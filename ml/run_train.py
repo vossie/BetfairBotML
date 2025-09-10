@@ -10,6 +10,7 @@ if PKG not in sys.path:
     sys.path.insert(0, PKG)
 
 from ml.features import build_features_for_date
+from ml import dataio
 
 def daterange_ending_at(end_iso: str | None, days: int) -> list[str]:
     end = datetime.now(timezone.utc).date() if not end_iso else datetime.fromisoformat(end_iso).date()
@@ -19,40 +20,47 @@ def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--curated", required=True)
+    ap.add_argument("--curated", required=True, help="Use 's3://betfair-curated' (NOT s3a://)")
     ap.add_argument("--sport", required=True)
     ap.add_argument("--date", default=None)
     ap.add_argument("--days", type=int, default=7)
-    ap.add_argument("--kelly", type=float, default=0.25)
-    ap.add_argument("--cap-ratio", type=float, default=0.5)
-    ap.add_argument("--market-cap", type=float, default=200.0)
-    ap.add_argument("--bankroll", type=float, default=5000.0)
     ap.add_argument("--outdir", default=os.path.join(HERE, "artifacts"))
     args = ap.parse_args()
 
+    # Print available dates to help debug empties
+    avail = {
+        "orderbook": dataio.list_dates(args.curated, args.sport, "orderbook_snapshots_5s"),
+        "defs":      dataio.list_dates(args.curated, args.sport, "market_definitions"),
+        "results":   dataio.list_dates(args.curated, args.sport, "results"),
+    }
+    print("Available dates:", avail)
+
     dates = daterange_ending_at(args.date, args.days)
     print(f"Loading sport={args.sport}, dates={dates[0]}..{dates[-1]}")
-
     feats_list, labels_list = [], []
+
     for d in dates:
+        print(f"  probing {d}")
         f, l = build_features_for_date(args.curated, args.sport, d)
         if f.height and l.height:
             feats_list.append(f); labels_list.append(l)
-            print(f"  + {d}: feats={f.height}, labels={l.height}")
+            print(f"    + feats={f.height}, labels={l.height}")
         else:
-            print(f"  - {d}: empty")
+            print(f"    - empty")
 
-    if not feats_list: raise RuntimeError("No features")
+    if not feats_list:
+        raise RuntimeError("No features (check curated path scheme and S3 env vars; see README below).")
 
     feats = pl.concat(feats_list, how="diagonal_relaxed")
     labels = pl.concat(labels_list, how="diagonal_relaxed")
     df = feats.join(labels, on=["marketId","selectionId"], how="inner").drop_nulls(["winLabel"])
     print(f"Training set size: {df.height}")
 
-    # --- Train simple XGB model ---
+    # Minimal model for now (keep your richer trainer if desired)
     from xgboost import XGBClassifier
     from sklearn.model_selection import GroupShuffleSplit
     from sklearn.metrics import log_loss
+    import numpy as np
 
     FEATURES = ["ltp_odds","best_back_odds","best_lay_odds","best_back_size","best_lay_size",
                 "back_overround","lay_overround","field_size"]
@@ -67,22 +75,19 @@ def main():
     model = XGBClassifier(tree_method="hist", n_estimators=200, max_depth=6, learning_rate=0.05)
     model.fit(Xtr, ytr)
     p = model.predict_proba(Xva)[:,1]
-
     print("logloss:", log_loss(yva, p))
 
-    # --- Kelly sizing example ---
-    import numpy as np
+    # Simple EV (taker) and dump recs
     bb = df["best_back_odds"].to_numpy()[va]
     bl = df["best_lay_odds"].to_numpy()[va]
-
     ev_back = p*(bb-1) + (1-p)*(-1)
     ev_lay  = (1-p) + p*(-(bl-1))
-    choose = np.where(ev_back >= ev_lay, "BACK", "LAY")
+    side = np.where(ev_back >= ev_lay, "BACK", "LAY")
 
     recs = pl.DataFrame({
         "marketId": df["marketId"][va],
         "selectionId": df["selectionId"][va],
-        "side": choose,
+        "side": side,
         "p": p,
         "ev_back": ev_back,
         "ev_lay": ev_lay

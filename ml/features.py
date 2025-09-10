@@ -12,11 +12,6 @@ def build_features_for_date(
     commission: float = 0.05,
     maker_horizon_secs: int = 10
 ) -> Tuple[pl.DataFrame, pl.DataFrame]:
-    """
-    Build features + labels for a single day (returns features, labels).
-    """
-
-    # Load Arrow → Polars
     snap_t = dataio.read_table(dataio.ds_orderbook(curated_root, sport, date))
     defs_t = dataio.read_table(dataio.ds_market_defs(curated_root, sport, date))
     res_t  = dataio.read_table(dataio.ds_results(curated_root, sport, date))
@@ -28,7 +23,6 @@ def build_features_for_date(
     df_defs = pl.from_arrow(defs_t)
     df_res  = pl.from_arrow(res_t)
 
-    # --- Feature engineering (simplified) ---
     df_snap = df_snap.with_columns([
         (1.0 / pl.col("ltp").cast(pl.Float64)).alias("ltp_odds"),
         (1.0 / pl.col("backTicks").list.first().cast(pl.Float64)).alias("best_back_odds"),
@@ -36,22 +30,11 @@ def build_features_for_date(
         pl.col("backSizes").list.first().cast(pl.Float64).alias("best_back_size"),
         pl.col("laySizes").list.first().cast(pl.Float64).alias("best_lay_size"),
     ])
-
-    # Overrounds
     df_snap = df_snap.with_columns([
         (1.0 / pl.col("best_back_odds")).alias("back_overround"),
         (1.0 / pl.col("best_lay_odds")).alias("lay_overround"),
     ])
-
-    # Field size per market
     field_sizes = df_snap.group_by("marketId").agg(pl.count("selectionId").alias("field_size"))
     df_snap = df_snap.join(field_sizes, on="marketId")
-
-    # --- Labels ---
-    df_lbl = df_res.select([
-        pl.col("marketId"),
-        pl.col("selectionId"),
-        pl.col("winLabel")
-    ])
-
+    df_lbl = df_res.select(["marketId","selectionId","winLabel"])
     return df_snap, df_lbl
