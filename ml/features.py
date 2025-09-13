@@ -2,9 +2,9 @@
 from __future__ import annotations
 from typing import Tuple, List, Dict, Any
 
-import os
 import numpy as np
 import polars as pl
+import pyarrow.dataset as ds
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -119,30 +119,19 @@ def build_features_streaming(
         return pl.DataFrame(), 0
 
     # lazy scan snapshots for all dates with column pruning
-    snap_paths = [dataio.ds_orderbook(curated_root, sport, d) for d in dates]
+    snap_dirs = [dataio.ds_orderbook(curated_root, sport, d) for d in dates]
 
-    endpoint = os.getenv("AWS_ENDPOINT_URL") or os.getenv("S3_ENDPOINT_URL")
-    key = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY")
-    secret = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY")
+    fs, _ = dataio._fs_and_root(curated_root)
 
-    storage_options = {}
-    # only set s3 options if we're actually reading s3://
-    if any(str(p).startswith("s3://") for p in snap_paths):
-        if not (endpoint and key and secret):
-            raise RuntimeError("Set AWS_ENDPOINT_URL (or S3_ENDPOINT_URL), AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY")
-        storage_options = {
-            "key": key,
-            "secret": secret,
-            "client_kwargs": {
-                "endpoint_url": endpoint,  # crucial for MinIO
-            },
-        }
+    file_list: List[str] = []
+    for p in snap_dirs:
+        file_list.extend(dataio._list_parquet_files(fs, p))
+    if not file_list:
+        return pl.DataFrame(), 0
 
-    lf_scan = pl.scan_parquet(
-        snap_paths,
-        # lets Polars/fsspec/s3fs hit MinIO instead of AWS
-        storage_options=storage_options,
-    )
+    file_list = [dataio._to_fs_path(fs, f) for f in file_list]
+    pa_ds = ds.dataset(file_list, format="parquet", filesystem=fs)
+    lf_scan = pl.scan_pyarrow_dataset(pa_ds)
 
     need_cols = [c for c in ["marketId", "selectionId", "publishTimeMs", "ltp", "spreadTicks", "imbalanceBest1", "tradedVolume"]
                  if c in lf_scan.columns]
