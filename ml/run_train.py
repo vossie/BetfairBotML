@@ -60,7 +60,11 @@ def main():
         downsample_secs=(args.downsample_secs or None),
     )
     if df_feat.is_empty():
-        raise RuntimeError("No features after streaming build")
+        print(
+            "No data found for the specified sport and date range; "
+            "skipping training."
+        )
+        return
 
     print(f"Feature rows: {df_feat.height:,} (from ~{total_raw:,} raw snapshot rows scanned)")
     print("Training model...")
