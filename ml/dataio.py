@@ -1,86 +1,136 @@
 # ml/dataio.py
 from __future__ import annotations
 import os
-from typing import List, Dict, Tuple
+from typing import List, Tuple, Dict
+from urllib.parse import urlparse
+
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
-from urllib.parse import urlparse
 
-# ---------- FS helpers ----------
+
+# ============================ S3 / FS HELPERS ============================
 
 def _mk_s3_fs_from_env() -> pafs.S3FileSystem:
     """
-    Build an S3FileSystem for MinIO using env vars:
+    Build an S3FileSystem for MinIO/S3 using env vars:
 
-      S3_ENDPOINT (or AWS_ENDPOINT_URL)  e.g. http://ziqni-minio.bronzegate.local:9000
-      AWS_ACCESS_KEY_ID
-      AWS_SECRET_ACCESS_KEY
-      AWS_REGION (optional, default: us-east-1)
-      S3_USE_SSL (optional "true"/"false")
+      S3_ENDPOINT or AWS_ENDPOINT_URL or S3_ENDPOINT_URL   (e.g. http://minio:9000)
+      AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+      AWS_REGION or AWS_DEFAULT_REGION (default 'us-east-1')
+
+    Notes:
+      - We do NOT set path-style options here; PyArrow expects bucket/key paths when using S3FileSystem.
+      - For HTTP MinIO, endpoint must start with http://; for HTTPS, https://
     """
-    endpoint = os.getenv("S3_ENDPOINT") or os.getenv("AWS_ENDPOINT_URL")
+    endpoint = (
+        os.getenv("S3_ENDPOINT")
+        or os.getenv("AWS_ENDPOINT_URL")
+        or os.getenv("S3_ENDPOINT_URL")
+    )
     if not endpoint:
-        raise RuntimeError("S3_ENDPOINT or AWS_ENDPOINT_URL must be set for MinIO access")
+        raise RuntimeError(
+            "Set S3_ENDPOINT or AWS_ENDPOINT_URL or S3_ENDPOINT_URL (e.g. http://host:9000)"
+        )
 
     access = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY")
     secret = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_KEY")
     if not access or not secret:
-        raise RuntimeError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set")
+        raise RuntimeError("Set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY")
 
-    region = os.getenv("AWS_REGION", "us-east-1")
-    use_ssl = (os.getenv("S3_USE_SSL", "").lower() == "true") or endpoint.startswith("https://")
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or "us-east-1"
+    use_ssl = endpoint.startswith("https://")
 
-    # endpoint_override must not include scheme in some builds; pyarrow ≥12 handles full URL.
     return pafs.S3FileSystem(
         access_key=access,
         secret_key=secret,
         region=region,
-        endpoint_override=endpoint,
-        scheme="https" if use_ssl else "http"
+        endpoint_override=endpoint,         # e.g. http://minio:9000
+        scheme="https" if use_ssl else "http",
     )
+
 
 def _fs_and_root(curated_root: str) -> Tuple[pafs.FileSystem, str]:
     """
     Return (filesystem, normalized_root).
-    Requires curated_root like: 's3://betfair-curated' or 'file:///path' or '/path'.
+    Accepts:
+      - 's3://bucket[/prefix]'  (or 's3a://' which is normalized to 's3://')
+      - local '/abs/path' or 'file:///abs/path'
     """
     if curated_root.startswith("s3a://"):
-        # Switch to s3:// for Arrow
-        curated_root = "s3://" + curated_root[len("s3a://"):]
-    parsed = urlparse(curated_root)
+        curated_root = "s3://" + curated_root[len("s3a://") :]
 
-    if parsed.scheme == "s3":
+    parsed = urlparse(curated_root)
+    scheme = parsed.scheme
+
+    if scheme == "s3":
         fs = _mk_s3_fs_from_env()
-        # normalized root (bucket + optional prefix)
-        root = curated_root.rstrip("/")
-        return fs, root
-    elif parsed.scheme in ("file", ""):
+        # keep as s3://bucket/prefix for outward-facing paths; we normalize only when calling FS
+        return fs, curated_root.rstrip("/")
+    elif scheme in ("file", ""):
         fs = pafs.LocalFileSystem()
-        # strip file:// if present
-        root = (parsed.path if parsed.scheme == "file" else curated_root).rstrip("/")
+        root = (parsed.path if scheme == "file" else curated_root).rstrip("/")
         return fs, root
     else:
-        raise RuntimeError(f"Unsupported curated_root scheme: {parsed.scheme}")
+        raise RuntimeError(f"Unsupported curated_root scheme: {scheme}")
 
-def _exists_dir(fs: pafs.FileSystem, path: str) -> bool:
-    info = fs.get_file_info([path])[0]
-    if info.type == pafs.FileType.Directory:
-        return True
-    if info.type == pafs.FileType.File:
-        return True
-    # Some S3 backends report NotFound for empty prefixes; try listing
+
+def _is_s3(fs: pafs.FileSystem) -> bool:
+    return isinstance(fs, pafs.S3FileSystem)
+
+
+def _to_fs_path(fs: pafs.FileSystem, path: str) -> str:
+    """
+    For S3FileSystem, convert 's3://bucket/key...' -> 'bucket/key...'
+    For LocalFileSystem, return as-is.
+    """
+    if _is_s3(fs) and path.startswith("s3://"):
+        return path[len("s3://"):]
+    return path
+
+
+# ============================ DIRECTORY / FILE ENUM ============================
+
+def _list_children(fs: pafs.FileSystem, path: str, recursive: bool) -> List[pafs.FileInfo]:
+    """
+    Return FileInfo list under 'path' (dir) using FileSelector.
+    Works for S3 & local.
+    """
+    p = _to_fs_path(fs, path)
+    sel = pafs.FileSelector(p, allow_not_found=True, recursive=recursive)
     try:
-        for _ in fs.get_file_info_selector(pafs.FileSelector(path, allow_not_found=True, recursive=False)):
-            return True
+        return fs.get_file_info(sel)
     except Exception:
-        return False
-    return False
+        return []
 
-# ---------- Paths (partitioned layout) ----------
+
+def _list_parquet_files(fs: pafs.FileSystem, path: str) -> List[str]:
+    """
+    Return normalized paths (bucket/key for S3, absolute for local) to all '.parquet' files
+    under 'path' recursively. Returns [] if none.
+    """
+    out: List[str] = []
+    for info in _list_children(fs, path, recursive=True):
+        # robust check for file:
+        is_file = (
+            getattr(info, "is_file", None) is True
+            or info.type == pafs.FileType.File
+        )
+        if is_file and info.path.lower().endswith(".parquet"):
+            # info.path is already normalized for the FS (bucket/key for S3)
+            out.append(info.path)
+    return out
+
+
+def _has_any(fs: pafs.FileSystem, path: str) -> bool:
+    """True if directory exists and has any entries (file or subdir)."""
+    return len(_list_children(fs, path, recursive=False)) > 0
+
+
+# ============================ PARTITIONED PATH HELPERS ============================
 
 def _p(curated_root: str, dataset: str, sport: str, date: str) -> str:
-    # Always build s3://… or local path, no trailing slash needed
+    # <root>/<dataset>/sport=<sport>/date=<YYYY-MM-DD>
     return f"{curated_root.rstrip('/')}/{dataset}/sport={sport}/date={date}"
 
 def ds_orderbook(curated_root: str, sport: str, date: str) -> str:
@@ -92,45 +142,67 @@ def ds_market_defs(curated_root: str, sport: str, date: str) -> str:
 def ds_results(curated_root: str, sport: str, date: str) -> str:
     return _p(curated_root, "results", sport, date)
 
-# ---------- Readers ----------
+
+# ============================ READERS ============================
 
 def read_table(path_or_paths, filesystem: pafs.FileSystem | None = None) -> pa.Table:
     """
-    Read a parquet dataset (directory of .parquet files) into a single Arrow Table.
+    Read one or many *partition directories* (or files) of parquet into a pyarrow.Table.
+    - Expands each directory into its explicit .parquet file list.
+    - Skips empty directories silently (returns empty table if no files).
     """
+    # Normalize input list
     paths = [path_or_paths] if isinstance(path_or_paths, str) else list(path_or_paths)
     if not paths:
         return pa.table({})
 
-    # Infer FS from first path if not supplied
+    # Infer FS if not supplied
     if filesystem is None:
-        fs, _ = _fs_and_root(paths[0].split("/")[0] + "//") if "://" in paths[0] else (pafs.LocalFileSystem(), "")
-        filesystem = fs
+        first = paths[0]
+        if first.startswith("s3://") or first.startswith("s3a://"):
+            # Just construct an S3 FS; we’ll normalize names later
+            filesystem, _ = _fs_and_root("s3://dummy")  # endpoint pulled from env
+        else:
+            filesystem = pafs.LocalFileSystem()
 
-    # Check existence
-    any_present = False
+    # Expand directories to explicit parquet file list
+    file_list: List[str] = []
     for p in paths:
-        if _exists_dir(filesystem, p):
-            any_present = True
-            break
-    if not any_present:
+        # If user passes a file path directly, accept it; else expand dir
+        if p.lower().endswith(".parquet"):
+            file_list.append(_to_fs_path(fileystem, p))  # type: ignore[name-defined]
+        else:
+            file_list.extend(_list_parquet_files(filesystem, p))
+
+    if not file_list:
         return pa.table({})
 
-    dataset = ds.dataset(paths, format="parquet", filesystem=filesystem)
+    # dataset() accepts a list of files relative to the FS (bucket/key for S3)
+    dataset = ds.dataset(file_list, format="parquet", filesystem=filesystem)
     return dataset.to_table()
 
-# ---------- Single-day (backwards compatible) ----------
+
+# ============================ SINGLE-DAY (compat) ============================
 
 def load_curated(curated_root: str, sport: str, date: str):
+    """
+    Return (snapshots_table, defs_table, results_table) for a single date.
+    Empty tables are returned if a partition has no files.
+    """
     fs, root = _fs_and_root(curated_root)
     snaps = read_table(ds_orderbook(root, sport, date), filesystem=fs)
     defs  = read_table(ds_market_defs(root, sport, date), filesystem=fs)
     res   = read_table(ds_results(root, sport, date), filesystem=fs)
     return snaps, defs, res
 
-# ---------- Multi-day ----------
+
+# ============================ MULTI-DAY ============================
 
 def load_curated_multi(curated_root: str, sport: str, dates: List[str]) -> Dict[str, pa.Table]:
+    """
+    Return dict of pyarrow.Tables for multiple dates:
+      {"snapshots": ..., "defs": ..., "results": ...}
+    """
     fs, root = _fs_and_root(curated_root)
     if not dates:
         empty = pa.table({})
@@ -145,19 +217,45 @@ def load_curated_multi(curated_root: str, sport: str, dates: List[str]) -> Dict[
     res   = read_table(res_paths,  filesystem=fs)
     return {"snapshots": snaps, "defs": defs, "results": res}
 
-# ---------- Diagnostics ----------
+
+# ============================ DIAGNOSTICS ============================
 
 def list_dates(curated_root: str, sport: str, dataset: str) -> List[str]:
     """
     List available dates under <root>/<dataset>/sport=<sport>/date=YYYY-MM-DD
+    Works for S3 and local.
     """
     fs, root = _fs_and_root(curated_root)
     base = f"{root.rstrip('/')}/{dataset}/sport={sport}"
-    if not _exists_dir(fs, base):
+    if not _has_any(fs, base):
         return []
     out: List[str] = []
-    for info in fs.get_file_info_selector(pafs.FileSelector(base, recursive=False)):
-        name = info.path.split("/")[-1]
+    for info in _list_children(fs, base, recursive=False):
+        # guard: FileInfo may return full path including bucket/key or absolute path
+        name = os.path.basename(info.path)
         if name.startswith("date="):
             out.append(name.split("=", 1)[1])
     return sorted(out)
+
+
+__all__ = [
+    "_mk_s3_fs_from_env", "_fs_and_root", "_is_s3", "_to_fs_path",
+    "_list_parquet_files", "read_table",
+    "ds_orderbook", "ds_market_defs", "ds_results",
+    "load_curated", "load_curated_multi",
+    "list_dates",
+]
+
+
+# ============================ CLI (optional) ============================
+
+if __name__ == "__main__":
+    # Usage:
+    #   python -m ml.dataio s3://betfair-curated horse-racing orderbook_snapshots_5s
+    import sys, json
+    if len(sys.argv) != 4:
+        print("Usage: python -m ml.dataio <curated_root> <sport> <dataset>")
+        sys.exit(2)
+    curated_root, sport, dataset = sys.argv[1:]
+    dates = list_dates(curated_root, sport, dataset)
+    print(json.dumps(dates, indent=2))

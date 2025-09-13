@@ -6,7 +6,8 @@ import polars as pl
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import log_loss, brier_score_loss
 from xgboost import XGBClassifier
-from .features import build_features_for_date
+
+from ml.features import build_features_streaming
 
 FEATURES = [
     "ltp_odds","best_back_odds","best_lay_odds","best_back_size","best_lay_size",
@@ -30,7 +31,7 @@ def main():
     ap.add_argument("--decision_secs", type=int, default=5)
     args = ap.parse_args()
 
-    feats, labels = build_features_for_date(args.curated, args.sport, args.date, args.decision_secs)
+    feats, labels = build_features_streaming(args.curated, args.sport, args.date, args.decision_secs)
 
     X, y, groups, df_all = prepare_xy(feats, labels)
 
