@@ -6,15 +6,14 @@ import logging
 import numpy as np
 import polars as pl
 import pyarrow.dataset as ds
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import log_loss, roc_auc_score
-from sklearn.model_selection import train_test_split
+import os
+os.environ.setdefault("POLARS_AUTO_STRUCTIFY", "0")
+
 
 from . import dataio
 
 
 # --------- helpers (version compatible) ---------
-
 
 def _with_time(df: pl.DataFrame) -> pl.DataFrame:
     need = [
@@ -39,7 +38,6 @@ def _with_time(df: pl.DataFrame) -> pl.DataFrame:
                 pl.col("spreadTicks").cast(pl.Int32).alias("spread_ticks"),
                 pl.col("imbalanceBest1").cast(pl.Float64).alias("imb1"),
                 pl.col("tradedVolume").cast(pl.Float64).alias("traded_vol"),
-                # datetime from ms since epoch w/out from_epoch(unit=...)
                 pl.col("publishTimeMs").cast(pl.Datetime("ms")).alias("ts"),
             ]
         )
@@ -71,14 +69,16 @@ def _lag_join(
 
 
 def _rolling_std(df: pl.DataFrame, window: str, out_name: str) -> pl.DataFrame:
-    # robust rolling std via group_by_dynamic on ts
-    g = df.group_by_dynamic(
-        index_column="ts",
-        every=window,
-        period=window,
-        by=["marketId", "selectionId"],
-        closed="right",
-    ).agg(pl.col("ltp_ff").std().alias(out_name))
+    g = (
+        df.group_by_dynamic(
+            index_column="ts",
+            every=window,
+            period=window,
+            by=["marketId", "selectionId"],
+            closed="right",
+        )
+        .agg(pl.col("ltp_ff").std().alias(out_name))
+    )
     return df.join(g, on=["marketId", "selectionId", "ts"], how="left")
 
 
@@ -97,7 +97,7 @@ def build_features_streaming(
     Memory-safe feature builder:
       - identifies markets with results
       - narrows snapshots to last `preoff_minutes` before off
-      - lazy scans parquet and collects per-market batches (streaming)
+      - lazy scans parquet and collects per-market batches (streaming with safe fallback)
     Returns (features_df, total_raw_rows_scanned_approx).
     """
     # Load definitions / results as full tables; handle snapshots via Arrow dataset
@@ -109,21 +109,19 @@ def build_features_streaming(
     df_defs = pl.from_arrow(dataio.read_table(def_paths, filesystem=fs))
     df_res = pl.from_arrow(dataio.read_table(res_paths, filesystem=fs))
 
-    # Arrow dataset for snapshots (stable for MinIO/S3)
-    snap_dirs = []
+    # Arrow dataset for snapshots (pass explicit file list to avoid directory-schema issues)
+    snap_files: list[str] = []
     for d in dates:
-        p = dataio.ds_orderbook(root, sport, d)
-        if dataio._list_parquet_files(fs, p):
-            snap_dirs.append(dataio._to_fs_path(fs, p).rstrip("/"))
-    if not snap_dirs:
-        logging.warning(
-            "No orderbook snapshot directories for sport=%s and dates %s", sport, dates
-        )
+        dir_path = dataio.ds_orderbook(root, sport, d)
+        snap_files.extend(dataio._list_parquet_files(fs, dir_path))
+    if not snap_files:
+        logging.warning("No orderbook parquet files for sport=%s dates=%s", sport, dates)
         return pl.DataFrame(), 0
+    snap_files = [dataio._to_fs_path(fs, p) for p in snap_files]
     try:
-        pa_ds = ds.dataset(snap_dirs, format="parquet", filesystem=fs)
+        pa_ds = ds.dataset(snap_files, format="parquet", filesystem=fs)
     except Exception as e:
-        logging.error("Failed to create snapshot dataset: %r", e)
+        logging.error("Failed to create snapshot dataset from files: %r", e)
         return pl.DataFrame(), 0
     lf_scan = pl.scan_pyarrow_dataset(pa_ds)
     try:
@@ -159,11 +157,17 @@ def build_features_streaming(
         )
         return pl.DataFrame(), 0
 
-    # marketId -> startMs
+    # marketId -> startMs (auto-fix seconds->ms if needed)
     mkt_times = (
         df_defs.select(["marketId", "marketStartMs"])
         .unique(subset=["marketId"], keep="last")
         .drop_nulls(["marketId", "marketStartMs"])
+        .with_columns(
+            pl.when(pl.col("marketStartMs") < 10_000_000_000)  # likely seconds
+            .then(pl.col("marketStartMs") * 1_000)
+            .otherwise(pl.col("marketStartMs"))
+            .alias("marketStartMs")
+        )
         .with_columns(
             [
                 (pl.col("marketStartMs") - preoff_minutes * 60_000).alias("fromMs"),
@@ -175,7 +179,7 @@ def build_features_streaming(
         logging.warning("No market start times available; aborting feature build")
         return pl.DataFrame(), 0
 
-    schema_cols = lf_scan.collect_schema().names()
+    schema_cols = set(lf_scan.collect_schema().names())
     need_cols = [
         c
         for c in [
@@ -215,32 +219,27 @@ def build_features_streaming(
     # process markets in batches
     for i in range(0, len(markets), batch_markets):
         batch = markets[i : i + batch_markets]
+
         mkt_times_b = mkt_times.filter(pl.col("marketId").is_in(batch))
 
-        lf_b = (
-            lf_snap.join(mkt_times_b.lazy(), on="marketId", how="inner")
+        # 1) Eager-collect the batch snapshots (disable Polars streaming to avoid panic)
+        df_snap_b = (
+            lf_snap
+            .filter(pl.col("marketId").is_in(batch))
+            .collect()  # <-- no streaming=True
+        )
+        if df_snap_b.is_empty():
+            continue
+
+        # 2) Small in-memory join with per-market time windows
+        df_b = (
+            df_snap_b
+            .join(mkt_times_b, on="marketId", how="inner")
             .filter(
                 (pl.col("publishTimeMs") >= pl.col("fromMs"))
                 & (pl.col("publishTimeMs") <= pl.col("toMs"))
             )
-            .filter(pl.col("marketId").is_in(batch))
         )
-
-        # `collect(streaming=True)` can trigger a "not yet implemented" panic
-        # in polars for some query plans (e.g. joins with filters).  Instead of
-        # crashing the whole training run, try to collect using the streaming
-        # engine and fall back to a normal in-memory collect if it fails.  This
-        # keeps memory usage low when streaming works, but still allows the
-        # function to succeed when polars lacks streaming support for a given
-        # operation.
-        try:
-            df_b = lf_b.collect(streaming=True)
-        except (pl.exceptions.PolarsPanicError, BaseException) as e:
-            logging.warning(
-                "Streaming collect failed; falling back to non-streaming mode: %r",
-                e,
-            )
-            df_b = lf_b.collect()
         if df_b.is_empty():
             continue
 
@@ -254,7 +253,9 @@ def build_features_streaming(
                 .alias("winLabel")
             )
         df_res_b = (
-            df_res_b.select(["marketId", "selectionId", "winLabel", "runnerStatus"])
+            df_res_b.select(
+                [c for c in ["marketId", "selectionId", "winLabel", "runnerStatus"] if c in df_res_b.columns]
+            )
             .unique(subset=["marketId", "selectionId"], keep="first")
         )
 
@@ -308,7 +309,8 @@ def build_features_streaming(
         )
 
         # attach labels; keep labeled rows
-        df_b = df_b.join(df_res_b, on=["marketId", "selectionId"], how="left")
+        if not df_res_b.is_empty():
+            df_b = df_b.join(df_res_b, on=["marketId", "selectionId"], how="left")
         df_b = df_b.filter(pl.col("winLabel").is_not_null())
 
         # per-market soft target (handles dead-heats / places if present)
@@ -352,7 +354,6 @@ FEATURE_COLS = [
 
 
 def _prep_xy(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    # target: binary win (fallback from soft_target)
     y = df.get_column("winLabel").cast(pl.Int32).to_numpy()
     X = (
         df.select([c for c in FEATURE_COLS if c in df.columns])
@@ -363,9 +364,12 @@ def _prep_xy(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def train_model(df_feat: pl.DataFrame) -> Dict[str, Any]:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import log_loss, roc_auc_score
+    from sklearn.model_selection import train_test_split
+
     X, y = _prep_xy(df_feat)
 
-    # downsample (optional) if very large
     if X.shape[0] > 2_000_000:
         idx = np.random.choice(X.shape[0], size=2_000_000, replace=False)
         X, y = X[idx], y[idx]
@@ -394,10 +398,6 @@ def train_model(df_feat: pl.DataFrame) -> Dict[str, Any]:
 
 
 def _kelly_fraction(p: np.ndarray, o: np.ndarray) -> np.ndarray:
-    """
-    Kelly for BACK (decimal odds o): f* = (o*p - 1)/(o - 1), clipped to [0,1].
-    For LAY, we invert below in recommend().
-    """
     f = (o * p - 1.0) / (o - 1.0)
     return np.clip(f, 0.0, 1.0)
 
@@ -406,18 +406,16 @@ def recommend(
     df_feat: pl.DataFrame,
     artifacts: Dict[str, Any],
     bankroll: float = 1000.0,
-    kelly: float = 0.125,  # fractional Kelly
-    cap_ratio: float = 0.02,  # max % bank per bet
-    market_cap: float = 50.0,  # max stake per market
+    kelly: float = 0.125,
+    cap_ratio: float = 0.02,
+    market_cap: float = 50.0,
 ) -> pl.DataFrame:
     clf = artifacts["model"]
 
-    # Ensure required cols exist
     cols = [c for c in FEATURE_COLS if c in df_feat.columns]
     X = df_feat.select(cols).fill_null(strategy="mean").to_numpy()
     p = np.clip(clf.predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
 
-    # odds from ltp (decimal)
     o = (
         df_feat.get_column("ltp")
         .fill_null(strategy="forward")
@@ -426,45 +424,35 @@ def recommend(
     )
     o = np.clip(o, 1.01, 1000.0)
 
-    # Back Kelly
     f_back = _kelly_fraction(p, o) * kelly
 
-    # Lay Kelly (mirror via p_lay = 1-p, o_lay ~ o/(o-1) -> implied price of lay liability)
-    # Simpler proxy: stake_back vs stake_lay; choose higher EV after caps.
-    # Compute suggested stakes with caps:
-    max_stake = bankroll * cap_ratio
-    stake_back = np.minimum(f_back * bankroll, max_stake)
-
-    # naive lay fraction: use back on (1-p) @ lay-odds = o/(o-1)
     o_lay = o / (o - 1.0)
     p_lay = 1.0 - p
     f_lay = _kelly_fraction(p_lay, o_lay) * kelly
+
+    max_stake = bankroll * cap_ratio
+    stake_back = np.minimum(f_back * bankroll, max_stake)
     stake_lay = np.minimum(f_lay * bankroll, max_stake)
 
-    # EV proxy (gross expectation per unit stake)
     ev_back = p * (o - 1) - (1 - p)
-    ev_lay = (1 - p_lay) * (1.0 / (o_lay - 1)) - p_lay  # rough; treat unit liability
+    ev_lay = (1 - p_lay) * (1.0 / (o_lay - 1)) - p_lay
 
-    # choose side with higher EV, set stake
     choose_back = ev_back >= ev_lay
     side = np.where(choose_back, "BACK", "LAY")
     stake = np.where(choose_back, stake_back, stake_lay)
 
-    # enforce per-market cap by grouping (approx in pandas)
     pdf = df_feat.select(["marketId", "selectionId", "ltp"]).to_pandas()
     pdf["side"] = side
     pdf["stake"] = stake
     pdf["ev_back"] = ev_back
     pdf["ev_lay"] = ev_lay
 
-    # per-market cap: cap total stakes within a market
     for mid, idx in pdf.groupby("marketId").groups.items():
         s = pdf.loc[idx, "stake"].sum()
         if s > market_cap:
             scale = market_cap / s
             pdf.loc[idx, "stake"] *= scale
 
-    # filter very small stakes
     pdf = pdf[pdf["stake"] >= 0.50].copy()
 
     return pl.from_pandas(
