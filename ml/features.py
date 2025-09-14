@@ -113,10 +113,14 @@ def build_features_streaming(
     snap_dirs = [dataio.ds_orderbook(root, sport, d) for d in dates]
     snap_dirs = [dataio._to_fs_path(fs, p) for p in snap_dirs]
     if not snap_dirs:
+        logging.warning(
+            "No orderbook snapshot directories for sport=%s and dates %s", sport, dates
+        )
         return pl.DataFrame(), 0
     try:
         pa_ds = ds.dataset(snap_dirs, format="parquet", filesystem=fs)
-    except Exception:
+    except Exception as e:
+        logging.error("Failed to create snapshot dataset: %r", e)
         return pl.DataFrame(), 0
     lf_scan = pl.scan_pyarrow_dataset(pa_ds)
     try:
@@ -124,12 +128,32 @@ def build_features_streaming(
     except Exception:
         total_raw = 0
 
-    if df_defs.is_empty() or df_res.is_empty():
+    if df_defs.is_empty():
+        logging.warning(
+            "Market definitions table empty for sport=%s dates %s..%s",
+            sport,
+            dates[0],
+            dates[-1],
+        )
+        return pl.DataFrame(), 0
+    if df_res.is_empty():
+        logging.warning(
+            "Results table empty for sport=%s dates %s..%s",
+            sport,
+            dates[0],
+            dates[-1],
+        )
         return pl.DataFrame(), 0
 
     # Markets with labels
     markets = df_res.select("marketId").unique().to_series().to_list()
     if not markets:
+        logging.warning(
+            "No markets with results for sport=%s dates %s..%s",
+            sport,
+            dates[0],
+            dates[-1],
+        )
         return pl.DataFrame(), 0
 
     # marketId -> startMs
@@ -145,6 +169,7 @@ def build_features_streaming(
         )
     )
     if mkt_times.is_empty():
+        logging.warning("No market start times available; aborting feature build")
         return pl.DataFrame(), 0
 
     schema_cols = lf_scan.collect_schema().names()
@@ -300,6 +325,7 @@ def build_features_streaming(
         out_batches.append(df_b)
 
     if not out_batches:
+        logging.warning("No feature batches generated; check data availability")
         return pl.DataFrame(), 0
 
     return pl.concat(out_batches, how="diagonal_relaxed"), total_raw
