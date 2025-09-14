@@ -110,8 +110,11 @@ def build_features_streaming(
     df_res = pl.from_arrow(dataio.read_table(res_paths, filesystem=fs))
 
     # Arrow dataset for snapshots (stable for MinIO/S3)
-    snap_dirs = [dataio.ds_orderbook(root, sport, d) for d in dates]
-    snap_dirs = [dataio._to_fs_path(fs, p) for p in snap_dirs]
+    snap_dirs = []
+    for d in dates:
+        p = dataio.ds_orderbook(root, sport, d)
+        if dataio._list_parquet_files(fs, p):
+            snap_dirs.append(dataio._to_fs_path(fs, p).rstrip("/"))
     if not snap_dirs:
         logging.warning(
             "No orderbook snapshot directories for sport=%s and dates %s", sport, dates
