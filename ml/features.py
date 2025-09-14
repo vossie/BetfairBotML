@@ -216,10 +216,17 @@ def build_features_streaming(
         if df_b.is_empty():
             continue
 
-        # labels for batch
+        # labels for batch; derive winLabel from runnerStatus if missing
+        df_res_b = df_res.filter(pl.col("marketId").is_in(batch))
+        if "winLabel" not in df_res_b.columns and "runnerStatus" in df_res_b.columns:
+            df_res_b = df_res_b.with_columns(
+                pl.when(pl.col("runnerStatus") == "WINNER")
+                .then(pl.lit(1))
+                .otherwise(pl.lit(0))
+                .alias("winLabel")
+            )
         df_res_b = (
-            df_res.filter(pl.col("marketId").is_in(batch))
-            .select(["marketId", "selectionId", "winLabel", "runnerStatus"])
+            df_res_b.select(["marketId", "selectionId", "winLabel", "runnerStatus"])
             .unique(subset=["marketId", "selectionId"], keep="first")
         )
 

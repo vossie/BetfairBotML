@@ -170,7 +170,8 @@ def read_table(path_or_paths, filesystem: pafs.FileSystem | None = None) -> pa.T
     for p in paths:
         # If user passes a file path directly, accept it; else expand dir
         if p.lower().endswith(".parquet"):
-            file_list.append(_to_fs_path(fileystem, p))  # type: ignore[name-defined]
+            # direct file path supplied
+            file_list.append(_to_fs_path(filesystem, p))
         else:
             file_list.extend(_list_parquet_files(filesystem, p))
 
