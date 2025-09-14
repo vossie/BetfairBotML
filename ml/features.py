@@ -167,7 +167,17 @@ def build_features_streaming(
             .filter(pl.col("marketId").is_in(batch))
         )
 
-        df_b = lf_b.collect(streaming=True)
+        # `collect(streaming=True)` can trigger a "not yet implemented" panic
+        # in polars for some query plans (e.g. joins with filters).  Instead of
+        # crashing the whole training run, try to collect using the streaming
+        # engine and fall back to a normal in-memory collect if it fails.  This
+        # keeps memory usage low when streaming works, but still allows the
+        # function to succeed when polars lacks streaming support for a given
+        # operation.
+        try:
+            df_b = lf_b.collect(streaming=True)
+        except Exception:
+            df_b = lf_b.collect()
         if df_b.is_empty():
             continue
 
