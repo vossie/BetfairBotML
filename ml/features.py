@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Tuple, List, Dict, Any
 
+import logging
 import numpy as np
 import polars as pl
 import pyarrow.dataset as ds
@@ -176,7 +177,11 @@ def build_features_streaming(
         # operation.
         try:
             df_b = lf_b.collect(streaming=True)
-        except Exception:
+        except (pl.exceptions.PolarsPanicError, BaseException) as e:
+            logging.warning(
+                "Streaming collect failed; falling back to non-streaming mode: %r",
+                e,
+            )
             df_b = lf_b.collect()
         if df_b.is_empty():
             continue
