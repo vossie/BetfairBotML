@@ -14,40 +14,50 @@ from . import dataio
 
 # --------- helpers (version compatible) ---------
 
+
 def _with_time(df: pl.DataFrame) -> pl.DataFrame:
-    need = ["marketId", "selectionId", "publishTimeMs", "ltp",
-            "spreadTicks", "imbalanceBest1", "tradedVolume"]
+    need = [
+        "marketId",
+        "selectionId",
+        "publishTimeMs",
+        "ltp",
+        "spreadTicks",
+        "imbalanceBest1",
+        "tradedVolume",
+    ]
     for c in need:
         if c not in df.columns:
             df = df.with_columns(pl.lit(None).alias(c))
     return (
-        df
-        .with_columns([
-            pl.col("marketId").cast(pl.Utf8),
-            pl.col("selectionId").cast(pl.Int64),
-            pl.col("publishTimeMs").cast(pl.Int64),
-            pl.col("ltp").cast(pl.Float64),
-            pl.col("spreadTicks").cast(pl.Int32).alias("spread_ticks"),
-            pl.col("imbalanceBest1").cast(pl.Float64).alias("imb1"),
-            pl.col("tradedVolume").cast(pl.Float64).alias("traded_vol"),
-            # datetime from ms since epoch w/out from_epoch(unit=...)
-            pl.col("publishTimeMs").cast(pl.Datetime("ms")).alias("ts"),
-        ])
+        df.with_columns(
+            [
+                pl.col("marketId").cast(pl.Utf8),
+                pl.col("selectionId").cast(pl.Int64),
+                pl.col("publishTimeMs").cast(pl.Int64),
+                pl.col("ltp").cast(pl.Float64),
+                pl.col("spreadTicks").cast(pl.Int32).alias("spread_ticks"),
+                pl.col("imbalanceBest1").cast(pl.Float64).alias("imb1"),
+                pl.col("tradedVolume").cast(pl.Float64).alias("traded_vol"),
+                # datetime from ms since epoch w/out from_epoch(unit=...)
+                pl.col("publishTimeMs").cast(pl.Datetime("ms")).alias("ts"),
+            ]
+        )
         .sort(["marketId", "selectionId", "publishTimeMs"])
         .with_columns(pl.col("ltp").forward_fill().alias("ltp_ff"))
     )
 
 
-def _lag_join(df: pl.DataFrame, secs: int, value_col: str, out_name: str) -> pl.DataFrame:
+def _lag_join(
+    df: pl.DataFrame, secs: int, value_col: str, out_name: str
+) -> pl.DataFrame:
     left = (
         df.select("marketId", "selectionId", "publishTimeMs", "ts", value_col)
-          .with_columns((pl.col("ts") - pl.duration(seconds=secs)).alias("ts_lag"))
-          .sort(["marketId", "selectionId", "ts_lag"])
+        .with_columns((pl.col("ts") - pl.duration(seconds=secs)).alias("ts_lag"))
+        .sort(["marketId", "selectionId", "ts_lag"])
     )
-    right = (
-        df.select("marketId", "selectionId", "ts", pl.col(value_col).alias(out_name))
-          .sort(["marketId", "selectionId", "ts"])
-    )
+    right = df.select(
+        "marketId", "selectionId", "ts", pl.col(value_col).alias(out_name)
+    ).sort(["marketId", "selectionId", "ts"])
     j = left.join_asof(
         right,
         left_on="ts_lag",
@@ -61,15 +71,18 @@ def _lag_join(df: pl.DataFrame, secs: int, value_col: str, out_name: str) -> pl.
 
 def _rolling_std(df: pl.DataFrame, window: str, out_name: str) -> pl.DataFrame:
     # robust rolling std via group_by_dynamic on ts
-    g = (
-        df
-        .group_by_dynamic(index_column="ts", every=window, period=window, by=["marketId", "selectionId"], closed="right")
-        .agg(pl.col("ltp_ff").std().alias(out_name))
-    )
+    g = df.group_by_dynamic(
+        index_column="ts",
+        every=window,
+        period=window,
+        by=["marketId", "selectionId"],
+        closed="right",
+    ).agg(pl.col("ltp_ff").std().alias(out_name))
     return df.join(g, on=["marketId", "selectionId", "ts"], how="left")
 
 
 # --------- memory-safe streaming builder ---------
+
 
 def build_features_streaming(
     curated_root: str,
@@ -88,32 +101,30 @@ def build_features_streaming(
     """
     tables = dataio.load_curated_multi(curated_root, sport, dates)
     df_defs = pl.from_arrow(tables["defs"])
-    df_res  = pl.from_arrow(tables["results"])
-    total_raw = int(pl.from_arrow(tables["snapshots"]).height) if tables["snapshots"] else 0
+    df_res = pl.from_arrow(tables["results"])
+    total_raw = (
+        int(pl.from_arrow(tables["snapshots"]).height) if tables["snapshots"] else 0
+    )
 
     if df_defs.is_empty() or df_res.is_empty():
         return pl.DataFrame(), 0
 
     # Markets with labels
-    markets = (
-        df_res.select("marketId")
-        .unique()
-        .to_series()
-        .to_list()
-    )
+    markets = df_res.select("marketId").unique().to_series().to_list()
     if not markets:
         return pl.DataFrame(), 0
 
     # marketId -> startMs
     mkt_times = (
-        df_defs
-        .select(["marketId", "marketStartMs"])
+        df_defs.select(["marketId", "marketStartMs"])
         .unique(subset=["marketId"], keep="last")
         .drop_nulls(["marketId", "marketStartMs"])
-        .with_columns([
-            (pl.col("marketStartMs") - preoff_minutes * 60_000).alias("fromMs"),
-            pl.col("marketStartMs").alias("toMs"),
-        ])
+        .with_columns(
+            [
+                (pl.col("marketStartMs") - preoff_minutes * 60_000).alias("fromMs"),
+                pl.col("marketStartMs").alias("toMs"),
+            ]
+        )
     )
     if mkt_times.is_empty():
         return pl.DataFrame(), 0
@@ -133,23 +144,38 @@ def build_features_streaming(
     pa_ds = ds.dataset(file_list, format="parquet", filesystem=fs)
     lf_scan = pl.scan_pyarrow_dataset(pa_ds)
 
-    need_cols = [c for c in ["marketId", "selectionId", "publishTimeMs", "ltp", "spreadTicks", "imbalanceBest1", "tradedVolume"]
-                 if c in lf_scan.columns]
+    schema_cols = lf_scan.collect_schema().names()
+    need_cols = [
+        c
+        for c in [
+            "marketId",
+            "selectionId",
+            "publishTimeMs",
+            "ltp",
+            "spreadTicks",
+            "imbalanceBest1",
+            "tradedVolume",
+        ]
+        if c in schema_cols
+    ]
     lf_snap = lf_scan.select(need_cols)
 
     # optional downsample to reduce rows
     if downsample_secs and downsample_secs > 1:
         lf_snap = (
-            lf_snap
-            .with_columns((pl.col("publishTimeMs") // (downsample_secs * 1000)).alias("_bin"))
+            lf_snap.with_columns(
+                (pl.col("publishTimeMs") // (downsample_secs * 1000)).alias("_bin")
+            )
             .group_by(["marketId", "selectionId", "_bin"])
-            .agg([
-                pl.last("publishTimeMs").alias("publishTimeMs"),
-                pl.last("ltp").alias("ltp"),
-                pl.last("spreadTicks").alias("spreadTicks"),
-                pl.last("imbalanceBest1").alias("imbalanceBest1"),
-                pl.last("tradedVolume").alias("tradedVolume"),
-            ])
+            .agg(
+                [
+                    pl.last("publishTimeMs").alias("publishTimeMs"),
+                    pl.last("ltp").alias("ltp"),
+                    pl.last("spreadTicks").alias("spreadTicks"),
+                    pl.last("imbalanceBest1").alias("imbalanceBest1"),
+                    pl.last("tradedVolume").alias("tradedVolume"),
+                ]
+            )
             .drop("_bin")
         )
 
@@ -157,13 +183,15 @@ def build_features_streaming(
 
     # process markets in batches
     for i in range(0, len(markets), batch_markets):
-        batch = markets[i:i+batch_markets]
+        batch = markets[i : i + batch_markets]
         mkt_times_b = mkt_times.filter(pl.col("marketId").is_in(batch))
 
         lf_b = (
-            lf_snap
-            .join(mkt_times_b.lazy(), on="marketId", how="inner")
-            .filter((pl.col("publishTimeMs") >= pl.col("fromMs")) & (pl.col("publishTimeMs") <= pl.col("toMs")))
+            lf_snap.join(mkt_times_b.lazy(), on="marketId", how="inner")
+            .filter(
+                (pl.col("publishTimeMs") >= pl.col("fromMs"))
+                & (pl.col("publishTimeMs") <= pl.col("toMs"))
+            )
             .filter(pl.col("marketId").is_in(batch))
         )
 
@@ -183,8 +211,7 @@ def build_features_streaming(
 
         # labels for batch
         df_res_b = (
-            df_res
-            .filter(pl.col("marketId").is_in(batch))
+            df_res.filter(pl.col("marketId").is_in(batch))
             .select(["marketId", "selectionId", "winLabel", "runnerStatus"])
             .unique(subset=["marketId", "selectionId"], keep="first")
         )
@@ -193,28 +220,50 @@ def build_features_streaming(
         df_b = _with_time(df_b)
         df_b = _lag_join(df_b, 10, "ltp_ff", "ltp_10s_ago")
         df_b = _lag_join(df_b, 60, "ltp_ff", "ltp_60s_ago")
-        df_b = df_b.with_columns([
-            (pl.col("ltp_ff") - pl.col("ltp_10s_ago")).alias("mom_10s"),
-            (pl.col("ltp_ff") - pl.col("ltp_60s_ago")).alias("mom_60s"),
-        ])
+        df_b = df_b.with_columns(
+            [
+                (pl.col("ltp_ff") - pl.col("ltp_10s_ago")).alias("mom_10s"),
+                (pl.col("ltp_ff") - pl.col("ltp_60s_ago")).alias("mom_60s"),
+            ]
+        )
         df_b = _rolling_std(df_b, "10s", "vol_10s")
         df_b = _rolling_std(df_b, "60s", "vol_60s")
 
         # overround / normalized probs / rank
-        df_b = df_b.with_columns([
-            pl.when(pl.col("ltp_ff") > 1.0).then(1.0 / pl.col("ltp_ff")).otherwise(None).alias("imp_prob")
-        ]).with_columns([
-            pl.sum("imp_prob").over(["marketId", "publishTimeMs"]).alias("overround")
-        ]).with_columns([
-            (pl.col("imp_prob") / pl.col("overround")).alias("norm_prob"),
-            pl.col("ltp_ff").rank("ordinal").over(["marketId", "publishTimeMs"]).alias("rank_price"),
-        ])
+        df_b = (
+            df_b.with_columns(
+                [
+                    pl.when(pl.col("ltp_ff") > 1.0)
+                    .then(1.0 / pl.col("ltp_ff"))
+                    .otherwise(None)
+                    .alias("imp_prob")
+                ]
+            )
+            .with_columns(
+                [
+                    pl.sum("imp_prob")
+                    .over(["marketId", "publishTimeMs"])
+                    .alias("overround")
+                ]
+            )
+            .with_columns(
+                [
+                    (pl.col("imp_prob") / pl.col("overround")).alias("norm_prob"),
+                    pl.col("ltp_ff")
+                    .rank("ordinal")
+                    .over(["marketId", "publishTimeMs"])
+                    .alias("rank_price"),
+                ]
+            )
+        )
 
         # ensure `ltp` is unique
         if "ltp" in df_b.columns:
             df_b = df_b.drop("ltp")
         df_b = df_b.with_columns(pl.col("ltp_ff").alias("ltp"))
-        df_b = df_b.drop([c for c in ["ltp_ff", "ltp_10s_ago", "ltp_60s_ago"] if c in df_b.columns])
+        df_b = df_b.drop(
+            [c for c in ["ltp_ff", "ltp_10s_ago", "ltp_60s_ago"] if c in df_b.columns]
+        )
 
         # attach labels; keep labeled rows
         df_b = df_b.join(df_res_b, on=["marketId", "selectionId"], how="left")
@@ -222,8 +271,9 @@ def build_features_streaming(
 
         # per-market soft target (handles dead-heats / places if present)
         df_b = (
-            df_b
-            .with_columns(pl.sum("winLabel").over("marketId").alias("sum_win_in_mkt"))
+            df_b.with_columns(
+                pl.sum("winLabel").over("marketId").alias("sum_win_in_mkt")
+            )
             .with_columns(
                 pl.when(pl.col("sum_win_in_mkt") > 0)
                 .then(pl.col("winLabel") / pl.col("sum_win_in_mkt"))
@@ -244,15 +294,30 @@ def build_features_streaming(
 # --------- train + recommend ---------
 
 FEATURE_COLS = [
-    "ltp", "mom_10s", "mom_60s", "vol_10s", "vol_60s",
-    "spread_ticks", "imb1", "traded_vol", "overround", "norm_prob", "rank_price",
+    "ltp",
+    "mom_10s",
+    "mom_60s",
+    "vol_10s",
+    "vol_60s",
+    "spread_ticks",
+    "imb1",
+    "traded_vol",
+    "overround",
+    "norm_prob",
+    "rank_price",
 ]
+
 
 def _prep_xy(df: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
     # target: binary win (fallback from soft_target)
     y = df.get_column("winLabel").cast(pl.Int32).to_numpy()
-    X = df.select([c for c in FEATURE_COLS if c in df.columns]).fill_null(strategy="mean").to_numpy()
+    X = (
+        df.select([c for c in FEATURE_COLS if c in df.columns])
+        .fill_null(strategy="mean")
+        .to_numpy()
+    )
     return X, y
+
 
 def train_model(df_feat: pl.DataFrame) -> Dict[str, Any]:
     X, y = _prep_xy(df_feat)
@@ -262,7 +327,9 @@ def train_model(df_feat: pl.DataFrame) -> Dict[str, Any]:
         idx = np.random.choice(X.shape[0], size=2_000_000, replace=False)
         X, y = X[idx], y[idx]
 
-    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    Xtr, Xte, ytr, yte = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
 
     clf = RandomForestClassifier(
         n_estimators=300,
@@ -274,7 +341,7 @@ def train_model(df_feat: pl.DataFrame) -> Dict[str, Any]:
     )
     clf.fit(Xtr, ytr)
 
-    p = np.clip(clf.predict_proba(Xte)[:, 1], 1e-6, 1-1e-6)
+    p = np.clip(clf.predict_proba(Xte)[:, 1], 1e-6, 1 - 1e-6)
     metrics = {
         "logloss": float(log_loss(yte, p)),
         "auc": float(roc_auc_score(yte, p)),
@@ -296,19 +363,24 @@ def recommend(
     df_feat: pl.DataFrame,
     artifacts: Dict[str, Any],
     bankroll: float = 1000.0,
-    kelly: float = 0.125,          # fractional Kelly
-    cap_ratio: float = 0.02,       # max % bank per bet
-    market_cap: float = 50.0,      # max stake per market
+    kelly: float = 0.125,  # fractional Kelly
+    cap_ratio: float = 0.02,  # max % bank per bet
+    market_cap: float = 50.0,  # max stake per market
 ) -> pl.DataFrame:
     clf = artifacts["model"]
 
     # Ensure required cols exist
     cols = [c for c in FEATURE_COLS if c in df_feat.columns]
     X = df_feat.select(cols).fill_null(strategy="mean").to_numpy()
-    p = np.clip(clf.predict_proba(X)[:, 1], 1e-6, 1-1e-6)
+    p = np.clip(clf.predict_proba(X)[:, 1], 1e-6, 1 - 1e-6)
 
     # odds from ltp (decimal)
-    o = df_feat.get_column("ltp").fill_null(strategy="forward").cast(pl.Float64).to_numpy()
+    o = (
+        df_feat.get_column("ltp")
+        .fill_null(strategy="forward")
+        .cast(pl.Float64)
+        .to_numpy()
+    )
     o = np.clip(o, 1.01, 1000.0)
 
     # Back Kelly
@@ -328,7 +400,7 @@ def recommend(
 
     # EV proxy (gross expectation per unit stake)
     ev_back = p * (o - 1) - (1 - p)
-    ev_lay  = (1 - p_lay) * (1.0 / (o_lay - 1)) - p_lay  # rough; treat unit liability
+    ev_lay = (1 - p_lay) * (1.0 / (o_lay - 1)) - p_lay  # rough; treat unit liability
 
     # choose side with higher EV, set stake
     choose_back = ev_back >= ev_lay
@@ -352,4 +424,6 @@ def recommend(
     # filter very small stakes
     pdf = pdf[pdf["stake"] >= 0.50].copy()
 
-    return pl.from_pandas(pdf[["marketId", "selectionId", "ltp", "side", "stake", "ev_back", "ev_lay"]])
+    return pl.from_pandas(
+        pdf[["marketId", "selectionId", "ltp", "side", "stake", "ev_back", "ev_lay"]]
+    )
