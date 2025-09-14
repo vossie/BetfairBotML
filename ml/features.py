@@ -100,12 +100,29 @@ def build_features_streaming(
       - lazy scans parquet and collects per-market batches (streaming)
     Returns (features_df, total_raw_rows_scanned_approx).
     """
-    tables = dataio.load_curated_multi(curated_root, sport, dates)
-    df_defs = pl.from_arrow(tables["defs"])
-    df_res = pl.from_arrow(tables["results"])
-    total_raw = (
-        int(pl.from_arrow(tables["snapshots"]).height) if tables["snapshots"] else 0
-    )
+    # Load definitions / results as full tables; handle snapshots via Arrow dataset
+    fs, root = dataio._fs_and_root(curated_root)
+
+    def_paths = [dataio.ds_market_defs(root, sport, d) for d in dates]
+    res_paths = [dataio.ds_results(root, sport, d) for d in dates]
+
+    df_defs = pl.from_arrow(dataio.read_table(def_paths, filesystem=fs))
+    df_res = pl.from_arrow(dataio.read_table(res_paths, filesystem=fs))
+
+    # Arrow dataset for snapshots (stable for MinIO/S3)
+    snap_dirs = [dataio.ds_orderbook(root, sport, d) for d in dates]
+    snap_dirs = [dataio._to_fs_path(fs, p) for p in snap_dirs]
+    if not snap_dirs:
+        return pl.DataFrame(), 0
+    try:
+        pa_ds = ds.dataset(snap_dirs, format="parquet", filesystem=fs)
+    except Exception:
+        return pl.DataFrame(), 0
+    lf_scan = pl.scan_pyarrow_dataset(pa_ds)
+    try:
+        total_raw = int(pa_ds.count_rows())
+    except Exception:
+        total_raw = 0
 
     if df_defs.is_empty() or df_res.is_empty():
         return pl.DataFrame(), 0
@@ -129,21 +146,6 @@ def build_features_streaming(
     )
     if mkt_times.is_empty():
         return pl.DataFrame(), 0
-
-    # lazy scan snapshots for all dates with column pruning
-    snap_dirs = [dataio.ds_orderbook(curated_root, sport, d) for d in dates]
-
-    fs, _ = dataio._fs_and_root(curated_root)
-
-    file_list: List[str] = []
-    for p in snap_dirs:
-        file_list.extend(dataio._list_parquet_files(fs, p))
-    if not file_list:
-        return pl.DataFrame(), 0
-
-    file_list = [dataio._to_fs_path(fs, f) for f in file_list]
-    pa_ds = ds.dataset(file_list, format="parquet", filesystem=fs)
-    lf_scan = pl.scan_pyarrow_dataset(pa_ds)
 
     schema_cols = lf_scan.collect_schema().names()
     need_cols = [
