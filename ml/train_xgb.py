@@ -13,6 +13,14 @@ from sklearn.metrics import log_loss, roc_auc_score
 
 from . import features
 
+# Optional CuPy (GPU arrays). Falls back to NumPy if unavailable.
+try:
+    import cupy as cp  # pip install cupy-cuda12x  (or cupy-cuda11x)
+    _HAVE_CUPY = True
+except Exception:
+    cp = None  # type: ignore
+    _HAVE_CUPY = False
+
 
 # --------------------------- date helpers ---------------------------
 
@@ -37,24 +45,11 @@ def _has_nvidia_gpu() -> bool:
         return os.system("nvidia-smi -L >/dev/null 2>&1") == 0
 
 
-def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimators: int) -> Dict:
-    use_gpu = _has_nvidia_gpu()
-    tree_method = "gpu_hist" if use_gpu else "hist"
-    predictor = "gpu_predictor" if use_gpu else "auto"
-
-    if n_classes > 2:
-        objective = "multi:softprob"
-        num_class = n_classes
-        eval_metric = ["mlogloss"]
-    else:
-        objective = "binary:logistic"
-        num_class = None
-        eval_metric = ["logloss", "auc"]
-
+def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimators: int, use_gpu: bool) -> Dict:
+    # XGBoost >= 2.0 uses device="cuda" with tree_method="hist" for GPU
     params: Dict = {
-        "tree_method": tree_method,
-        "predictor": predictor,
-        "objective": objective,
+        "tree_method": "hist",
+        "device": "cuda" if use_gpu else "cpu",
         "learning_rate": learning_rate,
         "max_depth": max_depth,
         "subsample": 0.8,
@@ -64,20 +59,35 @@ def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimato
         "n_estimators": n_estimators,
         "random_state": 42,
         "verbosity": 1,
-        "eval_metric": eval_metric,
     }
-    if num_class is not None:
-        params["num_class"] = num_class
+    if n_classes > 2:
+        params.update({
+            "objective": "multi:softprob",
+            "num_class": n_classes,
+            "eval_metric": "mlogloss",
+        })
+    else:
+        params.update({
+            "objective": "binary:logistic",
+            "eval_metric": "logloss",
+        })
     return params
 
 
-# --------------------------- training ---------------------------
+# --------------------------- feature selection ---------------------------
 
 def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
-    exclude = {"marketId", "selectionId", "ts", "ts_ms", label_col, "publishTimeMs"}
+    # Exclude IDs, timestamps, labels, and any label-derived helpers to avoid leakage
+    exclude = {
+        "marketId", "selectionId", "ts", "ts_ms", "publishTimeMs",
+        label_col, "soft_target", "sum_win_in_mkt", "runnerStatus"
+    }
     cols: List[str] = []
     for c, dt in zip(df_feat.columns, df_feat.dtypes):
         if c in exclude:
+            continue
+        lc = c.lower()
+        if "label" in lc or "target" in lc:
             continue
         if dt.is_numeric():
             cols.append(c)
@@ -91,10 +101,11 @@ def main():
     # Source
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
-    ap.add_argument("--date", default=datetime.now(UTC).strftime("%Y-%m-%d"), help="anchor date YYYY-MM-DD (treated as END of window)")
+    ap.add_argument("--date", default=datetime.now(UTC).strftime("%Y-%m-%d"),
+                    help="anchor date YYYY-MM-DD (treated as END of window)")
     ap.add_argument("--days", type=int, default=1, help="number of days back from --date (inclusive)")
 
-    # Feature builder knobs (match run_train)
+    # Feature builder knobs (match run_train.py)
     ap.add_argument("--preoff-mins", type=int, default=30)
     ap.add_argument("--batch-markets", type=int, default=100)
     ap.add_argument("--downsample-secs", type=int, default=0)
@@ -111,7 +122,7 @@ def main():
     dates = _daterange(args.date, args.days)
     print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
 
-    # Build features via the streaming builder (already memory-safe)
+    # Build features via the streaming builder (memory-safe)
     df_feat, total_raw = features.build_features_streaming(
         curated_root=args.curated,
         sport=args.sport,
@@ -137,39 +148,53 @@ def main():
 
     feature_cols = _select_feature_cols(df_feat, label_col)
 
-    # Split last 20% as validation
+    # Time-based split: last 20% as validation
     n = df_feat.height
     n_valid = max(1, int(n * 0.2))
     n_train = n - n_valid
     train_df = df_feat.slice(0, n_train)
     valid_df = df_feat.slice(n_train, n_valid)
 
-    # Data to numpy (float32 for XGB)
-    Xtr = train_df.select(feature_cols).fill_null(strategy="mean").to_numpy(dtype=np.float32)
+    # To numpy (Polars >=0.20: no dtype kwarg; cast with astype)
+    Xtr_np = train_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
     ytr = train_df.select(label_col).to_numpy().ravel()
-    Xva = valid_df.select(feature_cols).fill_null(strategy="mean").to_numpy(dtype=np.float32)
+    Xva_np = valid_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
     yva = valid_df.select(label_col).to_numpy().ravel()
 
-    # Determine binary vs multi
-    n_classes = int(pl.Series(ytr).unique().len())
+    # Decide GPU usage
+    use_gpu = _has_nvidia_gpu()
 
+    # Optionally move feature matrices to GPU with CuPy to avoid device mismatch warnings
+    if use_gpu and _HAVE_CUPY:
+        Xtr = cp.asarray(Xtr_np, dtype=cp.float32)
+        Xva = cp.asarray(Xva_np, dtype=cp.float32)
+    else:
+        Xtr = Xtr_np
+        Xva = Xva_np
+
+    # Binary vs multi-class
+    n_classes = int(pl.Series(ytr).unique().len())
     params = _xgb_params(
         n_classes=n_classes,
         learning_rate=args.learning_rate,
         max_depth=args.max_depth,
         n_estimators=args.n_estimators,
+        use_gpu=use_gpu,
     )
 
-    # Train
     clf = xgb.XGBClassifier(**params)
     clf.fit(Xtr, ytr)
 
     # Metrics
     if n_classes > 2:
         pva = clf.predict_proba(Xva)
+        if _HAVE_CUPY and isinstance(pva, cp.ndarray):
+            pva = pva.get()
         metrics = {"mlogloss": float(log_loss(yva, pva))}
     else:
         pva = clf.predict_proba(Xva)[:, 1]
+        if _HAVE_CUPY and isinstance(pva, cp.ndarray):
+            pva = pva.get()
         pva = np.clip(pva, 1e-6, 1 - 1e-6)
         metrics = {"logloss": float(log_loss(yva, pva))}
         try:
