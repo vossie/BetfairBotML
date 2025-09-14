@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta, UTC
 from typing import List
+import logging
 
 import polars as pl
 
@@ -21,6 +22,7 @@ def _daterange(end_date_str: str, days: int) -> List[str]:
 
 
 def main():
+    logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser()
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
@@ -60,7 +62,13 @@ def main():
         downsample_secs=(args.downsample_secs or None),
     )
     if df_feat.is_empty():
-        raise RuntimeError("No features after streaming build")
+        logging.error(
+            "No features generated. Verify data availability for sport=%s dates %s..%s",
+            args.sport,
+            dates[0],
+            dates[-1],
+        )
+        return
 
     print(f"Feature rows: {df_feat.height:,} (from ~{total_raw:,} raw snapshot rows scanned)")
     print("Training model...")
