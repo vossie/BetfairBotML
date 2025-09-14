@@ -235,7 +235,10 @@ def list_dates(curated_root: str, sport: str, dataset: str) -> List[str]:
         # guard: FileInfo may return full path including bucket/key or absolute path
         name = os.path.basename(info.path)
         if name.startswith("date="):
-            out.append(name.split("=", 1)[1])
+            # only include dates that have at least one parquet file
+            full_path = info.path
+            if _list_parquet_files(fs, full_path):
+                out.append(name.split("=", 1)[1])
     return sorted(out)
 
 
