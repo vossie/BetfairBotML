@@ -131,7 +131,7 @@ def _has_any(fs: pafs.FileSystem, path: str) -> bool:
 
 def _p(curated_root: str, dataset: str, sport: str, date: str) -> str:
     # <root>/<dataset>/sport=<sport>/date=<YYYY-MM-DD>
-    return f"{curated_root.rstrip('/')}/{dataset}/sport={sport}/date={date}"
+    return f"{curated_root.rstrip('/')}/{dataset}/sport={sport}/date={date}/"
 
 def ds_orderbook(curated_root: str, sport: str, date: str) -> str:
     return _p(curated_root, "orderbook_snapshots_5s", sport, date)
