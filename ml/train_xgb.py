@@ -62,7 +62,9 @@ def _xgb_base_params(n_classes: int, use_gpu: bool) -> Dict:
 def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
     exclude = {"marketId", "selectionId", "ts", "ts_ms", "publishTimeMs", label_col, "runnerStatus"}
     cols: List[str] = []
-    for c, dt in zip(df_feat.columns, df_feat.dtypes):
+    # use collect_schema to avoid perf warnings
+    schema = df_feat.collect_schema()
+    for c, dt in zip(schema.names(), schema.dtypes()):
         if c in exclude:
             continue
         if "label" in c.lower() or "target" in c.lower():
@@ -226,7 +228,6 @@ def main():
     ap.add_argument("--sweep", action="store_true")
     ap.add_argument("--sweep-out", default="sweep_results.csv")
 
-    # NEW: weight late snapshots stronger (e.g., 1.5) to prioritize near-off performance in unified 0–preoff model
     ap.add_argument("--weight-late", type=float, default=1.0, help="extra weight for rows with tto_minutes<=45 (1.0 means no extra weight)")
 
     args = ap.parse_args()
@@ -269,9 +270,27 @@ def main():
     elif "publishTimeMs" in df_feat.columns:
         df_feat = df_feat.sort("publishTimeMs")
 
+    # -------- CLEAN LABELS & BUILD MATRICES (DROP-IN FIX) --------
     label_col = args.label_col
     if label_col not in df_feat.columns:
         raise SystemExit(f"Label column '{label_col}' not found in features.")
+
+    n_before = df_feat.height
+    df_feat = df_feat.filter(
+        pl.col(label_col).is_not_null()
+        & pl.col(label_col).is_finite()
+    )
+
+    unique_labels = df_feat.select(pl.col(label_col)).unique().collect().to_series()
+    if unique_labels.len() > 0 and all(l in (0, 1) for l in unique_labels.drop_nulls().to_list()):
+        df_feat = df_feat.filter(pl.col(label_col).is_in([0, 1]))
+    else:
+        df_feat = df_feat.filter(pl.col(label_col).is_in([0, 1]))
+
+    n_after = df_feat.height
+    dropped = n_before - n_after
+    if dropped > 0:
+        print(f"[clean] Dropped {dropped:,} rows with invalid '{label_col}' (null/NaN/inf/not in {{0,1}}).")
 
     feature_cols = _select_feature_cols(df_feat, label_col)
 
@@ -282,9 +301,10 @@ def main():
     valid_df = df_feat.slice(n_train, n_valid)
 
     Xtr_np = train_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
-    ytr = train_df.select(label_col).to_numpy().ravel()
+    ytr = train_df.select(label_col).to_numpy().ravel().astype(np.int32)
     Xva_np = valid_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
-    yva = valid_df.select(label_col).to_numpy().ravel()
+    yva = valid_df.select(label_col).to_numpy().ravel().astype(np.int32)
+    # -------------------------------------------------------------
 
     if args.device == "cuda":
         use_gpu = True
@@ -297,7 +317,6 @@ def main():
     device_str = "CUDA" if use_gpu else "CPU"
     print(f"🚀 Training with XGBoost on {device_str} (tree_method=hist)")
 
-    # Training sample weights (optional, horizon-aware)
     train_weights: Optional[np.ndarray] = None
     if args.weight_late > 1.0 and "tto_minutes" in train_df.columns:
         tto = train_df["tto_minutes"].to_numpy()
