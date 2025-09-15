@@ -374,11 +374,12 @@ def main():
     ap.add_argument("--model-out", default="xgb_model.json", help="Used for single-model runs.")
     ap.add_argument("--sweep-out", default="sweep_results.csv")
 
+    # Legacy spelling kept hidden, both map to the same dest
     ap.add_argument(
         "--dual-horizon",
         dest="dual_horizon",
         action="store_true",
-        help=argparse.SUPPRESS,  # keep it hidden; legacy spelling
+        help=argparse.SUPPRESS,
     )
     ap.add_argument(
         "--dual_horizon",
@@ -395,9 +396,7 @@ def main():
                     help="Extra weight for rows with tto_minutes<=45 (applies to each model independently; 1.0 = no extra weight).")
 
     args = ap.parse_args()
-
-    # accept either flag spelling
-    dual_horizon = getattr(args, "dual_horizon", False) or getattr(args, "dual-horizon", False)
+    dual_horizon = getattr(args, "dual_horizon", False)
 
     is_s3 = _is_s3_uri(args.curated)
     _check_store(args.curated)
@@ -461,10 +460,15 @@ def main():
             sweep_out=args.sweep_out,
             sample_weight_late=args.weight_late,
         )
-        _binwise_report(
-            booster,
-            * _split_train_valid_time(_clean_labels_binary(df_feat, args.label_col), args.label_col, valid_frac=0.2)[1:],
-        )  # prints bin report again on same split
+
+        # Rebuild the SAME validation split to feed _binwise_report
+        clean_df = _clean_labels_binary(df_feat, args.label_col)
+        feature_cols = _select_feature_cols(clean_df, args.label_col)
+        tr_df, va_df = _split_train_valid_time(clean_df, args.label_col, valid_frac=0.2)
+        _, _, Xva_np, yva = _np_mats(tr_df, va_df, feature_cols, args.label_col)
+
+        _binwise_report(booster, va_df, Xva_np, yva)
+
         booster.save_model(args.model_out)
         print(f"Saved best model to {args.model_out}")
         return
