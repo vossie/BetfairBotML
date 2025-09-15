@@ -34,19 +34,35 @@ def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[L
     return snaps, defs, res
 
 
+# PATCH 1/1: replace _scan_parquet in ml/features.py (robustly handle directories by expanding to files)
+
 def _scan_parquet(paths: List[str]) -> pl.LazyFrame:
-    # Use pyarrow.dataset directly on the list of directory paths.
-    # (Passing a list of *Datasets* plus filesystem triggers the error you saw.)
+    # Expand each partition directory into concrete parquet file paths, then
+    # build a single dataset. Works for Local FS and S3/MinIO.
     fs, _ = pafs.FileSystem.from_uri(paths[0])
-    ds = pads.dataset(paths, format="parquet", filesystem=fs)
+
+    def _expand(dir_or_file: str) -> List[str]:
+        info = fs.get_file_info([dir_or_file])[0]
+        if info.type == pafs.FileType.File:
+            return [dir_or_file] if dir_or_file.endswith(".parquet") else []
+        elif info.type in (pafs.FileType.Directory, pafs.FileType.NotFound):  # NotFound can still be a selector root on S3
+            selector = pafs.FileSelector(dir_or_file, recursive=True)
+            infos = fs.get_file_info(selector)
+            return [i.path for i in infos if i.type == pafs.FileType.File and i.path.endswith(".parquet")]
+        else:
+            return []
+
+    all_files: List[str] = []
+    for p in paths:
+        all_files.extend(_expand(p))
+
+    if not all_files:
+        # Return empty LazyFrame with no rows; caller can handle empty concat.
+        return pl.DataFrame([]).lazy()
+
+    ds = pads.dataset(all_files, format="parquet", filesystem=fs)
     tbl = ds.to_table()
     return pl.from_arrow(tbl).lazy()
-
-
-
-
-
-
 
 
 def build_features_streaming(
