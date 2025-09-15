@@ -54,18 +54,15 @@ def _has_nvidia_gpu() -> bool:
         return os.system("nvidia-smi -L >/dev/null 2>&1") == 0
 
 
-def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimators: int, use_gpu: bool) -> Dict:
-    """XGBoost >=2.0 uses device='cuda' with tree_method='hist' for GPU."""
+def _xgb_base_params(n_classes: int, use_gpu: bool) -> Dict:
+    """Base params; per-run hyperparams layered on top."""
     params: Dict = {
         "tree_method": "hist",
         "device": "cuda" if use_gpu else "cpu",
-        "learning_rate": learning_rate,
-        "max_depth": max_depth,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
         "reg_lambda": 1.0,
         "reg_alpha": 0.0,
-        "n_estimators": n_estimators,
         "random_state": 42,
         "verbosity": 1,
     }
@@ -192,7 +189,7 @@ def _chunks(seq: List[str], n: int) -> Iterable[List[str]]:
 # --------------------------- main ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="XGBoost trainer over curated Betfair features (GPU-capable, chunked + resilient S3 retry).")
+    ap = argparse.ArgumentParser(description="XGBoost trainer (GPU-capable) with chunked S3 reads, retry, early stopping, and a small param sweep.")
     # Source
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
@@ -212,12 +209,16 @@ def main():
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
                     help="Force device for XGBoost. 'auto' = use GPU if available.")
 
-    # Model knobs
+    # Model knobs / training control
     ap.add_argument("--label-col", default="winLabel")
-    ap.add_argument("--learning-rate", type=float, default=0.05)
-    ap.add_argument("--max-depth", type=int, default=6)
-    ap.add_argument("--n-estimators", type=int, default=500)
+    ap.add_argument("--n-estimators", type=int, default=3000, help="upper bound trees for early stopping")
+    ap.add_argument("--learning-rate", type=float, default=0.02)
+    ap.add_argument("--early-stopping-rounds", type=int, default=100)
     ap.add_argument("--model-out", default="xgb_model.json")
+
+    # Small param sweep toggles
+    ap.add_argument("--sweep", action="store_true", help="run a small hyperparameter sweep and pick best by logloss")
+    ap.add_argument("--sweep-out", default="sweep_results.csv")
 
     args = ap.parse_args()
 
@@ -286,11 +287,10 @@ def main():
     else:
         use_gpu = _has_nvidia_gpu()
 
-    # GPU diagnostics print
+    # Diagnostics
     print(f"[diag] xgboost={xgb.__version__}, CUDA visible={use_gpu}, CuPy={_HAVE_CUPY}, CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES','<unset>')}")
 
     # Convert BOTH training and validation features to CuPy when CuPy is available; otherwise keep NumPy.
-    # (XGBoost can still train on GPU without CuPy; CuPy just avoids device-mismatch warnings.)
     if use_gpu and _HAVE_CUPY:
         Xtr = cp.asarray(Xtr_np, dtype=cp.float32)
         Xva = cp.asarray(Xva_np, dtype=cp.float32)
@@ -299,43 +299,110 @@ def main():
 
     # Binary vs multi-class
     n_classes = int(pl.Series(ytr).unique().len())
-    params = _xgb_params(
-        n_classes=n_classes,
-        learning_rate=args.learning_rate,
-        max_depth=args.max_depth,
-        n_estimators=args.n_estimators,
-        use_gpu=use_gpu,
-    )
+    base_params = _xgb_base_params(n_classes, use_gpu)
 
-    # Announce device choice
-    device = params["device"]
-    print(f"🚀 Training with XGBoost on {device.upper()} (tree_method={params['tree_method']})")
-
-    clf = xgb.XGBClassifier(**params)
-    clf.fit(Xtr, ytr)
-
-    # Metrics
-    if n_classes > 2:
-        pva = clf.predict_proba(Xva)
-        if _HAVE_CUPY and isinstance(pva, (cp.ndarray,)):
-            pva = pva.get()
-        metrics = {"mlogloss": float(log_loss(yva, pva))}
+    # Hyperparameter candidates
+    if args.sweep:
+        grid = [
+            {"max_depth": 5, "min_child_weight": 1,  "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 1.0, "reg_alpha": 0.0},
+            {"max_depth": 6, "min_child_weight": 5,  "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 0.0},
+            {"max_depth": 7, "min_child_weight": 10, "subsample": 0.9, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 1e-3},
+            {"max_depth": 6, "min_child_weight": 1,  "subsample": 0.7, "colsample_bytree": 1.0, "reg_lambda": 1.0, "reg_alpha": 1e-2},
+        ]
     else:
-        pva = clf.predict_proba(Xva)[:, 1]
-        if _HAVE_CUPY and isinstance(pva, (cp.ndarray,)):
-            pva = pva.get()
-        pva = np.clip(pva, 1e-6, 1 - 1e-6)
-        metrics = {"logloss": float(log_loss(yva, pva))}
+        grid = [
+            {"max_depth": 6, "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 0.0},
+        ]
+
+    # Run sweep
+    results = []
+    best = None  # (logloss, model, params, metrics)
+    for i, hp in enumerate(grid, 1):
+        params = {
+            **base_params,
+            "max_depth": hp["max_depth"],
+            "min_child_weight": hp["min_child_weight"],
+            "subsample": hp["subsample"],
+            "colsample_bytree": hp["colsample_bytree"],
+            "reg_lambda": hp["reg_lambda"],
+            "reg_alpha": hp["reg_alpha"],
+            "learning_rate": args.learning_rate,
+            "n_estimators": args.n_estimators,
+        }
+
+        # Announce device choice
+        device = params["device"]
+        print(f"\n=== Sweep {i}/{len(grid)}: {hp} ===")
+        print(f"🚀 Training with XGBoost on {device.upper()} (tree_method={params['tree_method']}) | "
+              f"n_estimators={params['n_estimators']} lr={params['learning_rate']}")
+
+        clf = xgb.XGBClassifier(**params)
+
+        # Early stopping: pass eval_set using the same array type as X used for training
+        if use_gpu and _HAVE_CUPY:
+            eval_set = [(Xva, yva)]
+        else:
+            eval_set = [(Xva_np, yva)]
+
+        clf.fit(
+            Xtr, ytr,
+            eval_set=eval_set,
+            early_stopping_rounds=args.early_stopping_rounds,
+            verbose=False,
+        )
+
+        # Metrics with explicit DMatrix predict to avoid device mismatch warning
+        booster = clf.get_booster()
+        dval = xgb.DMatrix(Xva_np)
+        pva = booster.predict(dval)
+        if n_classes > 2:
+            m = {"mlogloss": float(log_loss(yva, pva))}
+        else:
+            if pva.ndim == 2 and pva.shape[1] > 1:
+                pva = pva[:, 1]
+            pva = np.clip(pva, 1e-6, 1 - 1e-6)
+            m = {"logloss": float(log_loss(yva, pva))}
+            try:
+                m["auc"] = float(roc_auc_score(yva, pva))
+            except Exception:
+                pass
+
+        print(f"→ Metrics: {m}")
+        row = {**hp, **m, "best_iteration": getattr(clf, "best_iteration", None)}
+        results.append(row)
+
+        crit = m.get("logloss", m.get("mlogloss", 1e9))
+        if (best is None) or (crit < best[0]):
+            best = (crit, clf, params, m)
+
+    # Print sweep summary
+    if results:
+        # compact table
+        headers = list(results[0].keys())
+        print("\n=== Sweep Summary ===")
+        print(" | ".join(headers))
+        for r in results:
+            print(" | ".join(str(r.get(h)) for h in headers))
+
+        # Optionally write CSV
         try:
-            metrics["auc"] = float(roc_auc_score(yva, pva))
-        except Exception:
-            pass
+            import csv
+            with open(args.sweep_out, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=headers)
+                w.writeheader()
+                w.writerows(results)
+            print(f"Saved sweep results to {args.sweep_out}")
+        except Exception as e:
+            print(f"WARN: failed to write sweep CSV: {e}", file=sys.stderr)
 
-    print("Metrics:", metrics)
-
-    # Save model
-    clf.save_model(args.model_out)
-    print(f"Saved model to {args.model_out}")
+    # Save best model
+    if best is None:
+        raise SystemExit("Training failed to produce any model.")
+    _, best_model, best_params, best_metrics = best
+    best_model.save_model(args.model_out)
+    print(f"\nBest params: { {k: best_params[k] for k in ('max_depth','min_child_weight','subsample','colsample_bytree','reg_lambda','reg_alpha','learning_rate')} }")
+    print(f"Best metrics: {best_metrics}")
+    print(f"Saved best model to {args.model_out}")
 
 
 if __name__ == "__main__":
