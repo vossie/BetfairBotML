@@ -15,11 +15,11 @@ from sklearn.metrics import log_loss, roc_auc_score
 import pyarrow.fs as pafs
 from . import features
 
-# ---------- optional CuPy (GPU arrays). Falls back to NumPy if unavailable ----------
+# ---------- Optional CuPy (GPU arrays). Verify CUDA runtime is actually available ----------
 try:
-    import cupy as cp
+    import cupy as cp  # pip install cupy-cuda12x  (or cupy-cuda11x)
     try:
-        _ = cp.cuda.runtime.getVersion()  # verify CUDA runtime is available
+        _ = cp.cuda.runtime.getVersion()  # confirms CUDA runtime is visible
         _HAVE_CUPY = True
     except Exception:
         cp = None  # type: ignore
@@ -32,6 +32,7 @@ except Exception:
 # --------------------------- helpers ---------------------------
 
 def _daterange(end_date_str: str, days: int) -> List[str]:
+    """Inclusive date range: [end - (days-1), end], formatted YYYY-MM-DD."""
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
     start = end - timedelta(days=days - 1)
     out: List[str] = []
@@ -43,6 +44,7 @@ def _daterange(end_date_str: str, days: int) -> List[str]:
 
 
 def _has_nvidia_gpu() -> bool:
+    """Lightweight check for an NVIDIA GPU presence."""
     try:
         import pynvml  # noqa: F401
         return True
@@ -51,6 +53,7 @@ def _has_nvidia_gpu() -> bool:
 
 
 def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimators: int, use_gpu: bool) -> Dict:
+    """XGBoost >=2.0 uses device='cuda' with tree_method='hist' for GPU."""
     params: Dict = {
         "tree_method": "hist",
         "device": "cuda" if use_gpu else "cpu",
@@ -79,7 +82,7 @@ def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimato
 
 
 def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
-    # Exclude IDs, timestamps, labels, and label-derived helpers to avoid leakage
+    """Pick numeric feature columns; drop IDs/timestamps/labels & label-derived to avoid leakage."""
     exclude = {
         "marketId", "selectionId", "ts", "ts_ms", "publishTimeMs",
         label_col, "soft_target", "sum_win_in_mkt", "runnerStatus"
@@ -89,7 +92,7 @@ def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
         if c in exclude:
             continue
         lc = c.lower()
-        if "label" in lc or "target" in lc:
+        if "label" in lc or "target" in lc:  # extra guard
             continue
         if dt.is_numeric():
             cols.append(c)
@@ -99,12 +102,14 @@ def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
 
 
 def _check_minio(curated_root: str):
+    """Fail fast if the curated root/bucket is not reachable with current env."""
     try:
         fs, path = pafs.FileSystem.from_uri(curated_root)
         info = fs.get_file_info([path])[0]
         if info.type == pafs.FileType.NotFound:
             print(f"ERROR: Curated root not found: {curated_root}", file=sys.stderr)
             sys.exit(1)
+        # Extra: region alignment hint (when MinIO returns a region header)
         print(f"✅ MinIO/S3 reachable at {curated_root}")
     except Exception as e:
         print(f"ERROR: Failed to reach curated root {curated_root}: {e}", file=sys.stderr)
@@ -136,7 +141,7 @@ def main():
 
     args = ap.parse_args()
 
-    # Sanity check MinIO/S3 path
+    # Sanity check MinIO/S3 path first (catches endpoint/region issues early)
     _check_minio(args.curated)
 
     dates = _daterange(args.date, args.days)
@@ -175,22 +180,21 @@ def main():
     train_df = df_feat.slice(0, n_train)
     valid_df = df_feat.slice(n_train, n_valid)
 
-    # To numpy (Polars >=0.20: no dtype kwarg; cast with astype)
+    # Build feature arrays (float32). We'll move to CuPy if GPU is available.
     Xtr_np = train_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
     ytr = train_df.select(label_col).to_numpy().ravel()
     Xva_np = valid_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
     yva = valid_df.select(label_col).to_numpy().ravel()
 
-    # Decide GPU usage
-    use_gpu = _has_nvidia_gpu()
+    # Decide GPU usage; require CuPy so BOTH train/val live on GPU to avoid device mismatch.
+    use_gpu = _has_nvidia_gpu() and _HAVE_CUPY
 
-    # Optionally move feature matrices to GPU with CuPy to avoid device mismatch warnings
-    if use_gpu and _HAVE_CUPY:
+    # Convert BOTH training and validation features to CuPy when using GPU; otherwise keep NumPy.
+    if use_gpu:
         Xtr = cp.asarray(Xtr_np, dtype=cp.float32)
         Xva = cp.asarray(Xva_np, dtype=cp.float32)
     else:
-        Xtr = Xtr_np
-        Xva = Xva_np
+        Xtr, Xva = Xtr_np, Xva_np
 
     # Binary vs multi-class
     n_classes = int(pl.Series(ytr).unique().len())
@@ -208,12 +212,13 @@ def main():
     # Metrics
     if n_classes > 2:
         pva = clf.predict_proba(Xva)
-        if _HAVE_CUPY and isinstance(pva, cp.ndarray):
+        # Bring back to NumPy for sklearn metrics if it’s a CuPy array
+        if use_gpu and isinstance(pva, cp.ndarray):
             pva = pva.get()
         metrics = {"mlogloss": float(log_loss(yva, pva))}
     else:
         pva = clf.predict_proba(Xva)[:, 1]
-        if _HAVE_CUPY and isinstance(pva, cp.ndarray):
+        if use_gpu and isinstance(pva, cp.ndarray):
             pva = pva.get()
         pva = np.clip(pva, 1e-6, 1 - 1e-6)
         metrics = {"logloss": float(log_loss(yva, pva))}
