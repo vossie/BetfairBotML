@@ -374,9 +374,18 @@ def main():
     ap.add_argument("--model-out", default="xgb_model.json", help="Used for single-model runs.")
     ap.add_argument("--sweep-out", default="sweep_results.csv")
 
-    ap.add_argument("--dual-horizon", action="add_true", help=argparse.SUPPRESS)  # legacy guard
-    ap.add_argument("--dual_horizon", action="store_true",
-                    help="Train two models in one run: short (<=30 min) and long (30..preoff). Saves model_30.json and model_180.json (or with your prefix).")
+    ap.add_argument(
+        "--dual-horizon",
+        dest="dual_horizon",
+        action="store_true",
+        help=argparse.SUPPRESS,  # keep it hidden; legacy spelling
+    )
+    ap.add_argument(
+        "--dual_horizon",
+        dest="dual_horizon",
+        action="store_true",
+        help="Train two models in one run: short (<=30 min) and long (30..preoff). Saves model_30.json and model_180.json (or with your prefix).",
+    )
 
     ap.add_argument("--model-prefix", default="", help="Prefix for dual-horizon outputs, e.g., 'hr_' to get hr_model_30.json / hr_model_180.json")
     ap.add_argument("--sweep-out-30", default="sweep_results_30.csv")
