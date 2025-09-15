@@ -4,8 +4,9 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import polars as pl
@@ -109,17 +110,53 @@ def _check_minio(curated_root: str):
         if info.type == pafs.FileType.NotFound:
             print(f"ERROR: Curated root not found: {curated_root}", file=sys.stderr)
             sys.exit(1)
-        # Extra: region alignment hint (when MinIO returns a region header)
         print(f"✅ MinIO/S3 reachable at {curated_root}")
     except Exception as e:
         print(f"ERROR: Failed to reach curated root {curated_root}: {e}", file=sys.stderr)
         sys.exit(1)
 
 
+def _build_features_with_retry(
+    curated_root: str,
+    sport: str,
+    dates: List[str],
+    preoff_minutes: int,
+    batch_markets: int,
+    downsample_secs: int | None,
+    wait_seconds: float = 3.0,
+) -> Tuple[pl.DataFrame, int]:
+    """
+    Call the Polars/Arrow streaming feature builder; on transient S3 errors (e.g., curlCode 7),
+    sleep and retry once.
+    """
+    try:
+        return features.build_features_streaming(
+            curated_root=curated_root,
+            sport=sport,
+            dates=dates,
+            preoff_minutes=preoff_minutes,
+            batch_markets=batch_markets,
+            downsample_secs=downsample_secs,
+        )
+    except Exception as e:
+        msg = str(e)
+        print(f"WARN: First feature build attempt failed: {msg}\nRetrying once in {wait_seconds} seconds...", file=sys.stderr)
+        time.sleep(wait_seconds)
+        # second (final) attempt
+        return features.build_features_streaming(
+            curated_root=curated_root,
+            sport=sport,
+            dates=dates,
+            preoff_minutes=preoff_minutes,
+            batch_markets=batch_markets,
+            downsample_secs=downsample_secs,
+        )
+
+
 # --------------------------- main ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features.")
+    ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features (with S3 retry).")
     # Source
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
@@ -147,15 +184,17 @@ def main():
     dates = _daterange(args.date, args.days)
     print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
 
-    # Build features via the streaming builder (memory-safe)
-    df_feat, total_raw = features.build_features_streaming(
+    # Build features with a single retry if S3 hiccups
+    df_feat, total_raw = _build_features_with_retry(
         curated_root=args.curated,
         sport=args.sport,
         dates=dates,
         preoff_minutes=args.preoff_mins,
         batch_markets=args.batch_markets,
         downsample_secs=(args.downsample_secs or None),
+        wait_seconds=3.0,
     )
+
     if df_feat.is_empty():
         raise SystemExit("No features built (empty frame). Check curated paths and date range.")
 
