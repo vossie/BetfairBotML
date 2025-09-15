@@ -35,14 +35,18 @@ def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[L
 
 
 def _scan_parquet(paths: List[str]) -> pl.LazyFrame:
-    # Use pyarrow.dataset to unify local/S3 with directory partitions, then hand to polars.
+    # Use pyarrow.dataset directly on the list of directory paths.
+    # (Passing a list of *Datasets* plus filesystem triggers the error you saw.)
     fs, _ = pafs.FileSystem.from_uri(paths[0])
-    datasets = []
-    for p in paths:
-        datasets.append(pads.dataset(p, format="parquet", filesystem=fs))
-    ds = pads.dataset(datasets, filesystem=fs)
-    tbl = ds.to_table()  # let pyarrow expand the fragments (robust vs. polars streaming glitches)
+    ds = pads.dataset(paths, format="parquet", filesystem=fs)
+    tbl = ds.to_table()
     return pl.from_arrow(tbl).lazy()
+
+
+
+
+
+
 
 
 def build_features_streaming(
