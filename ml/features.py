@@ -1,16 +1,11 @@
 # ml/features.py
 from __future__ import annotations
 
-import os
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional
 
 import polars as pl
 import pyarrow.dataset as pads
 import pyarrow.fs as pafs
-
-
-def _is_s3_uri(uri: str) -> bool:
-    return uri.startswith("s3://")
 
 
 def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[List[str], List[str], List[str]]:
@@ -77,17 +72,21 @@ def build_features_streaming(
     lf_def = _scan_parquet(def_paths)
     lf_res = _scan_parquet(res_paths)
 
-    # If any are empty, return empty
-    if lf_snap.schema is None or lf_def.schema is None or lf_res.schema is None:
+    # Resolve schemas once to avoid repeated expensive lookups and warnings.
+    snap_names = set(lf_snap.collect_schema().names())
+    def_names = set(lf_def.collect_schema().names())
+    res_names = set(lf_res.collect_schema().names())
+
+    if not snap_names or not def_names or not res_names:
         return pl.DataFrame([]), 0
 
     # --- Normalize/select columns from snapshots ---
-    keep_snap = []
-    for c in ("sport", "marketId", "selectionId", "publishTimeMs",
-              "backTicks", "backSizes", "layTicks", "laySizes",
-              "ltpTick", "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1"):
-        if c in lf_snap.columns:
-            keep_snap.append(c)
+    snap_keep_order = (
+        "sport", "marketId", "selectionId", "publishTimeMs",
+        "backTicks", "backSizes", "layTicks", "laySizes",
+        "ltpTick", "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1"
+    )
+    keep_snap = [c for c in snap_keep_order if c in snap_names]
 
     lf_snap = lf_snap.select(
         *[
@@ -104,10 +103,8 @@ def build_features_streaming(
     )
 
     # --- Definitions ---
-    keep_def = []
-    for c in ("sport", "marketId", "marketStartMs", "inPlay", "status", "marketType", "countryCode"):
-        if c in lf_def.columns:
-            keep_def.append(c)
+    def_keep_order = ("sport", "marketId", "marketStartMs", "inPlay", "status", "marketType", "countryCode")
+    keep_def = [c for c in def_keep_order if c in def_names]
 
     lf_def = lf_def.select(
         *[
@@ -119,10 +116,8 @@ def build_features_streaming(
     )
 
     # --- Results ---
-    keep_res = []
-    for c in ("sport", "marketId", "selectionId", "winLabel", "runnerStatus", "settledTimeMs"):
-        if c in lf_res.columns:
-            keep_res.append(c)
+    res_keep_order = ("sport", "marketId", "selectionId", "winLabel", "runnerStatus", "settledTimeMs")
+    keep_res = [c for c in res_keep_order if c in res_names]
 
     lf_res = lf_res.select(
         *[
@@ -177,7 +172,7 @@ def build_features_streaming(
         .alias("implied_prob")
     )
 
-    # --- Momentum / volatility using as-of self-joins (fixed to avoid duplicate 'ltp' name collisions) ---
+    # --- Momentum / volatility using as-of self-joins (avoid duplicate 'ltp' collisions) ---
     base = (
         left.select(["marketId", "selectionId", "publishTimeMs", "ltp"])
             .sort(["marketId", "selectionId", "publishTimeMs"])
@@ -229,7 +224,9 @@ def build_features_streaming(
         "vol_60s",
         "winLabel",
     ]
-    have = [c for c in wanted if c in left.columns]
+    # Avoid resolving schema repeatedly
+    final_names = set(left.collect_schema().names())
+    have = [c for c in wanted if c in final_names]
 
     feat = left.select(have).collect()
 
