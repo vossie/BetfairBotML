@@ -12,6 +12,7 @@ from typing import List, Dict, Tuple, Iterable, Optional
 import numpy as np
 import polars as pl
 import xgboost as xgb
+from xgboost.callback import EarlyStopping
 from sklearn.metrics import log_loss, roc_auc_score
 
 import pyarrow.fs as pafs
@@ -153,7 +154,6 @@ def _build_features_with_retry(
     For local disk: just call once (no retry needed).
     """
     if not is_s3:
-        # Local disk path: single attempt
         return features.build_features_streaming(
             curated_root=curated_root,
             sport=sport,
@@ -163,7 +163,6 @@ def _build_features_with_retry(
             downsample_secs=downsample_secs,
         )
 
-    # S3 / MinIO path with retry
     last_err: Exception | None = None
     total_wait = 0.0
     for attempt in range(1, max_attempts + 1):
@@ -250,7 +249,7 @@ def main():
     src_label = "MinIO/S3" if is_s3 else "Local FS"
     print(f"Building features from [{src_label}] curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]} (chunk_days={args.chunk_days})")
 
-    # Build features in chunks (still helpful on local if there are many files)
+    # Build features in chunks with resilient retry/backoff
     df_parts: List[pl.DataFrame] = []
     total_raw = 0
     for idx, dchunk in enumerate(_chunks(dates, max(1, args.chunk_days)), 1):
@@ -361,7 +360,8 @@ def main():
 
         clf = xgb.XGBClassifier(**params)
 
-        # Early stopping: pass eval_set using the same array type as X used for training
+        # Early stopping via callback API
+        metric_name = "mlogloss" if n_classes > 2 else "logloss"
         if use_gpu and _HAVE_CUPY:
             eval_set = [(Xva, yva)]
         else:
@@ -370,8 +370,16 @@ def main():
         clf.fit(
             Xtr, ytr,
             eval_set=eval_set,
-            early_stopping_rounds=args.early_stopping_rounds,
             verbose=False,
+            callbacks=[
+                EarlyStopping(
+                    rounds=args.early_stopping_rounds,
+                    save_best=True,
+                    maximize=False,
+                    data_name="validation_0",
+                    metric_name=metric_name,
+                )
+            ],
         )
 
         # Metrics with explicit DMatrix predict to avoid device mismatch warning
