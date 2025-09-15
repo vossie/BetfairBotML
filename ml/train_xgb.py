@@ -1,17 +1,17 @@
 # ml/train_xgb.py
 from __future__ import annotations
 
+import sys
+import pyarrow.fs as pafs
 import argparse
 import os
 from datetime import datetime, timedelta, timezone
 UTC = timezone.utc
 from typing import List, Dict
-
 import numpy as np
 import polars as pl
 import xgboost as xgb
 from sklearn.metrics import log_loss, roc_auc_score
-
 from . import features
 
 # Optional CuPy (GPU arrays). Falls back to NumPy if unavailable.
@@ -22,6 +22,21 @@ except Exception:
     cp = None  # type: ignore
     _HAVE_CUPY = False
 
+
+# --------------------------- check minio ---------------------------
+
+def _check_minio(curated_root: str):
+    try:
+        fs, path = pafs.FileSystem.from_uri(curated_root)
+        infos = fs.get_file_info([path])
+        if infos[0].type == pafs.FileType.NotFound:
+            print(f"ERROR: Curated root not found: {curated_root}", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"✅ MinIO/S3 reachable at {curated_root}")
+    except Exception as e:
+        print(f"ERROR: Failed to reach curated root {curated_root}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 # --------------------------- date helpers ---------------------------
 
@@ -122,6 +137,8 @@ def main():
 
     dates = _daterange(args.date, args.days)
     print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
+
+    _check_minio(args.curated)
 
     # Build features via the streaming builder (memory-safe)
     df_feat, total_raw = features.build_features_streaming(
