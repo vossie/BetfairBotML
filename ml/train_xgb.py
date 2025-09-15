@@ -281,6 +281,9 @@ def main():
         use_gpu=use_gpu,
     )
 
+    device = params["device"]
+    print(f"🚀 Training with XGBoost on {device.upper()} (tree_method={params['tree_method']})")
+
     clf = xgb.XGBClassifier(**params)
     clf.fit(Xtr, ytr)
 
