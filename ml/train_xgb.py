@@ -5,10 +5,9 @@ import argparse
 import os
 import sys
 import time
-import math
 import random
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Iterable, Optional
 
 import numpy as np
 import polars as pl
@@ -118,7 +117,7 @@ def _check_minio(curated_root: str):
         sys.exit(1)
 
 
-# --------------------------- smarter retry ---------------------------
+# --------------------------- resilient S3 retry ---------------------------
 
 _RETRY_MATCHES = (
     "curlCode: 7",                 # couldn't connect
@@ -141,10 +140,10 @@ def _build_features_with_retry(
     dates: List[str],
     preoff_minutes: int,
     batch_markets: int,
-    downsample_secs: int | None,
+    downsample_secs: Optional[int],
     max_attempts: int = 5,
     base_delay: float = 1.5,
-    jitter: float = 0.3,
+    jitter: float = 0.25,
 ) -> Tuple[pl.DataFrame, int]:
     """
     Exponential backoff with jitter. Retries ONLY on transient S3/MinIO errors.
@@ -169,11 +168,8 @@ def _build_features_with_retry(
         except Exception as e:
             last_err = e
             if not _is_transient_s3_error(e) or attempt == max_attempts:
-                # Non-transient or out of attempts: re-raise
                 raise
-            # Compute backoff time with jitter
-            delay = min(30.0, base_delay * (1.6 ** (attempt - 1)))  # cap at 30s
-            # jitter factor in [1-jitter, 1+jitter]
+            delay = min(30.0, base_delay * (1.6 ** (attempt - 1)))
             delay *= (1.0 + random.uniform(-jitter, jitter))
             total_wait += delay
             print(
@@ -182,15 +178,21 @@ def _build_features_with_retry(
                 file=sys.stderr,
             )
             time.sleep(delay)
-    # Should never reach here because we re-raise above
     assert last_err is not None
     raise last_err
+
+
+# --------------------------- chunking (reduce S3 load) ---------------------------
+
+def _chunks(seq: List[str], n: int) -> Iterable[List[str]]:
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
 
 
 # --------------------------- main ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features (with resilient S3 retry).")
+    ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features (chunked + resilient S3 retry).")
     # Source
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
@@ -202,6 +204,9 @@ def main():
     ap.add_argument("--preoff-mins", type=int, default=30)
     ap.add_argument("--batch-markets", type=int, default=100)
     ap.add_argument("--downsample-secs", type=int, default=0)
+
+    # Chunking to ease MinIO pressure
+    ap.add_argument("--chunk-days", type=int, default=2, help="number of days per S3 scan batch (smaller = gentler on MinIO)")
 
     # Model knobs
     ap.add_argument("--label-col", default="winLabel")
@@ -216,24 +221,32 @@ def main():
     _check_minio(args.curated)
 
     dates = _daterange(args.date, args.days)
-    print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
+    print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]} (chunk_days={args.chunk_days})")
 
-    # Build features with resilient retry/backoff
-    df_feat, total_raw = _build_features_with_retry(
-        curated_root=args.curated,
-        sport=args.sport,
-        dates=dates,
-        preoff_minutes=args.preoff_mins,
-        batch_markets=args.batch_markets,
-        downsample_secs=(args.downsample_secs or None),
-        max_attempts=5,
-        base_delay=1.5,
-        jitter=0.25,
-    )
+    # Build features in chunks with resilient retry/backoff
+    df_parts: List[pl.DataFrame] = []
+    total_raw = 0
+    for idx, dchunk in enumerate(_chunks(dates, args.chunk_days), 1):
+        print(f"  • chunk {idx}: {dchunk[0]}..{dchunk[-1]}")
+        df_c, raw_c = _build_features_with_retry(
+            curated_root=args.curated,
+            sport=args.sport,
+            dates=dchunk,
+            preoff_minutes=args.preoff_mins,
+            batch_markets=args.batch_markets,
+            downsample_secs=(args.downsample_secs or None),
+            max_attempts=5,
+            base_delay=1.5,
+            jitter=0.25,
+        )
+        total_raw += raw_c
+        if not df_c.is_empty():
+            df_parts.append(df_c)
 
-    if df_feat.is_empty():
-        raise SystemExit("No features built (empty frame). Check curated paths and date range.")
+    if not df_parts:
+        raise SystemExit("No features built (empty frame). Check curated paths/date range.")
 
+    df_feat = pl.concat(df_parts, how="vertical", rechunk=True)
     print(f"Feature rows: {df_feat.height:,} (from ~{total_raw:,} raw snapshot rows scanned)")
 
     # Sort by time to do a time-based split
@@ -281,6 +294,7 @@ def main():
         use_gpu=use_gpu,
     )
 
+    # Announce device choice
     device = params["device"]
     print(f"🚀 Training with XGBoost on {device.upper()} (tree_method={params['tree_method']})")
 
@@ -290,7 +304,6 @@ def main():
     # Metrics
     if n_classes > 2:
         pva = clf.predict_proba(Xva)
-        # Bring back to NumPy for sklearn metrics if it’s a CuPy array
         if use_gpu and isinstance(pva, cp.ndarray):
             pva = pva.get()
         metrics = {"mlogloss": float(log_loss(yva, pva))}
