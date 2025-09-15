@@ -5,6 +5,8 @@ import argparse
 import os
 import sys
 import time
+import math
+import random
 from datetime import datetime, timedelta
 from typing import List, Dict, Tuple
 
@@ -116,6 +118,23 @@ def _check_minio(curated_root: str):
         sys.exit(1)
 
 
+# --------------------------- smarter retry ---------------------------
+
+_RETRY_MATCHES = (
+    "curlCode: 7",                 # couldn't connect
+    "curlCode: 6",                 # couldn't resolve host
+    "NETWORK_CONNECTION",
+    "Connection reset",
+    "timed out",
+    "Timeout",
+    "RemoteDisconnected",
+)
+
+def _is_transient_s3_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(s in msg for s in _RETRY_MATCHES)
+
+
 def _build_features_with_retry(
     curated_root: str,
     sport: str,
@@ -123,40 +142,55 @@ def _build_features_with_retry(
     preoff_minutes: int,
     batch_markets: int,
     downsample_secs: int | None,
-    wait_seconds: float = 3.0,
+    max_attempts: int = 5,
+    base_delay: float = 1.5,
+    jitter: float = 0.3,
 ) -> Tuple[pl.DataFrame, int]:
     """
-    Call the Polars/Arrow streaming feature builder; on transient S3 errors (e.g., curlCode 7),
-    sleep and retry once.
+    Exponential backoff with jitter. Retries ONLY on transient S3/MinIO errors.
+    On recovery, prints a clear 'Recovered after N attempts' message.
     """
-    try:
-        return features.build_features_streaming(
-            curated_root=curated_root,
-            sport=sport,
-            dates=dates,
-            preoff_minutes=preoff_minutes,
-            batch_markets=batch_markets,
-            downsample_secs=downsample_secs,
-        )
-    except Exception as e:
-        msg = str(e)
-        print(f"WARN: First feature build attempt failed: {msg}\nRetrying once in {wait_seconds} seconds...", file=sys.stderr)
-        time.sleep(wait_seconds)
-        # second (final) attempt
-        return features.build_features_streaming(
-            curated_root=curated_root,
-            sport=sport,
-            dates=dates,
-            preoff_minutes=preoff_minutes,
-            batch_markets=batch_markets,
-            downsample_secs=downsample_secs,
-        )
+    last_err: Exception | None = None
+    total_wait = 0.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            df, total = features.build_features_streaming(
+                curated_root=curated_root,
+                sport=sport,
+                dates=dates,
+                preoff_minutes=preoff_minutes,
+                batch_markets=batch_markets,
+                downsample_secs=downsample_secs,
+            )
+            if attempt > 1:
+                waited = f"{total_wait:.1f}s"
+                print(f"✅ Recovered: MinIO/S3 responded on attempt {attempt} after ~{waited} of backoff.")
+            return df, total
+        except Exception as e:
+            last_err = e
+            if not _is_transient_s3_error(e) or attempt == max_attempts:
+                # Non-transient or out of attempts: re-raise
+                raise
+            # Compute backoff time with jitter
+            delay = min(30.0, base_delay * (1.6 ** (attempt - 1)))  # cap at 30s
+            # jitter factor in [1-jitter, 1+jitter]
+            delay *= (1.0 + random.uniform(-jitter, jitter))
+            total_wait += delay
+            print(
+                f"WARN: Feature build attempt {attempt} failed: {e}\n"
+                f"      Backing off {delay:.1f}s before retry {attempt+1}/{max_attempts}...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+    # Should never reach here because we re-raise above
+    assert last_err is not None
+    raise last_err
 
 
 # --------------------------- main ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features (with S3 retry).")
+    ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features (with resilient S3 retry).")
     # Source
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
@@ -184,7 +218,7 @@ def main():
     dates = _daterange(args.date, args.days)
     print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
 
-    # Build features with a single retry if S3 hiccups
+    # Build features with resilient retry/backoff
     df_feat, total_raw = _build_features_with_retry(
         curated_root=args.curated,
         sport=args.sport,
@@ -192,7 +226,9 @@ def main():
         preoff_minutes=args.preoff_mins,
         batch_markets=args.batch_markets,
         downsample_secs=(args.downsample_secs or None),
-        wait_seconds=3.0,
+        max_attempts=5,
+        base_delay=1.5,
+        jitter=0.25,
     )
 
     if df_feat.is_empty():
