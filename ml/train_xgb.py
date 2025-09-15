@@ -33,6 +33,10 @@ except Exception:
 
 # --------------------------- helpers ---------------------------
 
+def _is_s3_uri(uri: str) -> bool:
+    return uri.startswith("s3://")
+
+
 def _daterange(end_date_str: str, days: int) -> List[str]:
     """Inclusive date range: [end - (days-1), end], formatted YYYY-MM-DD."""
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
@@ -100,15 +104,16 @@ def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
     return cols
 
 
-def _check_minio(curated_root: str):
-    """Fail fast if the curated root/bucket is not reachable with current env."""
+def _check_store(curated_root: str):
+    """Fail fast if the curated root (local or s3) is not reachable with current env."""
     try:
         fs, path = pafs.FileSystem.from_uri(curated_root)
         info = fs.get_file_info([path])[0]
         if info.type == pafs.FileType.NotFound:
             print(f"ERROR: Curated root not found: {curated_root}", file=sys.stderr)
             sys.exit(1)
-        print(f"✅ MinIO/S3 reachable at {curated_root}")
+        prefix = "MinIO/S3" if _is_s3_uri(curated_root) else "Local FS"
+        print(f"✅ {prefix} reachable at {curated_root}")
     except Exception as e:
         print(f"ERROR: Failed to reach curated root {curated_root}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -138,14 +143,27 @@ def _build_features_with_retry(
     preoff_minutes: int,
     batch_markets: int,
     downsample_secs: Optional[int],
+    is_s3: bool,
     max_attempts: int = 5,
     base_delay: float = 1.5,
     jitter: float = 0.25,
 ) -> Tuple[pl.DataFrame, int]:
     """
-    Exponential backoff with jitter. Retries ONLY on transient S3/MinIO errors.
-    On recovery, prints a clear 'Recovered after N attempts' message.
+    For S3/MinIO: exponential backoff with jitter on transient network errors.
+    For local disk: just call once (no retry needed).
     """
+    if not is_s3:
+        # Local disk path: single attempt
+        return features.build_features_streaming(
+            curated_root=curated_root,
+            sport=sport,
+            dates=dates,
+            preoff_minutes=preoff_minutes,
+            batch_markets=batch_markets,
+            downsample_secs=downsample_secs,
+        )
+
+    # S3 / MinIO path with retry
     last_err: Exception | None = None
     total_wait = 0.0
     for attempt in range(1, max_attempts + 1):
@@ -189,9 +207,11 @@ def _chunks(seq: List[str], n: int) -> Iterable[List[str]]:
 # --------------------------- main ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="XGBoost trainer (GPU-capable) with chunked S3 reads, retry, early stopping, and a small param sweep.")
-    # Source
-    ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
+    ap = argparse.ArgumentParser(
+        description="XGBoost trainer (GPU-capable) reading from Local or MinIO/S3, with chunked reads, retry, early stopping, and a small param sweep."
+    )
+    # Source (either s3://... OR local path like /data/betfair-curated)
+    ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] OR /local/path (rsynced mirror)")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
     ap.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
                     help="anchor date YYYY-MM-DD (treated as END of window)")
@@ -203,7 +223,7 @@ def main():
     ap.add_argument("--downsample-secs", type=int, default=0)
 
     # Chunking to ease MinIO pressure
-    ap.add_argument("--chunk-days", type=int, default=2, help="number of days per S3 scan batch (smaller = gentler on MinIO)")
+    ap.add_argument("--chunk-days", type=int, default=2, help="number of days per scan batch (smaller = gentler on MinIO). Ignored for tiny ranges.")
 
     # Device control
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
@@ -222,16 +242,18 @@ def main():
 
     args = ap.parse_args()
 
-    # Sanity check MinIO/S3 path first (catches endpoint/region issues early)
-    _check_minio(args.curated)
+    # Detect storage type and preflight
+    is_s3 = _is_s3_uri(args.curated)
+    _check_store(args.curated)
 
     dates = _daterange(args.date, args.days)
-    print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]} (chunk_days={args.chunk_days})")
+    src_label = "MinIO/S3" if is_s3 else "Local FS"
+    print(f"Building features from [{src_label}] curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]} (chunk_days={args.chunk_days})")
 
-    # Build features in chunks with resilient retry/backoff
+    # Build features in chunks (still helpful on local if there are many files)
     df_parts: List[pl.DataFrame] = []
     total_raw = 0
-    for idx, dchunk in enumerate(_chunks(dates, args.chunk_days), 1):
+    for idx, dchunk in enumerate(_chunks(dates, max(1, args.chunk_days)), 1):
         print(f"  • chunk {idx}: {dchunk[0]}..{dchunk[-1]}")
         df_c, raw_c = _build_features_with_retry(
             curated_root=args.curated,
@@ -240,6 +262,7 @@ def main():
             preoff_minutes=args.preoff_mins,
             batch_markets=args.batch_markets,
             downsample_secs=(args.downsample_secs or None),
+            is_s3=is_s3,
             max_attempts=5,
             base_delay=1.5,
             jitter=0.25,
@@ -353,7 +376,7 @@ def main():
 
         # Metrics with explicit DMatrix predict to avoid device mismatch warning
         booster = clf.get_booster()
-        dval = xgb.DMatrix(Xva_np)
+        dval = xgb.DMatrix(Xva_np)  # NumPy on CPU; no mismatch warnings
         pva = booster.predict(dval)
         if n_classes > 2:
             m = {"mlogloss": float(log_loss(yva, pva))}
@@ -377,7 +400,6 @@ def main():
 
     # Print sweep summary
     if results:
-        # compact table
         headers = list(results[0].keys())
         print("\n=== Sweep Summary ===")
         print(" | ".join(headers))
