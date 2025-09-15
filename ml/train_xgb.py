@@ -19,7 +19,7 @@ from . import features
 
 # ---------- Optional CuPy (GPU arrays). Verify CUDA runtime is actually available ----------
 try:
-    import cupy as cp  # pip install cupy-cuda12x  (or cupy-cuda11x)
+    import cupy as cp  # pip install cupy-cuda12x (or cupy-cuda11x)
     try:
         _ = cp.cuda.runtime.getVersion()  # confirms CUDA runtime is visible
         _HAVE_CUPY = True
@@ -192,7 +192,7 @@ def _chunks(seq: List[str], n: int) -> Iterable[List[str]]:
 # --------------------------- main ---------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features (chunked + resilient S3 retry).")
+    ap = argparse.ArgumentParser(description="XGBoost trainer over curated Betfair features (GPU-capable, chunked + resilient S3 retry).")
     # Source
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
@@ -207,6 +207,10 @@ def main():
 
     # Chunking to ease MinIO pressure
     ap.add_argument("--chunk-days", type=int, default=2, help="number of days per S3 scan batch (smaller = gentler on MinIO)")
+
+    # Device control
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
+                    help="Force device for XGBoost. 'auto' = use GPU if available.")
 
     # Model knobs
     ap.add_argument("--label-col", default="winLabel")
@@ -268,17 +272,26 @@ def main():
     train_df = df_feat.slice(0, n_train)
     valid_df = df_feat.slice(n_train, n_valid)
 
-    # Build feature arrays (float32). We'll move to CuPy if GPU is available.
+    # Build feature arrays (float32). We'll move to CuPy if available.
     Xtr_np = train_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
     ytr = train_df.select(label_col).to_numpy().ravel()
     Xva_np = valid_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
     yva = valid_df.select(label_col).to_numpy().ravel()
 
-    # Decide GPU usage; require CuPy so BOTH train/val live on GPU to avoid device mismatch.
-    use_gpu = _has_nvidia_gpu() and _HAVE_CUPY
+    # Decide device: user override or auto
+    if args.device == "cuda":
+        use_gpu = True
+    elif args.device == "cpu":
+        use_gpu = False
+    else:
+        use_gpu = _has_nvidia_gpu()
 
-    # Convert BOTH training and validation features to CuPy when using GPU; otherwise keep NumPy.
-    if use_gpu:
+    # GPU diagnostics print
+    print(f"[diag] xgboost={xgb.__version__}, CUDA visible={use_gpu}, CuPy={_HAVE_CUPY}, CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES','<unset>')}")
+
+    # Convert BOTH training and validation features to CuPy when CuPy is available; otherwise keep NumPy.
+    # (XGBoost can still train on GPU without CuPy; CuPy just avoids device-mismatch warnings.)
+    if use_gpu and _HAVE_CUPY:
         Xtr = cp.asarray(Xtr_np, dtype=cp.float32)
         Xva = cp.asarray(Xva_np, dtype=cp.float32)
     else:
@@ -304,12 +317,12 @@ def main():
     # Metrics
     if n_classes > 2:
         pva = clf.predict_proba(Xva)
-        if use_gpu and isinstance(pva, cp.ndarray):
+        if _HAVE_CUPY and isinstance(pva, (cp.ndarray,)):
             pva = pva.get()
         metrics = {"mlogloss": float(log_loss(yva, pva))}
     else:
         pva = clf.predict_proba(Xva)[:, 1]
-        if use_gpu and isinstance(pva, cp.ndarray):
+        if _HAVE_CUPY and isinstance(pva, (cp.ndarray,)):
             pva = pva.get()
         pva = np.clip(pva, 1e-6, 1 - 1e-6)
         metrics = {"logloss": float(log_loss(yva, pva))}
