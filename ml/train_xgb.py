@@ -281,7 +281,7 @@ def main():
         & pl.col(label_col).is_finite()
     )
 
-    unique_labels = df_feat.select(pl.col(label_col)).unique().collect().to_series()
+    unique_labels = df_feat.select(pl.col(label_col)).unique().to_series()
     if unique_labels.len() > 0 and all(l in (0, 1) for l in unique_labels.drop_nulls().to_list()):
         df_feat = df_feat.filter(pl.col(label_col).is_in([0, 1]))
     else:
