@@ -1,57 +1,46 @@
 # ml/train_xgb.py
 from __future__ import annotations
 
-import sys
-import pyarrow.fs as pafs
 import argparse
 import os
-from datetime import datetime, timedelta, timezone
-UTC = timezone.utc
+import sys
+from datetime import datetime, timedelta
 from typing import List, Dict
+
 import numpy as np
 import polars as pl
 import xgboost as xgb
 from sklearn.metrics import log_loss, roc_auc_score
+
+import pyarrow.fs as pafs
 from . import features
 
-# Optional CuPy (GPU arrays). Falls back to NumPy if unavailable.
+# ---------- optional CuPy (GPU arrays). Falls back to NumPy if unavailable ----------
 try:
-    import cupy as cp  # pip install cupy-cuda12x  (or cupy-cuda11x)
-    _HAVE_CUPY = True
+    import cupy as cp
+    try:
+        _ = cp.cuda.runtime.getVersion()  # verify CUDA runtime is available
+        _HAVE_CUPY = True
+    except Exception:
+        cp = None  # type: ignore
+        _HAVE_CUPY = False
 except Exception:
     cp = None  # type: ignore
     _HAVE_CUPY = False
 
 
-# --------------------------- check minio ---------------------------
-
-def _check_minio(curated_root: str):
-    try:
-        fs, path = pafs.FileSystem.from_uri(curated_root)
-        infos = fs.get_file_info([path])
-        if infos[0].type == pafs.FileType.NotFound:
-            print(f"ERROR: Curated root not found: {curated_root}", file=sys.stderr)
-            sys.exit(1)
-        else:
-            print(f"✅ MinIO/S3 reachable at {curated_root}")
-    except Exception as e:
-        print(f"ERROR: Failed to reach curated root {curated_root}: {e}", file=sys.stderr)
-        sys.exit(1)
-
-# --------------------------- date helpers ---------------------------
+# --------------------------- helpers ---------------------------
 
 def _daterange(end_date_str: str, days: int) -> List[str]:
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
     start = end - timedelta(days=days - 1)
-    d = start
     out: List[str] = []
+    d = start
     while d <= end:
         out.append(d.strftime("%Y-%m-%d"))
         d += timedelta(days=1)
     return out
 
-
-# --------------------------- GPU helpers ---------------------------
 
 def _has_nvidia_gpu() -> bool:
     try:
@@ -62,7 +51,6 @@ def _has_nvidia_gpu() -> bool:
 
 
 def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimators: int, use_gpu: bool) -> Dict:
-    # XGBoost >= 2.0 uses device="cuda" with tree_method="hist" for GPU
     params: Dict = {
         "tree_method": "hist",
         "device": "cuda" if use_gpu else "cpu",
@@ -90,10 +78,8 @@ def _xgb_params(n_classes: int, learning_rate: float, max_depth: int, n_estimato
     return params
 
 
-# --------------------------- feature selection ---------------------------
-
 def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
-    # Exclude IDs, timestamps, labels, and any label-derived helpers to avoid leakage
+    # Exclude IDs, timestamps, labels, and label-derived helpers to avoid leakage
     exclude = {
         "marketId", "selectionId", "ts", "ts_ms", "publishTimeMs",
         label_col, "soft_target", "sum_win_in_mkt", "runnerStatus"
@@ -112,12 +98,27 @@ def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
     return cols
 
 
+def _check_minio(curated_root: str):
+    try:
+        fs, path = pafs.FileSystem.from_uri(curated_root)
+        info = fs.get_file_info([path])[0]
+        if info.type == pafs.FileType.NotFound:
+            print(f"ERROR: Curated root not found: {curated_root}", file=sys.stderr)
+            sys.exit(1)
+        print(f"✅ MinIO/S3 reachable at {curated_root}")
+    except Exception as e:
+        print(f"ERROR: Failed to reach curated root {curated_root}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+# --------------------------- main ---------------------------
+
 def main():
     ap = argparse.ArgumentParser(description="GPU-accelerated XGBoost trainer over curated Betfair features.")
     # Source
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
     ap.add_argument("--sport", required=True, help="e.g. horse-racing")
-    ap.add_argument("--date", default=datetime.now(UTC).strftime("%Y-%m-%d"),
+    ap.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"),
                     help="anchor date YYYY-MM-DD (treated as END of window)")
     ap.add_argument("--days", type=int, default=1, help="number of days back from --date (inclusive)")
 
@@ -135,12 +136,11 @@ def main():
 
     args = ap.parse_args()
 
+    # Sanity check MinIO/S3 path
     _check_minio(args.curated)
 
     dates = _daterange(args.date, args.days)
     print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
-
-
 
     # Build features via the streaming builder (memory-safe)
     df_feat, total_raw = features.build_features_streaming(
