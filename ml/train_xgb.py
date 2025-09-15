@@ -135,10 +135,12 @@ def main():
 
     args = ap.parse_args()
 
+    _check_minio(args.curated)
+
     dates = _daterange(args.date, args.days)
     print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
 
-    _check_minio(args.curated)
+
 
     # Build features via the streaming builder (memory-safe)
     df_feat, total_raw = features.build_features_streaming(
