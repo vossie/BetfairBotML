@@ -18,11 +18,11 @@ from sklearn.metrics import log_loss, roc_auc_score
 import pyarrow.fs as pafs
 from . import features
 
-# ---------- Optional CuPy (GPU arrays). Verify CUDA runtime is actually available ----------
+# ---------- Optional CuPy (GPU arrays). Only used to keep arrays on-GPU if available ----------
 try:
     import cupy as cp  # pip install cupy-cuda12x (or cupy-cuda11x)
     try:
-        _ = cp.cuda.runtime.getVersion()  # confirms CUDA runtime is visible
+        _ = cp.cuda.runtime.getVersion()
         _HAVE_CUPY = True
     except Exception:
         cp = None  # type: ignore
@@ -60,7 +60,7 @@ def _has_nvidia_gpu() -> bool:
 
 
 def _xgb_base_params(n_classes: int, use_gpu: bool) -> Dict:
-    """Base params; per-run hyperparams layered on top."""
+    """Base params for xgboost.train; per-run hyperparams are layered on top."""
     params: Dict = {
         "tree_method": "hist",
         "device": "cuda" if use_gpu else "cpu",
@@ -68,7 +68,6 @@ def _xgb_base_params(n_classes: int, use_gpu: bool) -> Dict:
         "colsample_bytree": 0.8,
         "reg_lambda": 1.0,
         "reg_alpha": 0.0,
-        "random_state": 42,
         "verbosity": 1,
     }
     if n_classes > 2:
@@ -96,7 +95,7 @@ def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
         if c in exclude:
             continue
         lc = c.lower()
-        if "label" in lc or "target" in lc:  # extra guard
+        if "label" in lc or "target" in lc:
             continue
         if dt.is_numeric():
             cols.append(c)
@@ -203,6 +202,59 @@ def _chunks(seq: List[str], n: int) -> Iterable[List[str]]:
         yield seq[i:i + n]
 
 
+# --------------------------- training via xgboost.train ---------------------------
+
+def _train_one_run(
+    params: Dict,
+    Xtr_np: np.ndarray,
+    ytr: np.ndarray,
+    Xva_np: np.ndarray,
+    yva: np.ndarray,
+    num_boost_round: int,
+    early_stopping_rounds: int,
+    metric_name: str,
+) -> Tuple[xgb.Booster, Dict]:
+    """
+    Train with xgboost.train so we can always use EarlyStopping callbacks,
+    regardless of sklearn wrapper support.
+    """
+    # DMatrix on CPU host memory is fine; device is controlled via params["device"].
+    dtrain = xgb.DMatrix(Xtr_np, label=ytr)
+    dvalid = xgb.DMatrix(Xva_np, label=yva)
+
+    booster = xgb.train(
+        params=params,
+        dtrain=dtrain,
+        num_boost_round=num_boost_round,
+        evals=[(dvalid, "validation_0")],
+        callbacks=[
+            EarlyStopping(
+                rounds=early_stopping_rounds,
+                save_best=True,
+                maximize=False,
+                data_name="validation_0",
+                metric_name=metric_name,
+            )
+        ],
+    )
+
+    # Predict on validation to compute metrics
+    pva = booster.predict(dvalid)  # prob per class or prob for class 1 depending on objective
+    if params.get("objective", "").startswith("multi:"):
+        metrics = {"mlogloss": float(log_loss(yva, pva))}
+    else:
+        if pva.ndim == 2 and pva.shape[1] > 1:
+            pva = pva[:, 1]
+        pva = np.clip(pva, 1e-6, 1 - 1e-6)
+        metrics = {"logloss": float(log_loss(yva, pva))}
+        try:
+            metrics["auc"] = float(roc_auc_score(yva, pva))
+        except Exception:
+            pass
+
+    return booster, metrics
+
+
 # --------------------------- main ---------------------------
 
 def main():
@@ -222,7 +274,7 @@ def main():
     ap.add_argument("--downsample-secs", type=int, default=0)
 
     # Chunking to ease MinIO pressure
-    ap.add_argument("--chunk-days", type=int, default=2, help="number of days per scan batch (smaller = gentler on MinIO). Ignored for tiny ranges.")
+    ap.add_argument("--chunk-days", type=int, default=2, help="number of days per scan batch (smaller = gentler on MinIO).")
 
     # Device control
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto",
@@ -295,7 +347,7 @@ def main():
     train_df = df_feat.slice(0, n_train)
     valid_df = df_feat.slice(n_train, n_valid)
 
-    # Build feature arrays (float32). We'll move to CuPy if available.
+    # Build feature arrays (float32). We'll keep NumPy on host; GPU use is controlled by params['device'].
     Xtr_np = train_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
     ytr = train_df.select(label_col).to_numpy().ravel()
     Xva_np = valid_df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
@@ -311,17 +363,13 @@ def main():
 
     # Diagnostics
     print(f"[diag] xgboost={xgb.__version__}, CUDA visible={use_gpu}, CuPy={_HAVE_CUPY}, CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES','<unset>')}")
-
-    # Convert BOTH training and validation features to CuPy when CuPy is available; otherwise keep NumPy.
-    if use_gpu and _HAVE_CUPY:
-        Xtr = cp.asarray(Xtr_np, dtype=cp.float32)
-        Xva = cp.asarray(Xva_np, dtype=cp.float32)
-    else:
-        Xtr, Xva = Xtr_np, Xva_np
+    device_str = "CUDA" if use_gpu else "CPU"
+    print(f"🚀 Training with XGBoost on {device_str} (tree_method=hist)")
 
     # Binary vs multi-class
     n_classes = int(pl.Series(ytr).unique().len())
     base_params = _xgb_base_params(n_classes, use_gpu)
+    base_params["learning_rate"] = args.learning_rate
 
     # Hyperparameter candidates
     if args.sweep:
@@ -336,9 +384,12 @@ def main():
             {"max_depth": 6, "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 0.0},
         ]
 
+    # Metric name for EarlyStopping
+    metric_name = "mlogloss" if n_classes > 2 else "logloss"
+
     # Run sweep
     results = []
-    best = None  # (logloss, model, params, metrics)
+    best = None  # (crit, booster, params, metrics)
     for i, hp in enumerate(grid, 1):
         params = {
             **base_params,
@@ -348,63 +399,29 @@ def main():
             "colsample_bytree": hp["colsample_bytree"],
             "reg_lambda": hp["reg_lambda"],
             "reg_alpha": hp["reg_alpha"],
-            "learning_rate": args.learning_rate,
-            "n_estimators": args.n_estimators,
         }
 
-        # Announce device choice
-        device = params["device"]
         print(f"\n=== Sweep {i}/{len(grid)}: {hp} ===")
-        print(f"🚀 Training with XGBoost on {device.upper()} (tree_method={params['tree_method']}) | "
-              f"n_estimators={params['n_estimators']} lr={params['learning_rate']}")
+        print(f"   n_estimators={args.n_estimators}  lr={params['learning_rate']}")
 
-        clf = xgb.XGBClassifier(**params)
-
-        # Early stopping via callback API
-        metric_name = "mlogloss" if n_classes > 2 else "logloss"
-        if use_gpu and _HAVE_CUPY:
-            eval_set = [(Xva, yva)]
-        else:
-            eval_set = [(Xva_np, yva)]
-
-        clf.fit(
-            Xtr, ytr,
-            eval_set=eval_set,
-            verbose=False,
-            callbacks=[
-                EarlyStopping(
-                    rounds=args.early_stopping_rounds,
-                    save_best=True,
-                    maximize=False,
-                    data_name="validation_0",
-                    metric_name=metric_name,
-                )
-            ],
+        booster, metrics = _train_one_run(
+            params=params,
+            Xtr_np=Xtr_np,
+            ytr=ytr,
+            Xva_np=Xva_np,
+            yva=yva,
+            num_boost_round=args.n_estimators,
+            early_stopping_rounds=args.early_stopping_rounds,
+            metric_name=metric_name,
         )
 
-        # Metrics with explicit DMatrix predict to avoid device mismatch warning
-        booster = clf.get_booster()
-        dval = xgb.DMatrix(Xva_np)  # NumPy on CPU; no mismatch warnings
-        pva = booster.predict(dval)
-        if n_classes > 2:
-            m = {"mlogloss": float(log_loss(yva, pva))}
-        else:
-            if pva.ndim == 2 and pva.shape[1] > 1:
-                pva = pva[:, 1]
-            pva = np.clip(pva, 1e-6, 1 - 1e-6)
-            m = {"logloss": float(log_loss(yva, pva))}
-            try:
-                m["auc"] = float(roc_auc_score(yva, pva))
-            except Exception:
-                pass
-
-        print(f"→ Metrics: {m}")
-        row = {**hp, **m, "best_iteration": getattr(clf, "best_iteration", None)}
+        print(f"→ Metrics: {metrics}")
+        row = {**hp, **metrics, "best_iteration": booster.best_iteration if hasattr(booster, "best_iteration") else None}
         results.append(row)
 
-        crit = m.get("logloss", m.get("mlogloss", 1e9))
+        crit = metrics.get("logloss", metrics.get("mlogloss", 1e9))
         if (best is None) or (crit < best[0]):
-            best = (crit, clf, params, m)
+            best = (crit, booster, params, metrics)
 
     # Print sweep summary
     if results:
@@ -413,7 +430,6 @@ def main():
         print(" | ".join(headers))
         for r in results:
             print(" | ".join(str(r.get(h)) for h in headers))
-
         # Optionally write CSV
         try:
             import csv
@@ -428,8 +444,8 @@ def main():
     # Save best model
     if best is None:
         raise SystemExit("Training failed to produce any model.")
-    _, best_model, best_params, best_metrics = best
-    best_model.save_model(args.model_out)
+    _, best_booster, best_params, best_metrics = best
+    best_booster.save_model(args.model_out)
     print(f"\nBest params: { {k: best_params[k] for k in ('max_depth','min_child_weight','subsample','colsample_bytree','reg_lambda','reg_alpha','learning_rate')} }")
     print(f"Best metrics: {best_metrics}")
     print(f"Saved best model to {args.model_out}")
