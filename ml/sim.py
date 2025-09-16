@@ -183,12 +183,11 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
         bets.sort(["marketId", "edge"], descending=[False, True])
         .with_columns(
             pl.len().over("marketId").alias("n_in_market"),
-            pl.cumcount().over("marketId").alias("rank_in_market"),
+            pl.cum_count().over("marketId").alias("rank_in_market"),
         )
         .filter(pl.col("rank_in_market") < top_n)
         .drop(["n_in_market", "rank_in_market"])
     )
-
 
 def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
     """
