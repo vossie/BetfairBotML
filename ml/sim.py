@@ -301,7 +301,7 @@ def _binwise_pnl(bets: pl.DataFrame, bins: List[int]) -> pl.DataFrame:
     edges = bins
     labels = [f"{edges[i]:>3}-{edges[i+1]:>3}" for i in range(len(edges)-1)]
     dfb = bets.with_columns(
-        pl.cut(pl.col("tto_minutes"), bins=edges, labels=labels, include_breaks=False).alias("tto_bin")
+        pl.col("tto_minutes").bucket(breaks=edges, include_breaks=False).alias("tto_bin")
     )
     out = (
         dfb.group_by("tto_bin")

@@ -1,5 +1,6 @@
 #!/bin/bash
 # run.sh
+cd /opt/BetfairBotML || exit
 
 if [ $# -lt 1 ]; then
   echo "Usage: $0 <DATE: YYYY-MM-DD>"

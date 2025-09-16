@@ -1,7 +1,7 @@
 #!/bin/bash
 # run.sh
 
-cd /opt/BetfairBotML
+cd /opt/BetfairBotML || exit
 
 # Load environment variables from set-env-vars-prod.sh
 source "$(dirname "$0")/set-env-vars-prod.sh"
