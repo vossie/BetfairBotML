@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Optional, Tuple, Dict
+from typing import List
 
 import numpy as np
 import polars as pl
@@ -26,11 +26,12 @@ def _outpath(p: str) -> str:
     return str(OUTPUT_DIR / pp.name)
 
 
-# ----------------------------- date & features utils -----------------------------
+# ----------------------------- date & feature utils -----------------------------
 
 def _daterange(end_date_str: str, days: int) -> List[str]:
     """
     Build a list of YYYY-MM-DD strings covering [end - (days-1) ... end], inclusive.
+    Example: end=2025-09-15, days=2 -> ["2025-09-14","2025-09-15"]
     """
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
     start = end - timedelta(days=days - 1)
@@ -42,19 +43,31 @@ def _daterange(end_date_str: str, days: int) -> List[str]:
     return out
 
 
+def _is_numeric_dtype(dt) -> bool:
+    try:
+        return dt.is_numeric()
+    except AttributeError:
+        return dt in {
+            pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+            pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+            pl.Float32, pl.Float64,
+        }
+
+
 def _select_feature_cols(df: pl.DataFrame, label_col: str) -> List[str]:
     exclude = {
-        "marketId", "selectionId", "ts", "ts_ms",
+        "sport", "marketId", "selectionId", "ts", "ts_ms",
         "publishTimeMs", label_col, "runnerStatus", "p_hat",
     }
     cols: List[str] = []
-    schema = df.collect_schema()
-    for name, dtype in zip(schema.names(), schema.dtypes()):
+    schema = df.schema  # dict[name -> dtype]
+    for name, dtype in schema.items():
         if name in exclude:
             continue
-        if "label" in name.lower() or "target" in name.lower():
+        lname = name.lower()
+        if "label" in lname or "target" in lname:
             continue
-        if dtype.is_numeric():
+        if _is_numeric_dtype(dtype):
             cols.append(name)
     if not cols:
         raise RuntimeError("No numeric feature columns found.")
@@ -90,9 +103,9 @@ def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
     """
     Compute fair odds from p_hat; implied from ltp; edge for back/lay; pick side if auto.
     Assumptions:
-      - 'ltp' is the available back price proxy (odds). If missing/<=1, we drop the row.
-      - edge_back   = p_hat - implied_prob
-      - edge_lay    = (1 - p_hat) - (1 - implied_prob) = implied_prob - p_hat  (mirror)
+      - 'ltp' is the available back price proxy (odds). If missing/<=1, drop the row.
+      - edge_back = p_hat - implied_prob
+      - edge_lay  = implied_prob - p_hat (mirror)
     """
     have_cols = set(df.columns)
     if "p_hat" not in have_cols:
@@ -101,7 +114,6 @@ def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
         raise RuntimeError("ltp missing. Needed for implied_prob/odds.")
 
     out = df.with_columns([
-        # guard against bad odds
         pl.when(pl.col("ltp") > 1.0).then(pl.col("ltp")).otherwise(None).alias("odds"),
     ]).drop_nulls(["odds"])
 
@@ -126,7 +138,6 @@ def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
             pl.col("edge_lay").alias("edge"),
         ])
     else:
-        # auto: choose the larger positive edge; if both negative, take the less negative (we'll filter later)
         out = out.with_columns([
             pl.when(pl.col("edge_back") >= pl.col("edge_lay")).then(pl.lit("back")).otherwise(pl.lit("lay")).alias("side"),
             pl.max_horizontal(["edge_back", "edge_lay"]).alias("edge"),
@@ -136,13 +147,13 @@ def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
 
 def _kelly_stake_units(p: np.ndarray, odds: np.ndarray, frac: float) -> np.ndarray:
     """
-    Kelly fraction for BACK bets: f* = frac * (b p - q) / b, b = odds-1.
-    For lay, we reuse this stake as 'exposure units'; we handle pnl separately.
+    Kelly fraction for BACK bets: f* = frac * (b p - q) / b, where b = odds-1.
+    For lay, we reuse this stake as 'exposure units'; PnL handled separately.
     """
     b = np.maximum(odds - 1.0, 1e-9)
     q = 1.0 - p
     f = frac * (b * p - q) / b
-    f = np.clip(f, 0.0, 1.0)  # no negative stakes
+    f = np.clip(f, 0.0, 1.0)
     return f
 
 
@@ -159,7 +170,7 @@ def _build_bets_table(
     # filter by edge threshold
     df2 = df2.filter(pl.col("edge") >= min_edge)
 
-    # Kelly stakes in "units" (relative bankroll); we'll treat 1.0 as one unit
+    # Kelly stakes in "units" (relative bankroll)
     p = df2["p_hat"].to_numpy()
     odds = df2["odds"].to_numpy()
     stake_units = _kelly_stake_units(p, odds, kelly_frac)
@@ -180,16 +191,16 @@ def _build_bets_table(
 
 def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
     """
-    Pick top-N by edge within each market; works across old/new Polars (no row_number/cum_count assumptions).
+    Pick top-N by edge within each market; Polars-version-agnostic using per-group arange.
     """
     if bets.is_empty():
         return bets
+    length_expr = getattr(pl, "len", None) or pl.count
     return (
         bets.sort(["marketId", "edge"], descending=[False, True])
         .with_columns(
-            (getattr(pl, "len", None) or pl.count)().over("marketId").alias("n_in_market"),
-            # version-agnostic per-group rank: 0..N-1
-            pl.arange(0, (getattr(pl, "len", None) or pl.count)()).over("marketId").alias("rank_in_market"),
+            length_expr().over("marketId").alias("n_in_market"),
+            pl.arange(0, length_expr()).over("marketId").alias("rank_in_market"),
         )
         .filter(pl.col("rank_in_market") < top_n)
         .drop(["n_in_market", "rank_in_market"])
@@ -198,90 +209,117 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
 
 def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
     """
-    Apply caps per market and per day, then enforce a £1 minimum stake:
-    - If stake == 0 -> stay 0
-    - If 0 < stake < 1 -> round up to 1
-    - Else keep stake
+    1) Proportionally cap 'stake_unit' per market to cap_market.
+    2) Floor any positive stake to £1.
+    3) Re-normalize per market so total <= cap_market with £1 min respected.
+       - If cap_market < number of positive bets, keep the highest-priority bets (by edge, then original stake) and drop the rest.
+    4) Re-normalize per day similarly (with £1 min).
+    Returns a DataFrame with final 'stake' column (float, £ units).
     """
     if bets.is_empty():
         return bets
 
-    # Cap per market
-    b1 = (
-        bets.with_columns([
-            pl.col("stake_unit").cum_sum().over("marketId").alias("cum_mkt"),
-        ])
-        .with_columns([
-            pl.when(pl.col("cum_mkt") <= cap_market)
-            .then(pl.col("stake_unit"))
-            .otherwise(pl.col("stake_unit") * (cap_market / pl.col("cum_mkt")))
-            .alias("stake_unit_capped_mkt")
-        ])
-        .drop(["cum_mkt"])
-    )
-
-    # Cap per day
-    b1 = b1.with_columns([
-        (pl.col("publishTimeMs") // (1000 * 60 * 60 * 24)).alias("day_bucket")
-    ])
-    b2 = (
-        b1.with_columns([
-            pl.col("stake_unit_capped_mkt").cum_sum().over("day_bucket").alias("cum_day"),
-        ])
-        .with_columns([
-            pl.when(pl.col("cum_day") <= cap_day)
-            .then(pl.col("stake_unit_capped_mkt"))
-            .otherwise(pl.col("stake_unit_capped_mkt") * (cap_day / pl.col("cum_day")))
-            .alias("stake_unit_final")
-        ])
-        .drop(["cum_day", "day_bucket"])
-    )
-
-    # Enforce £1 minimum without clip_lower (works on old Polars)
-    b2 = b2.with_columns([
-        pl.when(pl.col("stake_unit_final") <= 0)
-        .then(0.0)
-        .when(pl.col("stake_unit_final") < 1.0)
-        .then(1.0)
-        .otherwise(pl.col("stake_unit_final"))
-        .alias("stake")
+    # Priority columns for trimming when caps are tight
+    with_priority = bets.with_columns([
+        (pl.col("edge") if "edge" in bets.columns else pl.lit(0.0)).alias("_priority_edge"),
+        pl.col("stake_unit").alias("_priority_stake_unit"),
     ])
 
-    return b2
+    # Step 1: proportional market cap on stake_unit
+    mkt_sum = with_priority.group_by("marketId").agg(pl.sum("stake_unit").alias("_sum_mkt"))
+    b1 = with_priority.join(mkt_sum, on="marketId", how="left").with_columns([
+        pl.when(pl.col("_sum_mkt") > 0)
+        .then(pl.min_horizontal([pl.lit(1.0), pl.lit(cap_market) / pl.col("_sum_mkt")]))
+        .otherwise(pl.lit(0.0))
+        .alias("_mkt_scale")
+    ]).with_columns([
+        (pl.col("stake_unit") * pl.col("_mkt_scale")).alias("_stake_mkt")
+    ]).drop("_sum_mkt", "_mkt_scale")
 
+    # Step 2: apply £1 floor to any positive stake
+    b2 = b1.with_columns([
+        pl.when(pl.col("_stake_mkt") <= 0.0).then(0.0)
+        .when(pl.col("_stake_mkt") < 1.0).then(1.0)
+        .otherwise(pl.col("_stake_mkt"))
+        .alias("_stake_floor")
+    ])
 
+    # Helper: re-normalize within a group under a cap with £1 floor
+    def _renorm_group(df: pl.DataFrame, cap: float) -> pl.DataFrame:
+        df = df.sort(by=["_priority_edge", "_priority_stake_unit"], descending=[True, True])
+
+        stake = df["_stake_floor"].to_numpy().astype(float)
+        pos = stake > 0
+        n_pos = int(pos.sum())
+
+        if n_pos == 0 or cap <= 0:
+            stake[:] = 0.0
+            return df.with_columns(pl.Series("_stake_grouped", stake))
+
+        if cap < n_pos:
+            # Not enough budget to give £1 to each positive bet -> keep top k bets at £1
+            k = int(cap)
+            stake_new = np.zeros_like(stake)
+            if k > 0:
+                idx_pos = np.flatnonzero(pos)
+                keep_idx = idx_pos[:k]
+                stake_new[keep_idx] = 1.0
+            return df.with_columns(pl.Series("_stake_grouped", stake_new))
+
+        # Give every positive bet at least £1, then distribute remaining budget proportionally
+        base = float(n_pos)  # minimal sum after floor
+        budget = cap - base
+
+        excess = np.where(pos, np.maximum(stake - 1.0, 0.0), 0.0)
+        sum_excess = float(excess.sum())
+
+        if sum_excess <= budget + 1e-12:
+            return df.with_columns(pl.Series("_stake_grouped", stake))
+
+        scale = budget / sum_excess if sum_excess > 0 else 0.0
+        new_excess = excess * scale
+        stake_new = np.where(pos, 1.0 + new_excess, 0.0)
+        return df.with_columns(pl.Series("_stake_grouped", stake_new))
+
+    # Step 3: re-normalize per market with £1 floor
+    b3 = b2.group_by("marketId", maintain_order=True).apply(lambda g: _renorm_group(g, cap_market))
+
+    # Step 4: day bucket, then re-normalize per day
+    b4 = b3.with_columns([
+        (pl.col("publishTimeMs") // (1000 * 60 * 60 * 24)).alias("_day_bucket")
+    ])
+    b5 = b4.group_by("_day_bucket", maintain_order=True).apply(lambda g: _renorm_group(g, cap_day))
+
+    out = b5.rename({"_stake_grouped": "stake"}).drop(
+        "_priority_edge", "_priority_stake_unit", "_stake_mkt", "_stake_floor", "_day_bucket"
+    )
+    return out
 
 
 def _pnl_columns(bets: pl.DataFrame, commission: float) -> pl.DataFrame:
     """
-    Compute PnL per bet including commission.
-      - BACK bet:
-          win: (odds - 1) * stake
-          lose: - stake
-        After commission: multiply * (1 - commission) on profits only.
-      - LAY bet (we're laying at 'odds'):
-          If selection loses (winLabel==0): we win stake (counterparty's loss / odds?) Simplify:
-            profit = stake * (1 - commission)
-          If selection wins (winLabel==1): we lose (odds - 1) * stake
+    Compute PnL per bet including Betfair commission on winnings.
+      - BACK:
+          win: (odds - 1) * stake * (1 - commission)
+          lose: -stake
+      - LAY:
+          selection loses: stake * (1 - commission)
+          selection wins : -(odds - 1) * stake
     """
     if bets.is_empty():
         return bets
 
-    back_win = (pl.col("odds") - 1.0) * pl.col("stake")
+    back_win = (pl.col("odds") - 1.0) * pl.col("stake") * (1.0 - commission)
     back_lose = -pl.col("stake")
-    lay_win = pl.col("stake")                 # when selection loses
-    lay_lose = -(pl.col("odds") - 1.0) * pl.col("stake")
+
+    lay_win = pl.col("stake") * (1.0 - commission)              # selection loses
+    lay_lose = -(pl.col("odds") - 1.0) * pl.col("stake")        # selection wins
 
     pnl_back = pl.when(pl.col("winLabel") == 1).then(back_win).otherwise(back_lose)
     pnl_lay = pl.when(pl.col("winLabel") == 0).then(lay_win).otherwise(lay_lose)
 
-    pnl_raw = pl.when(pl.col("side") == "back").then(pnl_back).otherwise(pnl_lay)
-    pnl_net = pl.when(pnl_raw > 0).then(pnl_raw * (1.0 - commission)).otherwise(pnl_raw)
-
-    return bets.with_columns([
-        pnl_raw.alias("pnl_gross"),
-        pnl_net.alias("pnl"),
-    ])
+    pnl = pl.when(pl.col("side") == "back").then(pnl_back).otherwise(pnl_lay)
+    return bets.with_columns(pnl.alias("pnl"))
 
 
 def _binwise_pnl(bets: pl.DataFrame, edges: List[int]) -> pl.DataFrame:
@@ -316,6 +354,7 @@ def _binwise_pnl(bets: pl.DataFrame, edges: List[int]) -> pl.DataFrame:
 
 def main():
     ap = argparse.ArgumentParser(description="Simulate wagering from trained model(s).")
+
     # Mutually exclusive modes, defaults resolved at runtime:
     ap.add_argument("--model", help="Single model path (JSON).", default=None)
     ap.add_argument("--model-30", help="Short-horizon model path.", default=None)
@@ -326,7 +365,7 @@ def main():
     ap.add_argument("--curated", required=True)
     ap.add_argument("--sport", required=True)
 
-    # New range selection: --date is the end date; --days-before N runs end and N days before
+    # Range selection: --date is the end date; --days-before N runs end and N days before
     ap.add_argument("--date", required=True, help="End date (YYYY-MM-DD) to run up to (inclusive).")
     ap.add_argument("--days-before", type=int, default=0, help="How many days before --date to include (0 = just the date).")
 
@@ -339,11 +378,11 @@ def main():
     ap.add_argument("--label-col", default="winLabel")
     ap.add_argument("--min-edge", type=float, default=0.02)
     ap.add_argument("--kelly", type=float, default=0.25)
-    ap.add_argument("--commission", type=float, default=0.02)
+    ap.add_argument("--commission", type=float, default=0.05)  # Betfair 5% default
     ap.add_argument("--side", choices=["back", "lay", "auto"], default="auto")
     ap.add_argument("--top-n-per-market", type=int, default=1)
-    ap.add_argument("--stake-cap-market", type=float, default=1.0)
-    ap.add_argument("--stake-cap-day", type=float, default=10.0)
+    ap.add_argument("--stake-cap-market", type=float, default=10.0)
+    ap.add_argument("--stake-cap-day", type=float, default=100.0)
 
     # Outputs (will be redirected to ./output/)
     ap.add_argument("--bets-out", default="bets.csv")
@@ -430,7 +469,7 @@ def main():
 
     df_scored = _score(df_feat)
 
-    # Build bets → pick topN → cap → pnl
+    # Build bets → pick topN → cap (with £1 min + renorm) → pnl (with commission)
     bets = _build_bets_table(
         df_scored,
         label_col=args.label_col,
