@@ -175,17 +175,27 @@ def _build_bets_table(
     have = [c for c in keep if c in df2.columns]
     return df2.select(have)
 
-
 def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
     if bets.is_empty():
         return bets
+
+    # Use new or old Polars APIs depending on availability
+    length_expr = getattr(pl, "len", None)
+    if length_expr is None:
+        length_expr = pl.count  # fallback for older versions
+
+    try:
+        rn_expr = pl.row_number()
+    except AttributeError:
+        rn_expr = pl.cumcount()
+
     return (
         bets.sort(["marketId", "edge"], descending=[False, True])
         .with_columns(
-            pl.count().over("marketId").alias("n_in_market"),
-            pl.row_number().over("marketId").alias("rank_in_market"),
+            length_expr().over("marketId").alias("n_in_market"),
+            rn_expr.over("marketId").alias("rank_in_market"),
         )
-        .filter(pl.col("rank_in_market") < top_n)  # keeps top N (row_number starts at 0)
+        .filter(pl.col("rank_in_market") < top_n)
         .drop(["n_in_market", "rank_in_market"])
     )
 
