@@ -509,16 +509,21 @@ def main():
         sample_weight_late=args.weight_late,
     )
 
+    # ensure output dir exists
+    out_dir = os.path.join(os.path.dirname(__file__), "..", "output")
+    os.makedirs(out_dir, exist_ok=True)
+
     # Save both
     prefix = args.model_prefix or ""
-    out_short = f"{prefix}model_30.json"
-    out_long = f"{prefix}model_180.json"
+    out_short = os.path.join(out_dir, f"{prefix}model_30.json")
+    out_long = os.path.join(out_dir, f"{prefix}model_180.json")
+
     bst_short.save_model(out_short)
     bst_long.save_model(out_long)
+
     print("\n=== Dual-horizon saved ===")
     print(f"  - {out_short}  (short horizon; best: {m_short})")
     print(f"  - {out_long}   (long horizon;  best: {m_long})")
-
 
 if __name__ == "__main__":
     main()
