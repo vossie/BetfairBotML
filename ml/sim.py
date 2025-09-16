@@ -209,17 +209,13 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
 
 def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
     """
-    1) Proportionally cap 'stake_unit' per market to cap_market.
-    2) Floor any positive stake to £1.
-    3) Re-normalize per market so total <= cap_market with £1 min respected.
-       - If cap_market < number of positive bets, keep the highest-priority bets (by edge, then original stake) and drop the rest.
-    4) Re-normalize per day similarly (with £1 min).
-    Returns a DataFrame with final 'stake' column (float, £ units).
+    Cap per market and per day with a £1 minimum stake and re-normalization.
+    Works on older Polars (no GroupBy.apply / no Expr.clip_lower).
     """
     if bets.is_empty():
         return bets
 
-    # Priority columns for trimming when caps are tight
+    # Priority columns used when caps are too tight
     with_priority = bets.with_columns([
         (pl.col("edge") if "edge" in bets.columns else pl.lit(0.0)).alias("_priority_edge"),
         pl.col("stake_unit").alias("_priority_stake_unit"),
@@ -227,14 +223,19 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
 
     # Step 1: proportional market cap on stake_unit
     mkt_sum = with_priority.group_by("marketId").agg(pl.sum("stake_unit").alias("_sum_mkt"))
-    b1 = with_priority.join(mkt_sum, on="marketId", how="left").with_columns([
-        pl.when(pl.col("_sum_mkt") > 0)
-        .then(pl.min_horizontal([pl.lit(1.0), pl.lit(cap_market) / pl.col("_sum_mkt")]))
-        .otherwise(pl.lit(0.0))
-        .alias("_mkt_scale")
-    ]).with_columns([
-        (pl.col("stake_unit") * pl.col("_mkt_scale")).alias("_stake_mkt")
-    ]).drop("_sum_mkt", "_mkt_scale")
+    b1 = (
+        with_priority.join(mkt_sum, on="marketId", how="left")
+        .with_columns([
+            pl.when(pl.col("_sum_mkt") > 0)
+            .then(pl.min_horizontal([pl.lit(1.0), pl.lit(cap_market) / pl.col("_sum_mkt")]))
+            .otherwise(pl.lit(0.0))
+            .alias("_mkt_scale")
+        ])
+        .with_columns([
+            (pl.col("stake_unit") * pl.col("_mkt_scale")).alias("_stake_mkt")
+        ])
+        .drop("_sum_mkt", "_mkt_scale")
+    )
 
     # Step 2: apply £1 floor to any positive stake
     b2 = b1.with_columns([
@@ -243,6 +244,73 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
         .otherwise(pl.col("_stake_mkt"))
         .alias("_stake_floor")
     ])
+
+    # ---- helper: re-normalize within a group under a cap with £1 floor ----
+    def _renorm_group(df: pl.DataFrame, cap: float) -> pl.DataFrame:
+        df = df.sort(by=["_priority_edge", "_priority_stake_unit"], descending=[True, True])
+
+        stake = df["_stake_floor"].to_numpy().astype(float)
+        pos = stake > 0
+        n_pos = int(pos.sum())
+
+        if n_pos == 0 or cap <= 0:
+            stake[:] = 0.0
+            return df.with_columns(pl.Series("_stake_grouped", stake))
+
+        if cap < n_pos:
+            # keep top k positive bets at exactly £1; drop the rest
+            k = int(cap)
+            stake_new = np.zeros_like(stake)
+            if k > 0:
+                idx_pos = np.flatnonzero(pos)
+                keep_idx = idx_pos[:k]
+                stake_new[keep_idx] = 1.0
+            return df.with_columns(pl.Series("_stake_grouped", stake_new))
+
+        # give everyone £1, then scale down excess to fit remaining budget
+        base = float(n_pos)
+        budget = cap - base
+
+        excess = np.where(pos, np.maximum(stake - 1.0, 0.0), 0.0)
+        sum_excess = float(excess.sum())
+
+        if sum_excess <= budget + 1e-12:
+            return df.with_columns(pl.Series("_stake_grouped", stake))
+
+        scale = budget / sum_excess if sum_excess > 0 else 0.0
+        stake_new = np.where(pos, 1.0 + excess * scale, 0.0)
+        return df.with_columns(pl.Series("_stake_grouped", stake_new))
+
+    # ---- Step 3: re-normalize per market (map_groups if available; else Python loop) ----
+    if hasattr(b2.group_by("marketId"), "map_groups"):
+        b3 = b2.group_by("marketId", maintain_order=True).map_groups(lambda g: _renorm_group(g, cap_market))
+    else:
+        # fallback for very old Polars
+        pieces = []
+        for mkt in b2.select("marketId").unique().to_series().to_list():
+            g = b2.filter(pl.col("marketId") == mkt)
+            pieces.append(_renorm_group(g, cap_market))
+        b3 = pl.concat(pieces, how="vertical")
+
+    # ---- Step 4: re-normalize per day similarly ----
+    b4 = b3.with_columns([
+        (pl.col("publishTimeMs") // (1000 * 60 * 60 * 24)).alias("_day_bucket")
+    ])
+
+    if hasattr(b4.group_by("_day_bucket"), "map_groups"):
+        b5 = b4.group_by("_day_bucket", maintain_order=True).map_groups(lambda g: _renorm_group(g, cap_day))
+    else:
+        pieces = []
+        for day in b4.select("_day_bucket").unique().to_series().to_list():
+            g = b4.filter(pl.col("_day_bucket") == day)
+            pieces.append(_renorm_group(g, cap_day))
+        b5 = pl.concat(pieces, how="vertical")
+
+    out = b5.rename({"_stake_grouped": "stake"}).drop(
+        "_priority_edge", "_priority_stake_unit", "_stake_mkt", "_stake_floor", "_day_bucket"
+    )
+    return out
+
 
     # Helper: re-normalize within a group under a cap with £1 floor
     def _renorm_group(df: pl.DataFrame, cap: float) -> pl.DataFrame:
