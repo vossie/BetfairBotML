@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ok
-#   bin/run-simulator.sh 2025-09-15            # dual-model default (uses ./output/model_30.json & model_180.json)
-#   bin/run-simulator.sh 2025-09-15 --model    # single-model default (./output/xgb_model.json)
+# Usage:
+#   bin/run-simulator.sh 2025-09-15            # dual-model default
+#   bin/run-simulator.sh 2025-09-15 --model    # single-model default ./output/xgb_model.json
 #   bin/run-simulator.sh 2025-09-15 --model ./output/custom.json
 
 DATE_ARG="${1:-}"
@@ -16,14 +16,13 @@ shift || true
 MODE="dual"
 MODEL_PATH=""
 
-# Parse optional --model [path]
 if [[ "${1:-}" == "--model" ]]; then
   MODE="single"
   shift || true
-  if [[ "${1:-}" =~ ^-- || -z "${1:-}" ]]; then
+  MODEL_PATH="${1:-}"
+  if [[ -z "$MODEL_PATH" || "$MODEL_PATH" == --* ]]; then
     MODEL_PATH="./output/xgb_model.json"
   else
-    MODEL_PATH="$1"
     shift || true
   fi
 fi
@@ -31,7 +30,6 @@ fi
 # Load environment
 source "$(dirname "$0")/set-env-vars-prod.sh"
 
-# Common env echo (optional)
 echo "Endpoint: ${AWS_ENDPOINT_URL:-<unset>}"
 echo "Region:   ${AWS_REGION:-<unset>}"
 echo "Key set:  $( [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]] && echo yes || echo no )"
@@ -62,4 +60,3 @@ else
     --gate-mins 45 \
     "${BASE_ARGS[@]}"
 fi
-
