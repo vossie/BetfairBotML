@@ -7,43 +7,49 @@ import polars as pl
 from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel, Field
 
-# -------- Config via env --------
-MODEL_PATH = os.getenv("MODEL_PATH", "artifacts/xgb_preoff.pkl")
-FEATURE_LIST_ENV = os.getenv("FEATURE_LIST", "")  # comma-separated, in TRAIN order
+# -------- Config (env) --------
+MODEL_PATH = os.getenv("MODEL_PATH", "output/xgb_model.json")
+FEATURE_LIST_ENV = os.getenv("FEATURE_LIST", "")  # comma-separated, in TRAIN order (if Booster)
 API_KEY = os.getenv("API_KEY", "")
 
-app = FastAPI(title="Betfair ML Inference API", version="1.2.0")
+app = FastAPI(title="Betfair ML Inference API", version="1.3.0")
 
-_model = None
-_feature_cols: Optional[List[str]] = None  # training feature order (if known)
+_model = None                # sklearn estimator OR xgboost Booster
+_model_is_booster = False    # True if _model is xgboost.Booster
+_feature_cols: Optional[List[str]] = None  # training feature order if known
 
 
 def _load_model():
-    """Load model once; supports joblib artifact or XGBoost JSON."""
-    global _model, _feature_cols
+    """Load the model once. Supports joblib artifacts or XGBoost Booster JSON."""
+    global _model, _feature_cols, _model_is_booster
     if _model is not None:
         return
-    # joblib first
+
+    # Try joblib artifact first (sklearn-style)
     try:
         import joblib
         art = joblib.load(MODEL_PATH)
         _model = art["model"]
         _feature_cols = art.get("features")
-        # allow overriding via env if explicitly set
+        # Allow override by env if explicitly provided
         if FEATURE_LIST_ENV:
             _feature_cols = [c.strip() for c in FEATURE_LIST_ENV.split(",") if c.strip()]
+        _model_is_booster = False
         return
     except Exception:
         pass
-    # xgboost json
+
+    # Fallback: raw XGBoost Booster JSON (what your trainer saves)
     try:
         import xgboost as xgb
-        model = xgb.XGBClassifier()
-        model.load_model(MODEL_PATH)
-        _model = model
+        booster = xgb.Booster()
+        booster.load_model(MODEL_PATH)
+        _model = booster
+        _model_is_booster = True
+        # For Booster, we usually need the exact feature order used at train:
         if FEATURE_LIST_ENV:
             _feature_cols = [c.strip() for c in FEATURE_LIST_ENV.split(",") if c.strip()]
-        # if not provided, we will rely on request feature_order
+        # If not set, we will accept request-provided feature_order; otherwise we must error.
     except Exception as e:
         raise RuntimeError(f"Failed to load model from {MODEL_PATH}: {e}")
 
@@ -59,7 +65,7 @@ def _require_api_key(x_api_key: Optional[str] = Header(None)):
 class FeatureRow(BaseModel):
     marketId: str
     selectionId: int
-    # Feature fields (extend as needed)
+    # Extend with whatever features your model uses:
     ltp: Optional[float] = None
     mom_10s: Optional[float] = None
     mom_60s: Optional[float] = None
@@ -78,7 +84,7 @@ class FeatureRow(BaseModel):
 
 class PredictRequest(BaseModel):
     rows: List[FeatureRow]
-    feature_order: Optional[List[str]] = None  # request-defined feature order (optional)
+    feature_order: Optional[List[str]] = None  # optional override order
 
 
 class Prediction(BaseModel):
@@ -94,8 +100,8 @@ class PredictResponse(BaseModel):
 
 class DecideRequest(BaseModel):
     rows: List[FeatureRow]
-    feature_order: Optional[List[str]] = None  # optional override order
-    threshold: float = 0.5  # simple demo policy
+    feature_order: Optional[List[str]] = None  # optional override
+    threshold: float = 0.5  # demo policy: PLACE_BACK if p >= threshold else HOLD
 
 
 class Decision(BaseModel):
@@ -114,7 +120,7 @@ class DecideResponse(BaseModel):
     features_used: List[str]
 
 
-# -------- Helpers --------
+# -------- Feature helpers --------
 
 def _resolve_feature_order(
     df: pl.DataFrame,
@@ -122,10 +128,10 @@ def _resolve_feature_order(
     learned_order: Optional[List[str]],
 ) -> List[str]:
     """
-    Decide the feature order to use:
-    1) FEATURE_LIST env (learned_order) if present;
-    2) else request feature_order;
-    3) else auto-detect numeric columns excluding ids.
+    Pick feature order:
+      1) learned_order (FEATURE_LIST env or artifact)
+      2) else request_order (from payload)
+      3) else auto-detect numeric columns (excluding ids)
     """
     if learned_order:
         return learned_order
@@ -140,22 +146,37 @@ def _align_features(
     ordered_features: List[str],
 ) -> Tuple[pl.DataFrame, List[str], List[str]]:
     """
-    Ensure df has all columns in ordered_features; add missing as zeros; ignore extras.
+    Ensure df has all ordered_features; add missing as zeros; ignore extras.
     Returns (df_aligned, used_features, missing_features).
     """
     missing = [c for c in ordered_features if c not in df.columns]
     for m in missing:
-        # add missing numeric features as zeros
         df = df.with_columns(pl.lit(0.0).alias(m))
-    # strictly select in the requested order
     used = ordered_features[:]
+    # Keep id cols at hand if needed (not used in X input)
     return df.select(used + ["marketId", "selectionId"]), used, missing
 
 
+# -------- Prediction helpers --------
+
 def _predict_proba_matrix(X: np.ndarray) -> np.ndarray:
+    """
+    Predict P(win) for:
+      - sklearn-like models with predict_proba
+      - XGBoost Booster (requires DMatrix)
+      - sklearn API XGBClassifier (predict_proba)
+    """
+    global _model, _model_is_booster
+    if _model_is_booster:
+        import xgboost as xgb
+        dm = xgb.DMatrix(X)
+        # objective=binary:logistic returns probabilities
+        return _model.predict(dm)
+    # sklearn-style
     if hasattr(_model, "predict_proba"):
         proba = _model.predict_proba(X)
         return proba[:, 1] if proba.ndim == 2 and proba.shape[1] > 1 else proba.ravel()
+    # raw margin -> logistic
     pred = _model.predict(X)
     return 1.0 / (1.0 + np.exp(-pred))
 
@@ -166,7 +187,12 @@ def _predict_proba_matrix(X: np.ndarray) -> np.ndarray:
 def health(_: bool = Depends(_require_api_key)):
     try:
         _load_model()
-        return {"status": "ok", "model_path": MODEL_PATH, "features": _feature_cols or []}
+        return {
+            "status": "ok",
+            "model_path": MODEL_PATH,
+            "model_type": "xgboost.Booster" if _model_is_booster else type(_model).__name__,
+            "features": _feature_cols or []
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"model_load_failed: {e}")
 
@@ -177,13 +203,15 @@ def predict(req: PredictRequest, _: bool = Depends(_require_api_key)):
     if not req.rows:
         raise HTTPException(400, "Empty request")
 
-    # Build frame from rows
     df = pl.from_dicts([r.dict(by_alias=True) for r in req.rows])
 
-    # Resolve and align feature order (adds missing as zeros)
     order = _resolve_feature_order(df, req.feature_order, _feature_cols)
+    # For Booster models: we must have either FEATURE_LIST or request feature_order.
+    if _model_is_booster and not order:
+        raise HTTPException(400, "Booster model requires FEATURE_LIST env or feature_order in request")
+
     try:
-        df_aligned, used_features, _missing = _align_features(df, order)
+        df_aligned, used_features, _ = _align_features(df, order)
         X = df_aligned.select(used_features).fill_null(strategy="mean").to_numpy().astype(np.float32, copy=False)
     except Exception as e:
         raise HTTPException(400, f"Failed to build feature matrix: {e}")
@@ -203,17 +231,20 @@ def decide(req: DecideRequest, _: bool = Depends(_require_api_key)):
         raise HTTPException(400, "Empty request")
 
     df = pl.from_dicts([r.dict(by_alias=True) for r in req.rows])
+
     order = _resolve_feature_order(df, req.feature_order, _feature_cols)
+    if _model_is_booster and not order:
+        raise HTTPException(400, "Booster model requires FEATURE_LIST env or feature_order in request")
+
     try:
-        df_aligned, used_features, _missing = _align_features(df, order)
+        df_aligned, used_features, _ = _align_features(df, order)
         X = df_aligned.select(used_features).fill_null(strategy="mean").to_numpy().astype(np.float32, copy=False)
     except Exception as e:
         raise HTTPException(400, f"Failed to build feature matrix: {e}")
 
     p = _predict_proba_matrix(X)
 
-    # Simple decision policy for integration demo:
-    # PLACE_BACK if p >= threshold, else HOLD; stake = £1 min.
+    # Simple decision policy: PLACE_BACK if p >= threshold, else HOLD; stake = £1
     decisions: List[Decision] = []
     thr = float(req.threshold)
     for i, row in enumerate(req.rows):
@@ -221,7 +252,7 @@ def decide(req: DecideRequest, _: bool = Depends(_require_api_key)):
         action = "PLACE_BACK" if pi >= thr else "HOLD"
         stake = 1.0 if action == "PLACE_BACK" else 0.0
         odds = row.ltp
-        ev = (pi - thr)  # simple diagnostic EV proxy relative to threshold
+        ev = pi - thr
         reason = None if action == "PLACE_BACK" else "below threshold"
         decisions.append(Decision(
             marketId=row.marketId,
