@@ -199,7 +199,8 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
 def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
     """
     Apply simple caps on cumulative stake units per market and per day.
-    We scale stakes if cumulative would exceed the cap.
+    Scale stakes if cumulative would exceed the cap.
+    Enforce Betfair's £1 minimum bet size by rounding up small positive stakes.
     """
     if bets.is_empty():
         return bets
@@ -218,7 +219,7 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
         .drop(["cum_mkt"])
     )
 
-    # day cap (based on date of publishTimeMs)
+    # day cap
     b1 = b1.with_columns([
         (pl.col("publishTimeMs") // (1000 * 60 * 60 * 24)).alias("day_bucket")
     ])
@@ -234,7 +235,17 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
         ])
         .drop(["cum_day", "day_bucket"])
     )
-    return b2.rename({"stake_unit_final": "stake"})
+
+    # enforce £1 minimum: round up all positive stakes below 1.0
+    b2 = b2.with_columns([
+        pl.when(pl.col("stake_unit_final") > 0)
+        .then(pl.col("stake_unit_final").clip_lower(1.0))
+        .otherwise(0.0)
+        .alias("stake")
+    ])
+
+    return b2
+
 
 
 def _pnl_columns(bets: pl.DataFrame, commission: float) -> pl.DataFrame:

@@ -1,3 +1,9 @@
+# single day
+python ml/sim.py --curated <root> --sport horse-racing --date 2025-09-15 --model
+
+# date + one day before (i.e., 2025-09-14 and 2025-09-15)
+python ml/sim.py --curated <root> --sport horse-racing --date 2025-09-15 --days-before 1 --model
+
 # Single-model (e.g., 30-min model)
 .venv/bin/python -m ml.sim \
   --model xgb_model.json \
