@@ -1,3 +1,4 @@
 /.venv/
 /bin/set-env-vars-prod.sh
 /output/*.json
+*.idea*

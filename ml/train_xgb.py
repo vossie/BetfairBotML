@@ -102,27 +102,37 @@ def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     return {"logloss": float(logloss), "auc": float(auc)}
 
 
+# Replace _binwise_report in ml/train_xgb.py with this version
+
 def _binwise_report(df: pl.DataFrame, y: np.ndarray, p: np.ndarray, bins: List[int]) -> None:
     if "tto_minutes" not in df.columns:
         return
+
     edges = bins
-    labels = [f"{edges[i]:>3}-{edges[i+1]:>3}" for i in range(len(edges) - 1)]
-    # build bin labels with nested whens (compatible across polars versions)
-    col = pl.Series("tto_minutes", df["tto_minutes"])
-    expr = pl.when((pl.col("tto_minutes") > edges[0]) & (pl.col("tto_minutes") <= edges[1])).then(labels[0])
+    labels = [f"{edges[i]:02d}-{edges[i+1]:02d}" for i in range(len(edges) - 1)]
+
+    # IMPORTANT: wrap labels with pl.lit(...) so Polars treats them as literals,
+    # not as column names (fixes ColumnNotFoundError).
+    expr = (
+        pl.when((pl.col("tto_minutes") > edges[0]) & (pl.col("tto_minutes") <= edges[1]))
+        .then(pl.lit(labels[0]))
+    )
     for i in range(1, len(labels)):
         lo, hi = edges[i], edges[i + 1]
-        expr = expr.when((pl.col("tto_minutes") > lo) & (pl.col("tto_minutes") <= hi)).then(labels[i])
-    expr = expr.otherwise(None).alias("tto_bin")
+        expr = expr.when((pl.col("tto_minutes") > lo) & (pl.col("tto_minutes") <= hi)).then(pl.lit(labels[i]))
+    expr = expr.otherwise(pl.lit(None)).alias("tto_bin")
+
     tmp = df.with_columns(expr)
+
     print("\n[Horizon bins: tto_minutes]")
     for lab in labels:
-        mask = (tmp["tto_bin"] == lab).to_numpy()
+        mask = (tmp.get_column("tto_bin") == lab).to_numpy()
         n = int(mask.sum())
         if n == 0:
             continue
         m = _metrics_binary(y[mask], p[mask])
         print(f"[{lab}] logloss={m['logloss']:.4f} auc={m['auc']:.3f} n={n}")
+
 
 
 def _build_features_with_retry(
