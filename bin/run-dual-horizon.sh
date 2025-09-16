@@ -1,5 +1,5 @@
 #!/bin/bash
-# run.sh
+# run.sh okk
 cd /opt/BetfairBotML || exit
 
 if [ $# -lt 1 ]; then
