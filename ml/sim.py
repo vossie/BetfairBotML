@@ -184,10 +184,11 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
     if length_expr is None:
         length_expr = pl.count  # fallback for older versions
 
-    try:
+    # row_number is preferred (new versions), fallback to cum_count (old versions)
+    if hasattr(pl, "row_number"):
         rn_expr = pl.row_number()
-    except AttributeError:
-        rn_expr = pl.cumcount()
+    else:
+        rn_expr = pl.cum_count()
 
     return (
         bets.sort(["marketId", "edge"], descending=[False, True])
