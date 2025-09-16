@@ -9,7 +9,7 @@ import numpy as np
 import polars as pl
 import xgboost as xgb
 
-# IMPORTANT: relative import because we run as a package: `python -m ml.sim`
+# Run as a package: `python -m ml.sim`
 from . import features
 
 
@@ -110,14 +110,12 @@ def _choose_side_auto(p: float, price: float, commission: float) -> str:
 
 def _ensure_time_columns(df: pl.DataFrame) -> pl.DataFrame:
     out = df
-    if "ts" not in out.columns:
-        if "publishTimeMs" in out.columns:
-            out = out.with_columns(
-                pl.from_epoch((pl.col("publishTimeMs") / 1000).cast(pl.Int64)).alias("ts")
-            )
-    if "event_date" not in out.columns:
-        if "ts" in out.columns:
-            out = out.with_columns(pl.col("ts").dt.date().alias("event_date"))
+    if "ts" not in out.columns and "publishTimeMs" in out.columns:
+        out = out.with_columns(
+            pl.from_epoch((pl.col("publishTimeMs") / 1000).cast(pl.Int64)).alias("ts")
+        )
+    if "event_date" not in out.columns and "ts" in out.columns:
+        out = out.with_columns(pl.col("ts").dt.date().alias("event_date"))
     return out
 
 
@@ -267,7 +265,7 @@ def _aggregate_per_market(bets: pl.DataFrame) -> pl.DataFrame:
         .agg([
             pl.first("sport").alias("sport"),
             pl.max("tto_minutes").alias("tto_max"),
-            pl.count().alias("n_bets"),
+            pl.len().alias("n_bets"),
             pl.sum("stake_unit").alias("stake_unit_sum"),
             pl.sum("pnl_unit").alias("pnl_unit_sum"),
             pl.mean("edge").alias("edge_mean"),
@@ -282,17 +280,40 @@ def _aggregate_per_market(bets: pl.DataFrame) -> pl.DataFrame:
 def _pnl_columns(bets: pl.DataFrame, commission: float) -> pl.DataFrame:
     if bets.is_empty():
         return bets
-    wins = bets["winLabel"].to_numpy().astype(int)
+    # Be robust to nulls in label
+    wins = bets["winLabel"].fill_null(-1).to_numpy()
+    wins = wins[wins != -1]
+    # We'll compute per-row pnl in a safe loop using original series to avoid alignment issues
     prices = bets["ltp"].to_numpy().astype(float)
     sides = bets["side"].to_list()
     stakes = bets["stake_unit"].to_numpy().astype(float)
 
     pnls = []
-    for w, pr, sd, st in zip(wins, prices, sides, stakes):
-        pnls.append(
-            _realized_pnl_back(w, pr, commission, st) if sd == "back" else _realized_pnl_lay(w, pr, commission, st)
-        )
+    for i in range(bets.height):
+        w = bets["winLabel"][i]
+        if w is None:
+            pnls.append(0.0)
+            continue
+        w = int(w)
+        pr = float(prices[i])
+        sd = sides[i]
+        st = float(stakes[i])
+        pnls.append(_realized_pnl_back(w, pr, commission, st) if sd == "back" else _realized_pnl_lay(w, pr, commission, st))
     return bets.with_columns(pl.Series("pnl_unit", pnls))
+
+
+def _bin_label_expr(col: pl.Expr, edges: List[int], labels: List[str]) -> pl.Expr:
+    """
+    Build a categorical bin label using nested when/then/otherwise.
+    Works on older Polars versions (no pl.bucket / no pandas.cut).
+    """
+    assert len(edges) == len(labels) + 1
+    expr = pl.when((col > edges[0]) & (col <= edges[1])).then(labels[0])
+    for i in range(1, len(labels)):
+        lo, hi = edges[i], edges[i + 1]
+        expr = expr.when((col > lo) & (col <= hi)).then(labels[i])
+    expr = expr.otherwise(None)
+    return expr
 
 
 def _binwise_pnl(bets: pl.DataFrame, bins: List[int]) -> pl.DataFrame:
@@ -301,17 +322,17 @@ def _binwise_pnl(bets: pl.DataFrame, bins: List[int]) -> pl.DataFrame:
     edges = bins
     labels = [f"{edges[i]:>3}-{edges[i+1]:>3}" for i in range(len(edges)-1)]
     dfb = bets.with_columns(
-        pl.col("tto_minutes").bucket(breaks=edges, include_breaks=False).alias("tto_bin")
+        _bin_label_expr(pl.col("tto_minutes"), edges, labels).alias("tto_bin")
     )
     out = (
         dfb.group_by("tto_bin")
         .agg([
-            pl.count().alias("n"),
+            pl.len().alias("n"),
             pl.sum("stake_unit").alias("stake_sum"),
             pl.sum("pnl_unit").alias("pnl_sum"),
         ])
         .with_columns(
-            (pl.col("pnl_sum") / pl.col("stake_sum").replace(0, None)).alias("roi")
+            (pl.col("pnl_sum") / pl.when(pl.col("stake_sum") == 0).then(None).otherwise(pl.col("stake_sum"))).alias("roi")
         )
         .sort("tto_bin")
     )
@@ -452,7 +473,9 @@ def main():
     total_pnl = float(bets["pnl_unit"].sum())
     roi = (total_pnl / total_stake) if total_stake > 0 else 0.0
     n_bets = bets.height
-    hit_rate = float((bets["winLabel"].to_numpy() == 1).mean()) if n_bets > 0 else 0.0
+    # Be robust to missing labels
+    lbl = bets["winLabel"].fill_null(-1).to_numpy()
+    hit_rate = float((lbl[lbl >= 0] == 1).mean()) if (lbl >= 0).any() else 0.0
     print("\n=== Simulation Summary ===")
     print(f"n_bets                : {n_bets}")
     print(f"total_stake_units     : {total_stake:.4f}")
