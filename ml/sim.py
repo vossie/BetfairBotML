@@ -29,6 +29,9 @@ def _outpath(p: str) -> str:
 # ----------------------------- date & features utils -----------------------------
 
 def _daterange(end_date_str: str, days: int) -> List[str]:
+    """
+    Build a list of YYYY-MM-DD strings covering [end - (days-1) ... end], inclusive.
+    """
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
     start = end - timedelta(days=days - 1)
     out: List[str] = []
@@ -157,7 +160,6 @@ def _build_bets_table(
     df2 = df2.filter(pl.col("edge") >= min_edge)
 
     # Kelly stakes in "units" (relative bankroll); we'll treat 1.0 as one unit
-    # Use p depending on side (for lay, use 1-p to compute stake aggressiveness? We keep p as event prob.)
     p = df2["p_hat"].to_numpy()
     odds = df2["odds"].to_numpy()
     stake_units = _kelly_stake_units(p, odds, kelly_frac)
@@ -175,21 +177,19 @@ def _build_bets_table(
     have = [c for c in keep if c in df2.columns]
     return df2.select(have)
 
-import polars as pl
 
 def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
+    """
+    Pick top-N by edge within each market; works across old/new Polars (no row_number/cum_count assumptions).
+    """
     if bets.is_empty():
         return bets
-
-    # Prefer pl.len() (new Polars), fall back to pl.count() (older Polars)
-    length_expr = getattr(pl, "len", None) or pl.count
-
     return (
         bets.sort(["marketId", "edge"], descending=[False, True])
         .with_columns(
-            length_expr().over("marketId").alias("n_in_market"),
-            # Generate per-group row numbers 0..N-1 without using row_number/cum_count
-            pl.arange(0, length_expr()).over("marketId").alias("rank_in_market"),
+            (getattr(pl, "len", None) or pl.count)().over("marketId").alias("n_in_market"),
+            # version-agnostic per-group rank: 0..N-1
+            pl.arange(0, (getattr(pl, "len", None) or pl.count)()).over("marketId").alias("rank_in_market"),
         )
         .filter(pl.col("rank_in_market") < top_n)
         .drop(["n_in_market", "rank_in_market"])
@@ -310,8 +310,11 @@ def main():
     # Data
     ap.add_argument("--curated", required=True)
     ap.add_argument("--sport", required=True)
-    ap.add_argument("--date", required=True)
-    ap.add_argument("--days", type=int, default=1)
+
+    # New range selection: --date is the end date; --days-before N runs end and N days before
+    ap.add_argument("--date", required=True, help="End date (YYYY-MM-DD) to run up to (inclusive).")
+    ap.add_argument("--days-before", type=int, default=0, help="How many days before --date to include (0 = just the date).")
+
     ap.add_argument("--preoff-mins", type=int, default=30)
     ap.add_argument("--batch-markets", type=int, default=100)
     ap.add_argument("--downsample-secs", type=int, default=0)
@@ -367,7 +370,8 @@ def main():
         booster_180 = _load_booster(args.model_180)
 
     # Dates
-    dates = _daterange(args.date, args.days)
+    days_total = int(args.days_before) + 1  # include the end date itself
+    dates = _daterange(args.date, days_total)
 
     # Build features chunked
     df_parts: List[pl.DataFrame] = []
