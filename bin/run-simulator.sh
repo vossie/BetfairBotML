@@ -28,6 +28,7 @@ if [[ "${1:-}" == "--model" ]]; then
 fi
 
 # Load environment
+git pull
 source "$(dirname "$0")/set-env-vars-prod.sh"
 
 echo "Endpoint: ${AWS_ENDPOINT_URL:-<unset>}"
