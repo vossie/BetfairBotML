@@ -5,25 +5,17 @@ import argparse
 import os
 import sys
 import time
-import random
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Iterable, Optional
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 import polars as pl
 import xgboost as xgb
-from xgboost.callback import EarlyStopping
-from sklearn.metrics import log_loss, roc_auc_score
 
-import pyarrow.fs as pafs
 from . import features
 
 
-# ---------------------------- utils ----------------------------
-
-def _is_s3_uri(uri: str) -> bool:
-    return uri.startswith("s3://")
-
+# ----------------------------- utils -----------------------------
 
 def _daterange(end_date_str: str, days: int) -> List[str]:
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
@@ -36,75 +28,101 @@ def _daterange(end_date_str: str, days: int) -> List[str]:
     return out
 
 
-def _has_nvidia_gpu() -> bool:
-    try:
-        import pynvml  # noqa: F401
-        return True
-    except Exception:
-        return os.system("nvidia-smi -L >/dev/null 2>&1") == 0
+def _ensure_output_dir() -> str:
+    out_dir = os.path.join(os.path.dirname(__file__), "..", "output")
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.abspath(out_dir)
 
 
-def _xgb_base_params(n_classes: int, use_gpu: bool) -> Dict:
-    params: Dict = {
-        "tree_method": "hist",
-        "device": "cuda" if use_gpu else "cpu",
-        "subsample": 0.8,
-        "colsample_bytree": 0.8,
-        "reg_lambda": 1.0,
-        "reg_alpha": 0.0,
-        "verbosity": 1,
+def _select_feature_cols(df: pl.DataFrame, label_col: str) -> List[str]:
+    exclude = {
+        "marketId", "selectionId", "ts", "ts_ms",
+        "publishTimeMs", label_col, "runnerStatus",
     }
-    if n_classes > 2:
-        params.update({"objective": "multi:softprob", "num_class": n_classes, "eval_metric": "mlogloss"})
-    else:
-        params.update({"objective": "binary:logistic", "eval_metric": "logloss"})
-    return params
-
-
-def _select_feature_cols(df_feat: pl.DataFrame, label_col: str) -> List[str]:
-    exclude = {"marketId", "selectionId", "ts", "ts_ms", "publishTimeMs", label_col, "runnerStatus"}
     cols: List[str] = []
-    schema = df_feat.collect_schema()
-    for c, dt in zip(schema.names(), schema.dtypes()):
-        if c in exclude:
+    schema = df.collect_schema()
+    for name, dtype in zip(schema.names(), schema.dtypes()):
+        if name in exclude:
             continue
-        if "label" in c.lower() or "target" in c.lower():
+        if "label" in name.lower() or "target" in name.lower():
             continue
-        if dt.is_numeric():
-            cols.append(c)
+        if dtype.is_numeric():
+            cols.append(name)
     if not cols:
-        raise RuntimeError("No numeric feature columns found for XGBoost.")
+        raise RuntimeError("No numeric feature columns found.")
     return cols
 
 
-def _check_store(curated_root: str):
+def _device_params(device: str) -> Tuple[Dict, str]:
+    """
+    Return XGBoost params and a human-readable banner for CPU/CUDA.
+    Using xgboost>=2 syntax: set device='cuda' for GPU training/inference.
+    """
+    if device == "auto":
+        # Simple auto-detect: try CUDA by importing, else CPU
+        use_cuda = False
+        try:
+            import cupy as _cp  # noqa: F401
+            use_cuda = True
+        except Exception:
+            use_cuda = False
+        device = "cuda" if use_cuda else "cpu"
+
+    if device == "cuda":
+        return {"device": "cuda", "tree_method": "hist"}, "🚀 Training with XGBoost on CUDA (tree_method=hist)"
+    else:
+        return {"device": "cpu", "tree_method": "hist"}, "🚀 Training with XGBoost on CPU (tree_method=hist)"
+
+
+def _to_numpy(df: pl.DataFrame, cols: List[str]) -> np.ndarray:
+    return df.select(cols).fill_null(strategy="mean").to_numpy().astype(np.float32, copy=False)
+
+
+def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
+    # logloss
+    eps = 1e-12
+    p_clip = np.clip(p, eps, 1 - eps)
+    logloss = -np.mean(y_true * np.log(p_clip) + (1 - y_true) * np.log(1 - p_clip))
+    # AUC (safe implementation)
     try:
-        fs, path = pafs.FileSystem.from_uri(curated_root)
-        info = fs.get_file_info([path])[0]
-        prefix = "MinIO/S3" if _is_s3_uri(curated_root) else "Local FS"
-        if info.type == pafs.FileType.NotFound:
-            print(f"ERROR: Curated root not found: {curated_root}", file=sys.stderr)
-            sys.exit(1)
-        print(f"✅ {prefix} reachable at {curated_root}")
-    except Exception as e:
-        print(f"ERROR: Failed to reach curated root {curated_root}: {e}", file=sys.stderr)
-        sys.exit(1)
+        from sklearn.metrics import roc_auc_score
+        auc = float(roc_auc_score(y_true, p))
+    except Exception:
+        # fallback: tie-aware U-statistic
+        order = np.argsort(p)
+        ranks = np.empty_like(order)
+        ranks[order] = np.arange(len(p))
+        pos = y_true == 1
+        n_pos = np.sum(pos)
+        n_neg = len(p) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            auc = 0.5
+        else:
+            auc = (np.sum(ranks[pos]) - n_pos * (n_pos - 1) / 2) / (n_pos * n_neg)
+    return {"logloss": float(logloss), "auc": float(auc)}
 
 
-_RETRY_MATCHES = (
-    "curlCode: 7",
-    "curlCode: 6",
-    "NETWORK_CONNECTION",
-    "Connection reset",
-    "timed out",
-    "Timeout",
-    "RemoteDisconnected",
-)
-
-
-def _is_transient_s3_error(exc: Exception) -> bool:
-    msg = str(exc)
-    return any(s in msg for s in _RETRY_MATCHES)
+def _binwise_report(df: pl.DataFrame, y: np.ndarray, p: np.ndarray, bins: List[int]) -> None:
+    if "tto_minutes" not in df.columns:
+        return
+    edges = bins
+    labels = [f"{edges[i]:>3}-{edges[i+1]:>3}" for i in range(len(edges) - 1)]
+    # build bin labels with nested whens (compatible across polars versions)
+    col = pl.Series("tto_minutes", df["tto_minutes"])
+    expr = pl.when((pl.col("tto_minutes") > edges[0]) & (pl.col("tto_minutes") <= edges[1])).then(labels[0])
+    for i in range(1, len(labels)):
+        lo, hi = edges[i], edges[i + 1]
+        expr = expr.when((pl.col("tto_minutes") > lo) & (pl.col("tto_minutes") <= hi)).then(labels[i])
+    expr = expr.otherwise(None).alias("tto_bin")
+    tmp = df.with_columns(expr)
+    print("\n[Horizon bins: tto_minutes]")
+    for lab in labels:
+        mask = (tmp["tto_bin"] == lab).to_numpy()
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        m = _metrics_binary(y[mask], p[mask])
+        print(f"[{lab}] logloss={m['logloss']:.4f} auc={m['auc']:.3f} n={n}")
 
 
 def _build_features_with_retry(
@@ -114,21 +132,23 @@ def _build_features_with_retry(
     preoff_minutes: int,
     batch_markets: int,
     downsample_secs: Optional[int],
-    is_s3: bool,
-    max_attempts: int = 5,
-    base_delay: float = 1.5,
-    jitter: float = 0.25,
 ) -> Tuple[pl.DataFrame, int]:
-    if not is_s3:
+    try:
         return features.build_features_streaming(
-            curated_root, sport, dates, preoff_minutes, batch_markets, downsample_secs
+            curated_root=curated_root,
+            sport=sport,
+            dates=dates,
+            preoff_minutes=preoff_minutes,
+            batch_markets=batch_markets,
+            downsample_secs=downsample_secs,
         )
-
-    last_err: Exception | None = None
-    total_wait = 0.0
-    for attempt in range(1, max_attempts + 1):
+    except Exception as e:
+        msg = str(e)
+        print(f"WARN: First feature build attempt failed: {msg}")
+        # simple smarter retry: short sleep, then try once more
+        time.sleep(3.0)
         try:
-            df, total = features.build_features_streaming(
+            df, raw = features.build_features_streaming(
                 curated_root=curated_root,
                 sport=sport,
                 dates=dates,
@@ -136,394 +156,299 @@ def _build_features_with_retry(
                 batch_markets=batch_markets,
                 downsample_secs=downsample_secs,
             )
-            if attempt > 1:
-                print(
-                    f"✅ Recovered: MinIO/S3 responded on attempt {attempt} after ~{total_wait:.1f}s of backoff."
-                )
-            return df, total
-        except Exception as e:
-            last_err = e
-            if not _is_transient_s3_error(e) or attempt == max_attempts:
-                raise
-            delay = min(30.0, base_delay * (1.6 ** (attempt - 1)))
-            delay *= (1.0 + random.uniform(-jitter, jitter))
-            total_wait += delay
-            print(
-                f"WARN: Feature build attempt {attempt} failed: {e}\n"
-                f"      Backing off {delay:.1f}s before retry {attempt+1}/{max_attempts}...",
-                file=sys.stderr,
-            )
-            time.sleep(delay)
-    assert last_err is not None
-    raise last_err
+            print("✅ Recovered after transient data access error; continuing.")
+            return df, raw
+        except Exception as e2:
+            raise
 
 
-def _chunks(seq: List[str], n: int) -> Iterable[List[str]]:
-    for i in range(0, len(seq), n):
-        yield seq[i : i + n]
-
-
-def _binwise_report(
-    booster: xgb.Booster,
-    valid_df: pl.DataFrame,
-    Xva_np: np.ndarray,
-    yva: np.ndarray,
-    bins: List[int] = [0, 30, 60, 90, 120, 180],
-):
-    if "tto_minutes" not in valid_df.columns:
-        return
-    tto = valid_df["tto_minutes"].to_numpy()
-    print("\n[Horizon bins: tto_minutes]")
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        m = (tto > lo) & (tto <= hi)
-        if m.sum() < 200:
-            continue
-        dsub = xgb.DMatrix(Xva_np[m], label=yva[m])
-        p = booster.predict(dsub)
-        if p.ndim == 2 and p.shape[1] > 1:
-            p = p[:, 1]
-        p = np.clip(p, 1e-6, 1 - 1e-6)
-        try:
-            print(
-                f"[{lo:>3}-{hi:>3}] logloss={log_loss(yva[m], p):.4f} auc={roc_auc_score(yva[m], p):.3f} n={m.sum()}"
-            )
-        except Exception:
-            print(f"[{lo:>3}-{hi:>3}] logloss={log_loss(yva[m], p):.4f} n={m.sum()}")
-
-
-def _clean_labels_binary(df: pl.DataFrame, label_col: str) -> pl.DataFrame:
-    df2 = df.filter(pl.col(label_col).is_not_null() & pl.col(label_col).is_finite())
-    # keep only {0,1}
-    df2 = df2.filter(pl.col(label_col).is_in([0, 1]))
-    return df2
-
-
-def _split_train_valid_time(df_feat: pl.DataFrame, label_col: str, valid_frac: float = 0.2):
-    if "ts" in df_feat.columns:
-        df_feat = df_feat.sort("ts")
-    elif "publishTimeMs" in df_feat.columns:
-        df_feat = df_feat.sort("publishTimeMs")
-    n = df_feat.height
-    n_valid = max(1, int(n * valid_frac))
-    n_train = n - n_valid
-    return df_feat.slice(0, n_train), df_feat.slice(n_train, n_valid)
-
-
-def _np_mats(df_tr: pl.DataFrame, df_va: pl.DataFrame, feature_cols: List[str], label_col: str):
-    Xtr = df_tr.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
-    ytr = df_tr.select(label_col).to_numpy().ravel().astype(np.int32)
-    Xva = df_va.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32)
-    yva = df_va.select(label_col).to_numpy().ravel().astype(np.int32)
-    return Xtr, ytr, Xva, yva
-
+# ----------------------------- training -----------------------------
 
 def _train_one_run(
-    params: Dict,
-    Xtr_np: np.ndarray,
-    ytr: np.ndarray,
-    Xva_np: np.ndarray,
-    yva: np.ndarray,
-    num_boost_round: int,
-    early_stopping_rounds: int,
-    metric_name: str,
-    train_weights: Optional[np.ndarray] = None,
-) -> Tuple[xgb.Booster, Dict]:
-    dtrain = xgb.DMatrix(Xtr_np, label=ytr, weight=train_weights)
-    dvalid = xgb.DMatrix(Xva_np, label=yva)
-    booster = xgb.train(
-        params=params,
-        dtrain=dtrain,
-        num_boost_round=num_boost_round,
-        evals=[(dvalid, "validation_0")],
-        callbacks=[
-            EarlyStopping(
-                rounds=early_stopping_rounds,
-                save_best=True,
-                maximize=False,
-                data_name="validation_0",
-                metric_name=metric_name,
-            )
-        ],
-    )
-    pva = booster.predict(dvalid)
-    if params.get("objective", "").startswith("multi:"):
-        metrics = {"mlogloss": float(log_loss(yva, pva))}
-    else:
-        if pva.ndim == 2 and pva.shape[1] > 1:
-            pva = pva[:, 1]
-        pva = np.clip(pva, 1e-6, 1 - 1e-6)
-        metrics = {"logloss": float(log_loss(yva, pva))}
-        try:
-            metrics["auc"] = float(roc_auc_score(yva, pva))
-        except Exception:
-            pass
-    return booster, metrics
-
-
-def _sweep_train(
     df: pl.DataFrame,
     label_col: str,
-    use_gpu: bool,
+    device: str,
     n_estimators: int,
     learning_rate: float,
     early_stopping_rounds: int,
-    sweep_out: Optional[str] = None,
-    sample_weight_late: float = 1.0,
-) -> Tuple[xgb.Booster, Dict, Dict]:
-    """Run a small hyperparam sweep on df; return best booster, best metrics, best params."""
-    df = _clean_labels_binary(df, label_col)
-    feature_cols = _select_feature_cols(df, label_col)
-    tr, va = _split_train_valid_time(df, label_col, valid_frac=0.2)
-    Xtr, ytr, Xva, yva = _np_mats(tr, va, feature_cols, label_col)
+) -> Tuple[xgb.Booster, Dict[str, float], int]:
+    feat_cols = _select_feature_cols(df, label_col)
+    y = df[label_col].to_numpy().astype(np.float32)
+    # split time-wise (last 20% as validation)
+    n = df.height
+    split_idx = int(n * 0.8)
+    train_df = df[:split_idx]
+    valid_df = df[split_idx:]
 
-    # optional horizon-based weights (favor tto<=45)
-    train_weights: Optional[np.ndarray] = None
-    if sample_weight_late > 1.0 and "tto_minutes" in tr.columns:
-        tto = tr["tto_minutes"].to_numpy()
-        w = np.ones_like(ytr, dtype=np.float32)
-        w *= np.where(tto <= 45.0, sample_weight_late, 1.0)
-        train_weights = w
+    Xtr = _to_numpy(train_df, feat_cols)
+    Xva = _to_numpy(valid_df, feat_cols)
+    ytr = y[:split_idx]
+    yva = y[split_idx:]
 
-    n_classes = int(pl.Series(ytr).unique().len())
-    base_params = _xgb_base_params(n_classes, use_gpu)
-    base_params["learning_rate"] = learning_rate
+    # Configure device
+    params, banner = _device_params(device)
+    params.update({
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "learning_rate": learning_rate,
+        "max_depth": 6,                # may be overridden by sweep
+        "min_child_weight": 1,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_lambda": 1.0,
+        "reg_alpha": 0.0,
+    })
+    print(banner)
 
-    grid = [
-        {"max_depth": 5, "min_child_weight": 1,  "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 1.0, "reg_alpha": 0.0},
-        {"max_depth": 6, "min_child_weight": 5,  "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 0.0},
-        {"max_depth": 7, "min_child_weight": 10, "subsample": 0.9, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 1e-3},
-        {"max_depth": 6, "min_child_weight": 1,  "subsample": 0.7, "colsample_bytree": 1.0, "reg_lambda": 1.0, "reg_alpha": 1e-2},
-    ]
-    metric_name = "mlogloss" if n_classes > 2 else "logloss"
+    dtrain = xgb.DMatrix(Xtr, label=ytr)
+    dvalid = xgb.DMatrix(Xva, label=yva)
+    evals = [(dtrain, "train"), (dvalid, "valid")]
 
-    results = []
-    best = None
-    for i, hp in enumerate(grid, 1):
-        params = {**base_params, **hp}
-        print(f"\n=== Sweep {i}/{len(grid)}: {hp} ===")
-        print(f"   n_estimators={n_estimators}  lr={params['learning_rate']}")
-        booster, metrics = _train_one_run(
-            params=params,
-            Xtr_np=Xtr,
-            ytr=ytr,
-            Xva_np=Xva,
-            yva=yva,
-            num_boost_round=n_estimators,
-            early_stopping_rounds=early_stopping_rounds,
-            metric_name=metric_name,
-            train_weights=train_weights,
-        )
-        row = {**hp, **metrics, "best_iteration": getattr(booster, "best_iteration", None)}
-        results.append(row)
-        crit = metrics.get("logloss", metrics.get("mlogloss", 1e9))
-        if (best is None) or (crit < best[0]):
-            best = (crit, booster, params, metrics)
-
-    # optional CSV
-    if sweep_out and results:
-        headers = list(results[0].keys())
-        try:
-            import csv
-            with open(sweep_out, "w", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=headers)
-                w.writeheader()
-                w.writerows(results)
-            print(f"Saved sweep results to {sweep_out}")
-        except Exception as e:
-            print(f"WARN: failed to write sweep CSV: {e}", file=sys.stderr)
-
-    if best is None:
-        raise SystemExit("Sweep produced no model.")
-    _, booster, best_params, best_metrics = best
-
-    # report bin-wise on validation
-    _binwise_report(booster, va, Xva, yva)
-
-    print(
-        f"\nBest params: {{ max_depth: {best_params['max_depth']}, min_child_weight: {best_params['min_child_weight']}, "
-        f"subsample: {best_params['subsample']}, colsample_bytree: {best_params['colsample_bytree']}, "
-        f"reg_lambda: {best_params['reg_lambda']}, reg_alpha: {best_params['reg_alpha']}, "
-        f"learning_rate: {best_params['learning_rate']} }}"
+    booster = xgb.train(
+        params=params,
+        dtrain=dtrain,
+        num_boost_round=n_estimators,
+        evals=evals,
+        early_stopping_rounds=early_stopping_rounds if early_stopping_rounds > 0 else None,
+        verbose_eval=False,
     )
-    print(f"Best metrics: {best_metrics}")
-    return booster, best_metrics, best_params
+
+    # Metrics on validation (use best ntree_limit automatically applied by booster)
+    pva = booster.predict(dvalid)
+    metrics = _metrics_binary(yva, pva)
+
+    # Binwise horizon report (on valid slice only)
+    _binwise_report(valid_df, yva, pva, bins=[0, 30, 60, 90, 120, 180])
+
+    return booster, metrics, booster.best_iteration if booster.best_iteration is not None else n_estimators
 
 
-# ---------------------------- main ----------------------------
+def _train_with_params(
+    df: pl.DataFrame,
+    label_col: str,
+    base_params: Dict,
+    device: str,
+    n_estimators: int,
+    learning_rate: float,
+    early_stopping_rounds: int,
+) -> Tuple[xgb.Booster, Dict[str, float], int]:
+    feat_cols = _select_feature_cols(df, label_col)
+    y = df[label_col].to_numpy().astype(np.float32)
+
+    n = df.height
+    split_idx = int(n * 0.8)
+    train_df = df[:split_idx]
+    valid_df = df[split_idx:]
+
+    Xtr = _to_numpy(train_df, feat_cols)
+    Xva = _to_numpy(valid_df, feat_cols)
+    ytr = y[:split_idx]
+    yva = y[split_idx:]
+
+    dev_params, banner = _device_params(device)
+    params = {**dev_params, **base_params}
+    params.update({
+        "objective": "binary:logistic",
+        "eval_metric": "logloss",
+        "learning_rate": learning_rate,
+    })
+    print(f"{banner} | n_estimators={n_estimators} lr={learning_rate}")
+
+    dtrain = xgb.DMatrix(Xtr, label=ytr)
+    dvalid = xgb.DMatrix(Xva, label=yva)
+    evals = [(dtrain, "train"), (dvalid, "valid")]
+
+    booster = xgb.train(
+        params=params,
+        dtrain=dtrain,
+        num_boost_round=n_estimators,
+        evals=evals,
+        early_stopping_rounds=early_stopping_rounds if early_stopping_rounds > 0 else None,
+        verbose_eval=False,
+    )
+
+    pva = booster.predict(dvalid)
+    metrics = _metrics_binary(yva, pva)
+    _binwise_report(valid_df, yva, pva, bins=[0, 30, 60, 90, 120, 180])
+
+    return booster, metrics, booster.best_iteration if booster.best_iteration is not None else n_estimators
+
+
+# ----------------------------- main -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(
-        description="XGBoost trainer (GPU-capable) local or MinIO/S3; chunked reads, retry, sweep, and optional dual-horizon training."
-    )
-    ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] OR /local/path (rsynced mirror)")
-    ap.add_argument("--sport", required=True)
-    ap.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
-    ap.add_argument("--days", type=int, default=1)
+    ap = argparse.ArgumentParser(description="Train XGBoost on curated Betfair features (local FS or MinIO/S3).")
 
-    ap.add_argument("--preoff-mins", type=int, default=180, help="Max minutes pre-off to include in feature build (set 180 to allow dual-horizon split).")
+    # Data
+    ap.add_argument("--curated", required=True, help="s3://bucket or /local/path")
+    ap.add_argument("--sport", required=True)
+    ap.add_argument("--date", default=None, help="End date (YYYY-MM-DD). If omitted, uses max available date.")
+    ap.add_argument("--days", type=int, default=1)
+    ap.add_argument("--preoff-mins", type=int, default=30)
     ap.add_argument("--batch-markets", type=int, default=100)
     ap.add_argument("--downsample-secs", type=int, default=0)
     ap.add_argument("--chunk-days", type=int, default=2)
 
+    # Model / training
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     ap.add_argument("--label-col", default="winLabel")
     ap.add_argument("--n-estimators", type=int, default=3000)
     ap.add_argument("--learning-rate", type=float, default=0.02)
     ap.add_argument("--early-stopping-rounds", type=int, default=100)
 
-    ap.add_argument("--model-out", default="xgb_model.json", help="Used for single-model runs.")
+    # Output
+    ap.add_argument("--model-out", default=None, help="Single-horizon output path; default ../output/xgb_model.json")
+    ap.add_argument("--model-prefix", default="", help="Prefix for saved model files")
+
+    # Sweep
+    ap.add_argument("--sweep", action="store_true", help="Run a small hyperparameter sweep.")
     ap.add_argument("--sweep-out", default="sweep_results.csv")
 
-    # Legacy spelling kept hidden, both map to the same dest
-    ap.add_argument(
-        "--dual-horizon",
-        dest="dual_horizon",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    ap.add_argument(
-        "--dual_horizon",
-        dest="dual_horizon",
-        action="store_true",
-        help="Train two models in one run: short (<=30 min) and long (30..preoff). Saves model_30.json and model_180.json (or with your prefix).",
-    )
-
-    ap.add_argument("--model-prefix", default="", help="Prefix for dual-horizon outputs, e.g., 'hr_' to get hr_model_30.json / hr_model_180.json")
-    ap.add_argument("--sweep-out-30", default="sweep_results_30.csv")
-    ap.add_argument("--sweep-out-180", default="sweep_results_180.csv")
-
-    ap.add_argument("--weight-late", type=float, default=1.0,
-                    help="Extra weight for rows with tto_minutes<=45 (applies to each model independently; 1.0 = no extra weight).")
+    # Dual horizon (train short <=30min and long <=180min in one go)
+    ap.add_argument("--dual-horizon", action="store_true", help="Train 2 models at preoff-mins=30 and 180.")
 
     args = ap.parse_args()
-    dual_horizon = getattr(args, "dual_horizon", False)
 
-    is_s3 = _is_s3_uri(args.curated)
-    _check_store(args.curated)
-
-    dates = _daterange(args.date, args.days)
-    src_label = "MinIO/S3" if is_s3 else "Local FS"
-    print(
-        f"Building features from [{src_label}] curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]} (chunk_days={args.chunk_days})"
-    )
-
-    # Build once (with max horizon to allow splitting)
-    df_parts: List[pl.DataFrame] = []
-    total_raw = 0
-    for idx, dchunk in enumerate(_chunks(dates, max(1, args.chunk_days)), 1):
-        print(f"  • chunk {idx}: {dchunk[0]}..{dchunk[-1]}")
-        df_c, raw_c = _build_features_with_retry(
-            curated_root=args.curated,
-            sport=args.sport,
-            dates=dchunk,
-            preoff_minutes=args.preoff_mins,
-            batch_markets=args.batch_markets,
-            downsample_secs=(args.downsample_secs or None),
-            is_s3=is_s3,
-            max_attempts=5,
-            base_delay=1.5,
-            jitter=0.25,
-        )
-        total_raw += raw_c
-        if not df_c.is_empty():
-            df_parts.append(df_c)
-
-    if not df_parts:
-        raise SystemExit("No features built (empty frame). Check curated paths/date range.")
-
-    df_feat = pl.concat(df_parts, how="vertical", rechunk=True)
-    print(f"Feature rows: {df_feat.height:,} (from ~{total_raw:,} raw snapshot rows scanned)")
-
-    # Device decision
-    if args.device == "cuda":
-        use_gpu = True
-    elif args.device == "cpu":
-        use_gpu = False
+    # Resolve dates
+    if args.date:
+        dates = _daterange(args.date, args.days)
+        print(f"Building features from curated={args.curated}, sport={args.sport}, dates={dates[0]}..{dates[-1]}")
     else:
-        use_gpu = _has_nvidia_gpu()
+        # If your features module exposes "list_available_dates", you could use it.
+        # For now assume date provided; otherwise just pass through.
+        print(f"Building features from curated={args.curated}, sport={args.sport}, (dates inferred)")
+        dates = []
 
-    print(
-        f"[diag] xgboost={xgb.__version__}, CUDA visible={use_gpu}, CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES','<unset>')}"
-    )
-    device_str = "CUDA" if use_gpu else "CPU"
-    print(f"🚀 Training with XGBoost on {device_str} (tree_method=hist)")
+    out_dir = _ensure_output_dir()
 
-    # Single-model path (no dual split)
-    if not dual_horizon:
-        booster, best_metrics, best_params = _sweep_train(
+    # Helper to fetch features in chunks for a given preoff window
+    def build_all_features(preoff_minutes: int) -> pl.DataFrame:
+        df_parts: List[pl.DataFrame] = []
+        total_raw = 0
+        if not dates:
+            # single fetch; features module may interpret empty list as "all"
+            df, raw = _build_features_with_retry(
+                args.curated, args.sport, dates, preoff_minutes, args.batch_markets, args.downsample_secs or None
+            )
+            total_raw += raw
+            if not df.is_empty():
+                df_parts.append(df)
+        else:
+            # chunked by chunk_days
+            for i in range(0, len(dates), args.chunk_days):
+                dchunk = dates[i:i + args.chunk_days]
+                print(f"  • chunk {i//args.chunk_days + 1}: {dchunk[0]}..{dchunk[-1]}")
+                df_c, raw_c = _build_features_with_retry(
+                    args.curated, args.sport, dchunk, preoff_minutes, args.batch_markets, args.downsample_secs or None
+                )
+                total_raw += raw_c
+                if not df_c.is_empty():
+                    df_parts.append(df_c)
+        if not df_parts:
+            raise SystemExit("No features after streaming build.")
+        df_all = pl.concat(df_parts, how="vertical", rechunk=True)
+        print(f"Feature rows: {df_all.height} (from ~{df_all.height} raw snapshot rows scanned)")
+        return df_all
+
+    # ----------------- Single horizon path -----------------
+    if not args.dual_horizon:
+        df_feat = build_all_features(args.preoff_mins)
+        # ensure labels are clean
+        df_feat = df_feat.filter(pl.col(args.label_col).is_not_null())
+        booster, metrics, best_iter = _train_one_run(
             df=df_feat,
             label_col=args.label_col,
-            use_gpu=use_gpu,
+            device=args.device,
             n_estimators=args.n_estimators,
             learning_rate=args.learning_rate,
             early_stopping_rounds=args.early_stopping_rounds,
-            sweep_out=args.sweep_out,
-            sample_weight_late=args.weight_late,
         )
+        print(f"Metrics: {metrics}")
 
-        # Rebuild the SAME validation split to feed _binwise_report
-        clean_df = _clean_labels_binary(df_feat, args.label_col)
-        feature_cols = _select_feature_cols(clean_df, args.label_col)
-        tr_df, va_df = _split_train_valid_time(clean_df, args.label_col, valid_frac=0.2)
-        _, _, Xva_np, yva = _np_mats(tr_df, va_df, feature_cols, args.label_col)
-
-        _binwise_report(booster, va_df, Xva_np, yva)
-
-        booster.save_model(args.model_out)
-        print(f"Saved best model to {args.model_out}")
+        # Save single model to ../output
+        out_path = args.model_out or os.path.join(out_dir, f"{args.model_prefix}xgb_model.json")
+        booster.save_model(out_path)
+        print(f"Saved model to {out_path}")
         return
 
-    # Dual-horizon: split by tto_minutes
-    if "tto_minutes" not in df_feat.columns:
-        raise SystemExit("dual-horizon requires 'tto_minutes' feature. Ensure features.py adds it.")
-    short_df = df_feat.filter(pl.col("tto_minutes") <= 30.0)
-    long_df = df_feat.filter(pl.col("tto_minutes") > 30.0)
+    # ----------------- Dual horizon path -----------------
+    print(f"\n==== Training (preoff-mins=30) → model_30.json ====")
+    df_30 = build_all_features(30)
+    df_30 = df_30.filter(pl.col(args.label_col).is_not_null())
 
-    if short_df.is_empty() or long_df.is_empty():
-        raise SystemExit(
-            f"dual-horizon split empty: short={short_df.height}, long={long_df.height}. "
-            f"Check preoff-mins ({args.preoff_mins}) and data coverage."
+    print(f"\n==== Training (preoff-mins=180) → model_180.json ====")
+    df_180 = build_all_features(180)
+    df_180 = df_180.filter(pl.col(args.label_col).is_not_null())
+
+    def run_sweep(df: pl.DataFrame, tag_out: str) -> Tuple[xgb.Booster, Dict[str, float]]:
+        # small sweep grid
+        search_space = [
+            {"max_depth": 5, "min_child_weight": 1, "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 1.0, "reg_alpha": 0.0},
+            {"max_depth": 6, "min_child_weight": 5, "subsample": 0.8, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 0.0},
+            {"max_depth": 7, "min_child_weight": 10, "subsample": 0.9, "colsample_bytree": 0.8, "reg_lambda": 3.0, "reg_alpha": 0.001},
+            {"max_depth": 6, "min_child_weight": 1, "subsample": 0.7, "colsample_bytree": 1.0, "reg_lambda": 1.0, "reg_alpha": 0.01},
+        ]
+        rows = []
+        best_bst, best_m, best_params, best_iter = None, None, None, None
+
+        for i, hp in enumerate(search_space, 1):
+            print(f"\n=== Sweep {i}/{len(search_space)}: {hp} ===")
+            bst, m, it = _train_with_params(
+                df=df,
+                label_col=args.label_col,
+                base_params=hp,
+                device=args.device,
+                n_estimators=args.n_estimators,
+                learning_rate=args.learning_rate,
+                early_stopping_rounds=args.early_stopping_rounds,
+            )
+            rows.append({
+                **hp,
+                "logloss": m["logloss"],
+                "auc": m["auc"],
+                "best_iteration": it,
+            })
+            if (best_m is None) or (m["logloss"] < best_m["logloss"]):
+                best_bst, best_m, best_params, best_iter = bst, m, hp, it
+
+        # write sweep csv
+        df_rows = pl.DataFrame(rows)
+        out_csv = os.path.join(out_dir, tag_out)
+        df_rows.write_csv(out_csv)
+        print("\n=== Sweep Summary ===")
+        print(df_rows.sort("logloss").to_string())
+        print(f"Saved sweep results to {out_csv}")
+        print(f"\nBest params: {best_params} \nBest metrics: {best_m}")
+        return best_bst, best_m
+
+    # Either sweep or single train per horizon
+    if args.sweep:
+        bst_short, m_short = run_sweep(df_30, "sweep_results_30.csv")
+        bst_long,  m_long  = run_sweep(df_180, "sweep_results_180.csv")
+    else:
+        bst_short, m_short, _ = _train_one_run(
+            df=df_30, label_col=args.label_col, device=args.device,
+            n_estimators=args.n_estimators, learning_rate=args.learning_rate,
+            early_stopping_rounds=args.early_stopping_rounds,
         )
+        bst_long,  m_long,  _ = _train_one_run(
+            df=df_180, label_col=args.label_col, device=args.device,
+            n_estimators=args.n_estimators, learning_rate=args.learning_rate,
+            early_stopping_rounds=args.early_stopping_rounds,
+        )
+        print(f"\n[30] Metrics: {m_short}")
+        print(f"[180] Metrics: {m_long}")
 
-    print(f"\n=== Training short-horizon model (tto <= 30) : {short_df.height:,} rows ===")
-    bst_short, m_short, p_short = _sweep_train(
-        df=short_df,
-        label_col=args.label_col,
-        use_gpu=use_gpu,
-        n_estimators=args.n_estimators,
-        learning_rate=args.learning_rate,
-        early_stopping_rounds=args.early_stopping_rounds,
-        sweep_out=args.sweep_out_30,
-        sample_weight_late=args.weight_late,
-    )
-
-    print(f"\n=== Training long-horizon model  (30 < tto <= {args.preoff_mins}) : {long_df.height:,} rows ===")
-    bst_long, m_long, p_long = _sweep_train(
-        df=long_df,
-        label_col=args.label_col,
-        use_gpu=use_gpu,
-        n_estimators=args.n_estimators,
-        learning_rate=args.learning_rate,
-        early_stopping_rounds=args.early_stopping_rounds,
-        sweep_out=args.sweep_out_180,
-        sample_weight_late=args.weight_late,
-    )
-
-    # ensure output dir exists
-    out_dir = os.path.join(os.path.dirname(__file__), "..", "output")
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Save both
+    # Save both under ../output
     prefix = args.model_prefix or ""
     out_short = os.path.join(out_dir, f"{prefix}model_30.json")
-    out_long = os.path.join(out_dir, f"{prefix}model_180.json")
-
+    out_long  = os.path.join(out_dir, f"{prefix}model_180.json")
     bst_short.save_model(out_short)
     bst_long.save_model(out_long)
-
     print("\n=== Dual-horizon saved ===")
     print(f"  - {out_short}  (short horizon; best: {m_short})")
     print(f"  - {out_long}   (long horizon;  best: {m_long})")
+
 
 if __name__ == "__main__":
     main()
