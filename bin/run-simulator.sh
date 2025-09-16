@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage:
+# Usage: ok
 #   bin/run-simulator.sh 2025-09-15            # dual-model default (uses ./output/model_30.json & model_180.json)
 #   bin/run-simulator.sh 2025-09-15 --model    # single-model default (./output/xgb_model.json)
 #   bin/run-simulator.sh 2025-09-15 --model ./output/custom.json
