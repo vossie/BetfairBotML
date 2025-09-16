@@ -198,14 +198,15 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
 
 def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
     """
-    Apply simple caps on cumulative stake units per market and per day.
-    Scale stakes if cumulative would exceed the cap.
-    Enforce Betfair's £1 minimum bet size by rounding up small positive stakes.
+    Apply caps per market and per day, then enforce a £1 minimum stake:
+    - If stake == 0 -> stay 0
+    - If 0 < stake < 1 -> round up to 1
+    - Else keep stake
     """
     if bets.is_empty():
         return bets
 
-    # market cap
+    # Cap per market
     b1 = (
         bets.with_columns([
             pl.col("stake_unit").cum_sum().over("marketId").alias("cum_mkt"),
@@ -219,7 +220,7 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
         .drop(["cum_mkt"])
     )
 
-    # day cap
+    # Cap per day
     b1 = b1.with_columns([
         (pl.col("publishTimeMs") // (1000 * 60 * 60 * 24)).alias("day_bucket")
     ])
@@ -236,15 +237,18 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
         .drop(["cum_day", "day_bucket"])
     )
 
-    # enforce £1 minimum: round up all positive stakes below 1.0
+    # Enforce £1 minimum without clip_lower (works on old Polars)
     b2 = b2.with_columns([
-        pl.when(pl.col("stake_unit_final") > 0)
-        .then(pl.col("stake_unit_final").clip_lower(1.0))
-        .otherwise(0.0)
+        pl.when(pl.col("stake_unit_final") <= 0)
+        .then(0.0)
+        .when(pl.col("stake_unit_final") < 1.0)
+        .then(1.0)
+        .otherwise(pl.col("stake_unit_final"))
         .alias("stake")
     ])
 
     return b2
+
 
 
 
