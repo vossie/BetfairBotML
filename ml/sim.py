@@ -27,7 +27,13 @@ def _daterange(end_date_str: str, days: int) -> List[str]:
 
 
 def _load_booster(path: str) -> xgb.Booster:
+    import os
     bst = xgb.Booster()
+    # prepend ./output if path is relative and doesn't exist
+    if not os.path.isabs(path) and not os.path.exists(path):
+        alt = os.path.join("output", path)
+        if os.path.exists(alt):
+            path = alt
     bst.load_model(path)
     return bst
 
@@ -345,9 +351,9 @@ def main():
     ap = argparse.ArgumentParser(description="Bet selection & PnL simulation using trained XGBoost models.")
 
     # models (single or dual)
-    ap.add_argument("--model", help="Path to single model (JSON).")
-    ap.add_argument("--model-30", help="Path to short-horizon model (<= gate-mins).")
-    ap.add_argument("--model-180", help="Path to long-horizon model (> gate-mins).")
+    ap.add_argument("--model", help="Path to single model (JSON).", default="./output/xgb_model.json")
+    ap.add_argument("--model-30", help="Path to short-horizon model (<= gate-mins).", default="./output/model_30.json")
+    ap.add_argument("--model-180", help="Path to long-horizon model (> gate-mins).", default="./output/model_180.json")
     ap.add_argument("--gate-mins", type=float, default=45.0, help="Gate for dual model switching (tto<=gate→short).")
 
     # data
