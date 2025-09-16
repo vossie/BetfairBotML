@@ -175,30 +175,26 @@ def _build_bets_table(
     have = [c for c in keep if c in df2.columns]
     return df2.select(have)
 
+import polars as pl
+
 def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
     if bets.is_empty():
         return bets
 
-    # Use new or old Polars APIs depending on availability
-    length_expr = getattr(pl, "len", None)
-    if length_expr is None:
-        length_expr = pl.count  # fallback for older versions
-
-    # row_number is preferred (new versions), fallback to cum_count (old versions)
-    if hasattr(pl, "row_number"):
-        rn_expr = pl.row_number()
-    else:
-        rn_expr = pl.cum_count()
+    # Prefer pl.len() (new Polars), fall back to pl.count() (older Polars)
+    length_expr = getattr(pl, "len", None) or pl.count
 
     return (
         bets.sort(["marketId", "edge"], descending=[False, True])
         .with_columns(
             length_expr().over("marketId").alias("n_in_market"),
-            rn_expr.over("marketId").alias("rank_in_market"),
+            # Generate per-group row numbers 0..N-1 without using row_number/cum_count
+            pl.arange(0, length_expr()).over("marketId").alias("rank_in_market"),
         )
         .filter(pl.col("rank_in_market") < top_n)
         .drop(["n_in_market", "rank_in_market"])
     )
+
 
 def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
     """
