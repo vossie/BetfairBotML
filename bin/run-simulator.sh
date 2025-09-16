@@ -28,6 +28,9 @@ if [[ "${1:-}" == "--model" ]]; then
   fi
 fi
 
+# Load environment
+source "$(dirname "$0")/set-env-vars-prod.sh"
+
 # Common env echo (optional)
 echo "Endpoint: ${AWS_ENDPOINT_URL:-<unset>}"
 echo "Region:   ${AWS_REGION:-<unset>}"
