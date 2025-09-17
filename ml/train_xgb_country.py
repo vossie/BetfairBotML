@@ -218,38 +218,38 @@ def main():
     df_enc = add_country_onehots(df, vocab)
 
 
-        # Train
-        bst, metrics, best_it = train(df_enc, args.label_col, args.device, args.n_estimators, args.learning_rate, args.early_stopping_rounds)
-        out_model = OUTPUT_DIR / args.model_out
-        bst.save_model(str(out_model))
+    # Train
+    bst, metrics, best_it = train(df_enc, args.label_col, args.device, args.n_estimators, args.learning_rate, args.early_stopping_rounds)
+    out_model = OUTPUT_DIR / args.model_out
+    bst.save_model(str(out_model))
 
-        meta = {"country_vocab": vocab, "other_token": "__OTHER__"}
-        out_meta = OUTPUT_DIR / args.meta_out
-        out_meta.write_text(json.dumps(meta, indent=2))
+    meta = {"country_vocab": vocab, "other_token": "__OTHER__"}
+    out_meta = OUTPUT_DIR / args.meta_out
+    out_meta.write_text(json.dumps(meta, indent=2))
 
-        print(f"Saved model to {out_model}")
-        print(f"Saved meta to  {out_meta}")
-        print(f"Metrics: {metrics} | best_iteration={best_it}")
-        # Stratified metrics by country
-        if "countryCode" in df_enc.columns:
-            print("\\nStratified validation metrics by country:")
-            va_df = df_enc[split_idx:]
-            va_preds = bst.predict(xgb.DMatrix(Xva))
-            va_df = va_df.with_columns(pl.Series("p_hat", va_preds))
-            for cc, sub in va_df.group_by("countryCode"):
-                y_sub = sub[args.label_col].to_numpy().astype(np.float32)
-                p_sub = sub["p_hat"].to_numpy()
-                if len(y_sub) == 0:
-                    continue
-                eps = 1e-12
-                p_clip = np.clip(p_sub, eps, 1 - eps)
-                logloss_sub = float(-np.mean(y_sub*np.log(p_clip) + (1 - y_sub)*np.log(1 - p_clip)))
-                try:
-                    from sklearn.metrics import roc_auc_score
-                    auc_sub = float(roc_auc_score(y_sub, p_sub))
-                except Exception:
-                    auc_sub = float("nan")
-                print(f"  {cc}: logloss={logloss_sub:.4f} auc={auc_sub:.4f} n={len(y_sub)}")
+    print(f"Saved model to {out_model}")
+    print(f"Saved meta to  {out_meta}")
+    print(f"Metrics: {metrics} | best_iteration={best_it}")
+    # Stratified metrics by country
+    if "countryCode" in df_enc.columns:
+        print("\\nStratified validation metrics by country:")
+        va_df = df_enc[split_idx:]
+        va_preds = bst.predict(xgb.DMatrix(Xva))
+        va_df = va_df.with_columns(pl.Series("p_hat", va_preds))
+        for cc, sub in va_df.group_by("countryCode"):
+            y_sub = sub[args.label_col].to_numpy().astype(np.float32)
+            p_sub = sub["p_hat"].to_numpy()
+            if len(y_sub) == 0:
+                continue
+            eps = 1e-12
+            p_clip = np.clip(p_sub, eps, 1 - eps)
+            logloss_sub = float(-np.mean(y_sub*np.log(p_clip) + (1 - y_sub)*np.log(1 - p_clip)))
+            try:
+                from sklearn.metrics import roc_auc_score
+                auc_sub = float(roc_auc_score(y_sub, p_sub))
+            except Exception:
+                auc_sub = float("nan")
+            print(f"  {cc}: logloss={logloss_sub:.4f} auc={auc_sub:.4f} n={len(y_sub)}")
     
 
 
