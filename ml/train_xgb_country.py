@@ -101,7 +101,7 @@ def _binwise_report(df: pl.DataFrame, y: np.ndarray, p: np.ndarray, edges: List[
         return
     labels = [f"{edges[i]:02d}-{edges[i+1]:02d}" for i in range(len(edges) - 1)]
 
-    # Proper when/then chain (fixes earlier bug)
+    # Proper when/then chain
     expr = None
     for i, lab in enumerate(labels):
         lo, hi = edges[i], edges[i+1]
