@@ -126,7 +126,7 @@ def build_features_streaming(
     lf_def  = _scan_parquet(def_paths)
     lf_res  = _scan_parquet(res_paths)
 
-    if lf_snap.collect_schema().is_empty():
+    if len(lf_snap.collect_schema().names()) == 0:
         return pl.DataFrame([]), 0
 
     # Minimal subset from snapshots
@@ -139,14 +139,14 @@ def build_features_streaming(
     lf_snap = _with_basic_transforms(lf_snap)
 
     # Market definitions: need marketStartMs and countryCode (if present)
-    if not lf_def.collect_schema().is_empty():
+    if len(lf_def.collect_schema().names()) > 0:
         keep_def = [c for c in ["marketId", "marketStartMs", "countryCode"] if c in lf_def.collect_schema().names()]
         lf_def = lf_def.select(keep_def)
     else:
         lf_def = pl.DataFrame({"marketId": [], "marketStartMs": [], "countryCode": []}).lazy()
 
     # Results: join for winLabel if available
-    if not lf_res.collect_schema().is_empty():
+    if len(lf_res.collect_schema().names()) > 0:
         keep_res = [c for c in ["marketId", "selectionId", "winLabel"] if c in lf_res.collect_schema().names()]
         lf_res = lf_res.select(keep_res)
     else:
