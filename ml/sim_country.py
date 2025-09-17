@@ -3,43 +3,33 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from datetime import datetime, timedelta
 import polars as pl
 import numpy as np
 import xgboost as xgb
-from datetime import datetime, timedelta
+import csv
 
 from . import features
 
 
 def _load_booster(path: str) -> xgb.Booster:
     p = Path(path)
-    if not p.exists():
-        raise SystemExit(f"Model not found: {p}")
     bst = xgb.Booster()
     bst.load_model(str(p))
     return bst
 
 
 def _load_features(path: str) -> list[str]:
-    p = Path(path)
-    if not p.exists():
-        raise SystemExit(f"Feature file not found: {p}")
-    return [line.strip() for line in p.read_text().splitlines() if line.strip()]
+    return [line.strip() for line in Path(path).read_text().splitlines() if line.strip()]
 
 
 def _to_numpy(df: pl.DataFrame, cols: list[str]) -> np.ndarray:
     return df.select(cols).fill_null(strategy="mean").to_numpy().astype(np.float32, copy=False)
 
 
-def _build_features(
-    curated_root: str,
-    sport: str,
-    dates: list[str],
-    preoff_minutes: int,
-    batch_markets: int,
-    downsample_secs: int | None,
-    chunk_days: int,
-) -> pl.DataFrame:
+def _build_features(curated_root: str, sport: str, dates: list[str],
+                    preoff_minutes: int, batch_markets: int,
+                    downsample_secs: int | None, chunk_days: int) -> pl.DataFrame:
     parts: list[pl.DataFrame] = []
     for i in range(0, len(dates), chunk_days):
         chunk = dates[i:i + chunk_days]
@@ -68,9 +58,14 @@ def _add_country_feature(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
+def _kelly_stake(edge: float, kelly: float, bank: float = 100.0) -> float:
+    # Simplified: stake = kelly * bank * edge
+    return max(1.0, kelly * bank * edge)  # enforce £1 min
+
+
 def main():
     ap = argparse.ArgumentParser("Simulate bets with trained XGB (country-aware).")
-    ap.add_argument("--model", required=True, help="Path to model JSON")
+    ap.add_argument("--model", required=True)
     ap.add_argument("--curated", required=True)
     ap.add_argument("--sport", required=True)
     ap.add_argument("--date", required=True)
@@ -92,14 +87,15 @@ def main():
     ap.add_argument("--bets-out", default="./output/bets_country.csv")
     args = ap.parse_args()
 
-    # Load model + feature order
+    # Load model + features
     bst = _load_booster(args.model)
     feats = _load_features(Path(args.model).with_suffix(".features.txt"))
 
-    # Build feature set
+    # Date window
     end = datetime.strptime(args.date, "%Y-%m-%d").date()
     dates = [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in reversed(range(args.days_before + 1))]
 
+    # Build features
     df = _build_features(
         curated_root=args.curated,
         sport=args.sport,
@@ -109,24 +105,52 @@ def main():
         downsample_secs=(args.downsample_secs or None),
         chunk_days=args.chunk_days,
     )
-
-    # Add derived country_feat so features align
     df = _add_country_feature(df)
 
-    # Only keep rows with labels if present
     if args.label_col in df.columns:
         df = df.filter(pl.col(args.label_col).is_not_null())
 
     if df.is_empty():
         raise SystemExit("No usable rows after feature build.")
 
-    # Convert to numpy with correct feature order
+    # Predict
     X = _to_numpy(df, feats)
     dX = xgb.DMatrix(X, feature_names=feats)
+    probs = bst.predict(dX)
 
-    # Predict
-    p = bst.predict(dX)
-    print(f"Simulated {len(p)} predictions, example={p[:5]}")
+    df = df.with_columns(pl.Series("pred", probs))
+
+    # Expected value = prob * odds – (1 - prob)
+    df = df.with_columns(((pl.col("pred") * pl.col("ltp")) - (1.0 - pl.col("pred"))).alias("edge"))
+
+    # Filter bets
+    bets = df.filter(pl.col("edge") >= args.min_edge)
+
+    rows = []
+    pnl_by_country: dict[str, float] = {}
+
+    for r in bets.iter_rows(named=True):
+        stake = _kelly_stake(r["edge"], args.kelly)
+        pnl = (r["ltp"] - 1) * stake * r["pred"] - stake * (1 - r["pred"])
+        pnl *= (1.0 - args.commission)  # commission adjustment
+        rows.append([r["marketId"], r["selectionId"], r.get("countryCode", "UNK"), r["ltp"], r["pred"], stake, pnl])
+        pnl_by_country[r.get("countryCode", "UNK")] = pnl_by_country.get(r.get("countryCode", "UNK"), 0.0) + pnl
+
+    # Write bets
+    with open(args.bets_out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["marketId", "selectionId", "countryCode", "ltp", "pred", "stake", "pnl"])
+        w.writerows(rows)
+
+    # Write pnl by country
+    with open(args.pnl_by_country_out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["countryCode", "pnl"])
+        for c, v in pnl_by_country.items():
+            w.writerow([c, v])
+
+    print(f"Saved bets -> {args.bets_out}")
+    print(f"Saved pnl_by_country -> {args.pnl_by_country_out}")
 
 
 if __name__ == "__main__":
