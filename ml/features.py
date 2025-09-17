@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 from typing import List, Tuple, Optional
-import os
 
 import polars as pl
 import pyarrow.dataset as pads
-import pyarrow.fs as pafs
 
 
 # -------------------------
@@ -25,97 +23,30 @@ def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[L
         return f"{curated_root.rstrip('/')}/{name}/sport={sport}"
 
     snaps = [f"{pfx('orderbook_snapshots_5s')}/date={d}" for d in dates]
-    defs = [f"{pfx('market_definitions')}/date={d}" for d in dates]
-    res  = [f"{pfx('results')}/date={d}" for d in dates]
+    defs  = [f"{pfx('market_definitions')}/date={d}" for d in dates]
+    res   = [f"{pfx('results')}/date={d}" for d in dates]
     return snaps, defs, res
-
-
-def _strip_scheme(url: str) -> str:
-    if url.startswith("https://"):
-        return url[len("https://"):]
-    if url.startswith("http://"):
-        return url[len("http://"):]
-    return url
-
-
-def _make_s3fs() -> pafs.S3FileSystem:
-    """
-    Construct an S3FileSystem using environment variables, so region/endpoint
-    mismatches don't occur (ACCESS_DENIED due to wrong region).
-    Env vars used (best-effort):
-      - AWS_ACCESS_KEY_ID
-      - AWS_SECRET_ACCESS_KEY
-      - AWS_SESSION_TOKEN
-      - AWS_REGION or AWS_DEFAULT_REGION
-      - AWS_ENDPOINT_URL or AWS_S3_ENDPOINT (for MinIO/local gateways)
-    """
-    access_key = os.getenv("AWS_ACCESS_KEY_ID")
-    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
-    session_token = os.getenv("AWS_SESSION_TOKEN")
-    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
-    endpoint = os.getenv("AWS_ENDPOINT_URL") or os.getenv("AWS_S3_ENDPOINT")
-    scheme = "https"
-    if endpoint and endpoint.startswith("http://"):
-        scheme = "http"
-    endpoint_override = _strip_scheme(endpoint) if endpoint else None
-
-    # pyarrow accepts None for any unset fields.
-    return pafs.S3FileSystem(
-        access_key=access_key,
-        secret_key=secret_key,
-        session_token=session_token,
-        region=region,
-        scheme=scheme,
-        endpoint_override=endpoint_override,
-    )
-
-
-def _fs_and_path(uri: str):
-    """Return (filesystem, path_without_scheme) for a given local/S3/other URI."""
-    if uri.startswith("s3://"):
-        fs = _make_s3fs()
-        path = uri[len("s3://"):]
-        return fs, path
-    # Non-S3 -> let Arrow infer
-    fs, path = pafs.FileSystem.from_uri(uri)
-    return fs, path
-
-
-def _expand_uri(uri: str) -> List[str]:
-    """Expand a file or directory URI into file paths compatible with its filesystem."""
-    fs, path = _fs_and_path(uri)
-    info = fs.get_file_info([path])[0]
-    if info.type == pafs.FileType.Directory:
-        selector = pafs.FileSelector(path, recursive=True)
-        return [fi.path for fi in fs.get_file_info(selector) if fi.is_file]
-    elif info.is_file:
-        return [path]
-    else:
-        return []
 
 
 def _scan_parquet(uris: List[str]) -> pl.LazyFrame:
     """
-    Build a LazyFrame from a list of URIs (local or s3://...). All URIs must belong
-    to the same filesystem (e.g., same S3 endpoint). Returns an empty LazyFrame if none.
+    Build a LazyFrame from a list of directory/file URIs (local or s3://...).
+    We rely on PyArrow to handle URIs using the current environment configuration.
+    Any missing/non-existent URI is skipped gracefully.
     """
-    if not uris:
-        return pl.DataFrame([]).lazy()
-
-    base_fs, _ = _fs_and_path(uris[0])
-    all_files: List[str] = []
+    frames: List[pl.LazyFrame] = []
     for u in uris:
-        fs_u, _ = _fs_and_path(u)
-        if type(fs_u) != type(base_fs):
-            raise ValueError(f"Mixed filesystems not supported: {type(base_fs)} vs {type(fs_u)} for {u}")
-        all_files.extend(_expand_uri(u))
-
-    if not all_files:
+        try:
+            ds = pads.dataset(u, format="parquet")
+        except Exception:
+            # Skip paths that don't exist or aren't accessible for the date/sport
+            continue
+        tbl = ds.to_table()
+        if tbl.num_rows > 0:
+            frames.append(pl.from_arrow(tbl).lazy())
+    if not frames:
         return pl.DataFrame([]).lazy()
-
-    ds = pads.dataset(all_files, format="parquet", filesystem=base_fs)
-    tbl = ds.to_table()
-    return pl.from_arrow(tbl).lazy()
+    return pl.concat(frames, how="vertical")
 
 
 # -------------------------
@@ -128,7 +59,7 @@ def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
     snaps = snaps.with_columns([
         (pl.col("publishTimeMs") / 1000).alias("ts_s"),
     ]).with_columns([
-        pl.from_epoch("ts_s").alias("ts")
+        pl.from_epoch(pl.col("ts_s")).alias("ts")
     ])
 
     # implied_prob = 1/ltp (guarded)
