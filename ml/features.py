@@ -30,7 +30,7 @@ def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[L
 def _scan_parquet(paths: List[str]) -> pl.LazyFrame:
     """
     Read a list of partition directories/files (local or s3://...) using PyArrow dataset.
-    We rely on the environment for S3 credentials/endpoint/region (unchanged behavior).
+    Relies on environment for S3 configuration (unchanged behavior).
     Missing paths are skipped quietly.
     """
     frames: List[pl.LazyFrame] = []
@@ -38,7 +38,6 @@ def _scan_parquet(paths: List[str]) -> pl.LazyFrame:
         try:
             ds = pads.dataset(p, format="parquet", partitioning="hive", ignore_missing_files=True)
         except Exception:
-            # Skip nonexistent or inaccessible partitions for this date/sport
             continue
         tbl = ds.to_table()
         if tbl.num_rows > 0:
@@ -113,7 +112,7 @@ def build_features_streaming(
     sport: str,
     dates: List[str],
     preoff_minutes: int = 30,
-    batch_markets: int = 100,     # kept for API compatibility; not used in this single-pass builder
+    batch_markets: int = 100,     # API compat; not used in this single-pass builder
     downsample_secs: Optional[int] = None,
 ) -> Tuple[pl.DataFrame, int]:
     """
@@ -122,8 +121,7 @@ def build_features_streaming(
     - Includes 'countryCode' from market definitions.
     - Computes time-to-off in minutes from marketStartMs.
     - Computes basic momentum/volume windows from snapshots.
-    NOTE: We do NOT hard-filter by preoff window here to avoid dropping markets that
-          lack marketStartMs; caller can filter if desired.
+    - Applies the same pre-off filter as the classic pipeline: 0 <= tto_minutes <= preoff_minutes.
     """
     snap_paths, def_paths, res_paths = _paths_for_dates(curated_root, sport, dates)
 
@@ -176,8 +174,9 @@ def build_features_streaming(
             .drop("_buck")
         )
 
-    # NOTE: intentionally no preoff filter here to preserve all rows
-    # Caller can filter using tto_minutes if desired.
+    # Pre-off filter: keep rows with 0 <= tto_minutes <= preoff_minutes
+    # If tto_minutes is null (missing marketStartMs), we leave the row out here to match classic behavior.
+    left = left.filter((pl.col("tto_minutes") >= 0) & (pl.col("tto_minutes") <= preoff_minutes))
 
     # Join results for label
     left = left.join(lf_res, on=["marketId", "selectionId"], how="left")
