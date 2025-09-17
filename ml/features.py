@@ -173,7 +173,10 @@ def build_features_streaming(
         )
 
     # Filter to pre-off window (keep rows with 0 <= tto_minutes <= preoff_minutes)
-    left = left.filter((pl.col("tto_minutes") >= 0) & (pl.col("tto_minutes") <= preoff_minutes))
+    left = left.filter(
+        pl.col("tto_minutes").is_null() |
+        ((pl.col("tto_minutes") >= 0) & (pl.col("tto_minutes") <= preoff_minutes))
+    )
 
     # Join results for label
     left = left.join(lf_res, on=["marketId", "selectionId"], how="left")

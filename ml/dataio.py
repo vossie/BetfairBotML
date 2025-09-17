@@ -255,7 +255,7 @@ __all__ = [
 
 if __name__ == "__main__":
     # Usage:
-    #   python -m ml.dataio s3://betfair-curated horse-racing orderbook_snapshots_5s
+    #   python -m ml.dataio s3://betfair-curated horse_racing orderbook_snapshots_5s
     import sys, json
     if len(sys.argv) != 4:
         print("Usage: python -m ml.dataio <curated_root> <sport> <dataset>")

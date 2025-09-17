@@ -171,7 +171,7 @@ def main():
         description="Rolling evaluation: train on last N days, validate on next day (GPU XGBoost)."
     )
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
-    ap.add_argument("--sport", required=True, help="e.g. horse-racing")
+    ap.add_argument("--sport", required=True, help="e.g. horse_racing")
     ap.add_argument("--start", required=True, help="YYYY-MM-DD (first validation day)")
     ap.add_argument("--end", required=True, help="YYYY-MM-DD (last validation day)")
     ap.add_argument("--window-days", type=int, default=7, help="training window length (days)")

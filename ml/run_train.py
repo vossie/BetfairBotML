@@ -25,7 +25,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
     ap = argparse.ArgumentParser()
     ap.add_argument("--curated", required=True, help="s3://bucket[/prefix] or /local/path")
-    ap.add_argument("--sport", required=True, help="e.g. horse-racing")
+    ap.add_argument("--sport", required=True, help="e.g. horse_racing")
     ap.add_argument("--date", default=datetime.now(UTC).strftime("%Y-%m-%d"))
     ap.add_argument("--days", type=int, default=1, help="how many days back inclusive")
 
