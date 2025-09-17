@@ -10,7 +10,7 @@ import numpy as np
 import polars as pl
 import xgboost as xgb
 
-from . import features  # uses the same loader the working trainer uses
+from . import features  # use the same feature builder as the working trainer
 
 OUTPUT_DIR = (Path(__file__).resolve().parent.parent / "output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,7 +51,7 @@ def _select_feature_cols(df: pl.DataFrame, label_col: str) -> List[str]:
             if dtype.is_numeric():
                 cols.append(name)
         except Exception:
-            # Be permissive on old Polars
+            # Be permissive on very old Polars
             pass
     if not cols:
         raise RuntimeError("No numeric feature columns found to train on.")
@@ -100,12 +100,19 @@ def _binwise_report(df: pl.DataFrame, y: np.ndarray, p: np.ndarray, edges: List[
     if "tto_minutes" not in df.columns:
         return
     labels = [f"{edges[i]:02d}-{edges[i+1]:02d}" for i in range(len(edges) - 1)]
+
+    # Proper when/then chain (fixes earlier bug)
     expr = None
     for i, lab in enumerate(labels):
         lo, hi = edges[i], edges[i+1]
         cond = (pl.col("tto_minutes") > lo) & (pl.col("tto_minutes") <= hi)
-        expr = cond.then(pl.lit(lab)) if expr is None else expr.when(cond).then(pl.lit(lab))
-    tmp = df.with_columns((expr.otherwise(pl.lit(None))).alias("tto_bin"))
+        if expr is None:
+            expr = pl.when(cond).then(pl.lit(lab))
+        else:
+            expr = expr.when(cond).then(pl.lit(lab))
+    expr = expr.otherwise(pl.lit(None))
+
+    tmp = df.with_columns(expr.alias("tto_bin"))
     print("\n[Validation by TTO bins]")
     for lab in labels:
         mask = (tmp.get_column("tto_bin") == lab).to_numpy()
@@ -150,13 +157,17 @@ def _build_features_chunked(
 
 def _add_country_feature(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Adds a numeric 'country_feat' column derived from 'country' OR 'eventCountryCode'.
+    Adds a numeric 'country_feat' derived from 'country' OR 'eventCountryCode'.
     No filtering by country; purely a feature so the model can learn per-country effects.
     """
     if "country" in df.columns:
-        df = df.with_columns(pl.col("country").fill_null("UNK").cast(pl.Categorical).to_physical().alias("country_feat"))
+        df = df.with_columns(
+            pl.col("country").fill_null("UNK").cast(pl.Categorical).to_physical().alias("country_feat")
+        )
     elif "eventCountryCode" in df.columns:
-        df = df.with_columns(pl.col("eventCountryCode").fill_null("UNK").cast(pl.Categorical).to_physical().alias("country_feat"))
+        df = df.with_columns(
+            pl.col("eventCountryCode").fill_null("UNK").cast(pl.Categorical).to_physical().alias("country_feat")
+        )
     else:
         print("WARN: no country column found; continuing without 'country_feat'.")
     return df
@@ -221,7 +232,7 @@ def _train_xgb(
 def _save_model_json(booster: xgb.Booster, features_used: List[str], filename: str) -> Path:
     out = OUTPUT_DIR / filename
     booster.save_model(str(out))
-    # Also persist feature order (neighbor file)
+    # Persist feature order (neighbor file)
     (OUTPUT_DIR / (Path(filename).stem + ".features.txt")).write_text("\n".join(features_used))
     print(f"Saved model: {out}")
     return out
