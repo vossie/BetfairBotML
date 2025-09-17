@@ -11,8 +11,10 @@ import polars as pl
 import xgboost as xgb
 
 from . import features
-from .sim import _edge_columns, _kelly_stake_units, _build_bets_table, _pick_topn_per_market, _cap_stakes, _pnl_columns, _binwise_pnl  # reuse helpers
-
+from .sim import (
+    _edge_columns, _kelly_stake_units, _build_bets_table,
+    _pick_topn_per_market, _cap_stakes, _pnl_columns
+)
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,10 +33,13 @@ def _daterange(end_date_str: str, days: int) -> List[str]:
 
 
 def _select_feature_cols(df: pl.DataFrame, label_col: str) -> List[str]:
-    exclude = {"sport","marketId","selectionId","ts","ts_ms","publishTimeMs",label_col,"runnerStatus","p_hat","countryCode"}
+    exclude = {
+        "sport","marketId","selectionId","ts","ts_ms","publishTimeMs",
+        label_col,"runnerStatus","p_hat","countryCode"
+    }
     cols: List[str] = []
     for name, dtype in df.schema.items():
-        if name in exclude: 
+        if name in exclude:
             continue
         lname = name.lower()
         if "label" in lname or "target" in lname:
@@ -60,33 +65,13 @@ def _load_booster(path: str) -> xgb.Booster:
     bst.load_model(str(p))
     return bst
 
-def _load_meta(p):
-    text = Path(p).read_text().strip()
-    try:
-        return json.loads(text)   # valid JSON path
-    except json.JSONDecodeError:
-        # fallback: assume it's just a newline-separated list
-        return {"features": text.splitlines()}
-
-def add_country_onehots(df: pl.DataFrame, vocab: List[str], other_token="__OTHER__") -> pl.DataFrame:
-    if not vocab or "countryCode" not in df.columns:
-        return df
-    df2 = df.with_columns(
-        pl.when(pl.col("countryCode").is_in(vocab)).then(pl.col("countryCode")).otherwise(other_token).alias("_cc")
-    )
-    for c in vocab + [other_token]:
-        df2 = df2.with_columns(pl.when(pl.col("_cc") == c).then(1).otherwise(0).cast(pl.Int8).alias(f"cc__{c}"))
-    return df2.drop("_cc")
-
 
 def main():
     ap = argparse.ArgumentParser(description="Simulate wagering with country-aware model and report by country.")
-    ap.add_argument("--model", required=True, help="Trained model with country one-hots.")
-    ap.add_argument("--meta", required=True, help="JSON meta with country_vocab.")
+    ap.add_argument("--model", required=True)
     ap.add_argument("--curated", required=True)
     ap.add_argument("--sport", required=True)
-
-    ap.add_argument("--date", required=True, help="End date (YYYY-MM-DD).")
+    ap.add_argument("--date", required=True)
     ap.add_argument("--days-before", type=int, default=0)
 
     ap.add_argument("--preoff-mins", type=int, default=30)
@@ -103,23 +88,19 @@ def main():
     ap.add_argument("--stake-cap-market", type=float, default=10.0)
     ap.add_argument("--stake-cap-day", type=float, default=100.0)
 
-    ap.add_argument("--country-filter", default=None, help="If set, only include this countryCode.")
+    ap.add_argument("--country-filter", default=None)
     ap.add_argument("--pnl-by-country-out", default="pnl_by_country.csv")
     ap.add_argument("--bets-out", default="bets_country.csv")
 
     args = ap.parse_args()
 
-    # Load booster & metadata
     bst = _load_booster(args.model)
-    meta = _load_meta(args.meta)
-    vocab = meta.get("country_vocab", [])
-    other_tok = meta.get("other_token", "__OTHER__")
 
     # Dates
     days_total = int(args.days_before) + 1
     dates = _daterange(args.date, days_total)
 
-    # Build features (chunked)
+    # Build features
     parts = []
     for i in range(0, len(dates), args.chunk_days):
         dchunk = dates[i:i+args.chunk_days]
@@ -137,30 +118,36 @@ def main():
     if args.country_filter:
         df = df.filter(pl.col("countryCode") == args.country_filter)
 
-    # Encode countries
-    df_enc = add_country_onehots(df, vocab, other_token=other_tok)
-
-    # Score
-    fcols = _select_feature_cols(df_enc, args.label_col)
-    X = _to_numpy(df_enc, fcols)
+    # Score with booster
+    fcols = _select_feature_cols(df, args.label_col)
+    X = _to_numpy(df, fcols)
     p = bst.predict(xgb.DMatrix(X))
-    df_scored = df_enc.with_columns(pl.lit(p).alias("p_hat"))
+    df_scored = df.with_columns(pl.lit(p).alias("p_hat"))
 
     # Build bets + pnl
-    bets = _build_bets_table(df_scored, label_col=args.label_col, min_edge=args.min_edge, kelly_frac=args.kelly, side_mode=args.side)
+    bets = _build_bets_table(
+        df_scored,
+        label_col=args.label_col,
+        min_edge=args.min_edge,
+        kelly_frac=args.kelly,
+        side_mode=args.side,
+    )
     bets = _pick_topn_per_market(bets, args.top_n_per_market)
     bets = _cap_stakes(bets, cap_market=args.stake_cap_market, cap_day=args.stake_cap_day)
     bets = _pnl_columns(bets, commission=args.commission)
 
-    # Save all bets
     bets_out = _outpath(args.bets_out)
     bets.write_csv(bets_out)
 
-    # PnL by country
+    # PnL by countryCode
     if "countryCode" in bets.columns:
         pnl_by_country = (
             bets.group_by("countryCode")
-                .agg([pl.len().alias("n_bets"), pl.sum("stake").alias("stake"), pl.sum("pnl").alias("pnl")])
+                .agg([
+                    pl.len().alias("n_bets"),
+                    pl.sum("stake").alias("stake"),
+                    pl.sum("pnl").alias("pnl")
+                ])
                 .with_columns((pl.col("pnl") / pl.col("stake")).alias("roi"))
                 .sort("roi", descending=True)
         )
