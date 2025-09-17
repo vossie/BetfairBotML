@@ -6,7 +6,7 @@ from pathlib import Path
 import polars as pl
 import numpy as np
 import xgboost as xgb
-import json
+from datetime import datetime, timedelta
 
 from . import features
 
@@ -59,6 +59,15 @@ def _build_features(
     return pl.concat(parts, how="vertical", rechunk=True)
 
 
+def _add_country_feature(df: pl.DataFrame) -> pl.DataFrame:
+    if "countryCode" in df.columns:
+        return df.with_columns(
+            pl.col("countryCode").fill_null("UNK").cast(pl.Categorical).to_physical().alias("country_feat")
+        )
+    print("WARN: no countryCode column; continuing without country_feat")
+    return df
+
+
 def main():
     ap = argparse.ArgumentParser("Simulate bets with trained XGB (country-aware).")
     ap.add_argument("--model", required=True, help="Path to model JSON")
@@ -88,7 +97,6 @@ def main():
     feats = _load_features(Path(args.model).with_suffix(".features.txt"))
 
     # Build feature set
-    from datetime import datetime, timedelta
     end = datetime.strptime(args.date, "%Y-%m-%d").date()
     dates = [(end - timedelta(days=i)).strftime("%Y-%m-%d") for i in reversed(range(args.days_before + 1))]
 
@@ -102,7 +110,10 @@ def main():
         chunk_days=args.chunk_days,
     )
 
-    # Only keep rows with labels
+    # Add derived country_feat so features align
+    df = _add_country_feature(df)
+
+    # Only keep rows with labels if present
     if args.label_col in df.columns:
         df = df.filter(pl.col(args.label_col).is_not_null())
 
@@ -111,12 +122,10 @@ def main():
 
     # Convert to numpy with correct feature order
     X = _to_numpy(df, feats)
-    dX = xgb.DMatrix(X, feature_names=feats)  # ✅ FIX: add feature_names
+    dX = xgb.DMatrix(X, feature_names=feats)
 
     # Predict
     p = bst.predict(dX)
-
-    # Stub output — integrate your PnL / bet-writing logic here
     print(f"Simulated {len(p)} predictions, example={p[:5]}")
 
 
