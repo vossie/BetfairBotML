@@ -3,22 +3,21 @@ set -euo pipefail
 
 # Usage:
 #   bin/run-simulator-country.sh 2025-09-15
-#   bin/run-simulator-country.sh 2025-09-15 --model ./output/xgb_country.json --meta ./output/xgb_country_meta.json
+#   bin/run-simulator-country.sh 2025-09-15 --model ./output/xgb_model_country.json
 #   bin/run-simulator-country.sh 2025-09-15 --days-before 7 --country GB
 #
 # Notes:
 # - Runs the country-aware simulator (ml.sim_country) to produce overall and per-country PnL.
-# - By default it looks for ./output/xgb_country.json and ./output/xgb_country_meta.json.
+# - By default it looks for ./output/xgb_model_country.json.
 
 DATE_ARG="${1:-}"
 if [[ -z "$DATE_ARG" ]]; then
-  echo "Usage: $0 YYYY-MM-DD [--model PATH] [--meta PATH] [--days-before N] [--country CC]"
+  echo "Usage: $0 YYYY-MM-DD [--model PATH] [--days-before N] [--country CC]"
   exit 1
 fi
 shift || true
 
 MODEL_PATH="./output/xgb_model_country.json"
-META_PATH="./output/xgb_model_country.features.txt"
 DAYS_BEFORE="7"
 COUNTRY_FILTER=""
 
@@ -28,10 +27,6 @@ while [[ $# -gt 0 ]]; do
     --model)
       shift || true
       MODEL_PATH="${1:-$MODEL_PATH}"
-      ;;
-    --meta)
-      shift || true
-      META_PATH="${1:-$META_PATH}"
       ;;
     --days-before)
       shift || true
@@ -61,7 +56,6 @@ cd /opt/BetfairBotML
 
 BASE_ARGS=(
   --model "$MODEL_PATH"
-  --meta "$META_PATH"
   --curated /mnt/nvme/betfair-curated
   --sport horse-racing
   --date "$DATE_ARG"
