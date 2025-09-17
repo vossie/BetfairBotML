@@ -222,6 +222,7 @@ def build_features_streaming(
         "mom_60s",
         "vol_10s",
         "vol_60s",
+        "countryCode",
         "winLabel",
     ]
     # Avoid resolving schema repeatedly
