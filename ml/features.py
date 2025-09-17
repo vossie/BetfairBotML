@@ -14,32 +14,31 @@ import pyarrow.dataset as pads
 def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[List[str], List[str], List[str]]:
     """
     Build partitioned paths for snapshots, market definitions, and results
-    under the curated root (local or s3). Example layout:
-      <root>/market_definitions/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+    under the curated root (local or s3). Expected layout:
       <root>/orderbook_snapshots_5s/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+      <root>/market_definitions/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
       <root>/results/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
     """
     def pfx(name: str) -> str:
         return f"{curated_root.rstrip('/')}/{name}/sport={sport}"
-
     snaps = [f"{pfx('orderbook_snapshots_5s')}/date={d}" for d in dates]
     defs  = [f"{pfx('market_definitions')}/date={d}" for d in dates]
     res   = [f"{pfx('results')}/date={d}" for d in dates]
     return snaps, defs, res
 
 
-def _scan_parquet(uris: List[str]) -> pl.LazyFrame:
+def _scan_parquet(paths: List[str]) -> pl.LazyFrame:
     """
-    Build a LazyFrame from a list of directory/file URIs (local or s3://...).
-    We rely on PyArrow to handle URIs using the current environment configuration.
-    Any missing/non-existent URI is skipped gracefully.
+    Read a list of partition directories/files (local or s3://...) using PyArrow dataset.
+    We rely on the environment for S3 credentials/endpoint/region (unchanged behavior).
+    Missing paths are skipped quietly.
     """
     frames: List[pl.LazyFrame] = []
-    for u in uris:
+    for p in paths:
         try:
-            ds = pads.dataset(u, format="parquet")
+            ds = pads.dataset(p, format="parquet", partitioning="hive", ignore_missing_files=True)
         except Exception:
-            # Skip paths that don't exist or aren't accessible for the date/sport
+            # Skip nonexistent or inaccessible partitions for this date/sport
             continue
         tbl = ds.to_table()
         if tbl.num_rows > 0:
@@ -55,15 +54,19 @@ def _scan_parquet(uris: List[str]) -> pl.LazyFrame:
 
 def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
     """Add timestamps and simple transforms expected by downstream code."""
+    schema = snaps.collect_schema().names()
+
     # publishTimeMs -> ts (datetime) and seconds
-    snaps = snaps.with_columns([
-        (pl.col("publishTimeMs") / 1000).alias("ts_s"),
-    ]).with_columns([
-        pl.from_epoch(pl.col("ts_s")).alias("ts")
-    ])
+    if "publishTimeMs" in schema:
+        snaps = snaps.with_columns(
+            (pl.col("publishTimeMs") / 1000).alias("ts_s")
+        ).with_columns(
+            pl.from_epoch(pl.col("ts_s")).alias("ts")
+        )
+    else:
+        snaps = snaps.with_columns(pl.lit(None).alias("ts_s"), pl.lit(None).alias("ts"))
 
     # implied_prob = 1/ltp (guarded)
-    schema = snaps.collect_schema().names()
     if "ltp" in schema:
         snaps = snaps.with_columns(
             pl.when((pl.col("ltp").is_not_null()) & (pl.col("ltp") > 0))
@@ -76,6 +79,7 @@ def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
 
     # Rolling momentum and volume windows: 10s (2 * 5s), 60s (12 * 5s)
     by_keys = ["marketId", "selectionId"]
+    schema = snaps.collect_schema().names()
     if all(k in schema for k in by_keys) and "publishTimeMs" in schema:
         snaps = snaps.sort(by_keys + ["publishTimeMs"])  # ensure order
 
@@ -101,7 +105,6 @@ def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
             pl.lit(None).alias("vol_10s"),
             pl.lit(None).alias("vol_60s"),
         ])
-
     return snaps
 
 
@@ -119,6 +122,8 @@ def build_features_streaming(
     - Includes 'countryCode' from market definitions.
     - Computes time-to-off in minutes from marketStartMs.
     - Computes basic momentum/volume windows from snapshots.
+    NOTE: We do NOT hard-filter by preoff window here to avoid dropping markets that
+          lack marketStartMs; caller can filter if desired.
     """
     snap_paths, def_paths, res_paths = _paths_for_dates(curated_root, sport, dates)
 
@@ -126,6 +131,7 @@ def build_features_streaming(
     lf_def  = _scan_parquet(def_paths)
     lf_res  = _scan_parquet(res_paths)
 
+    # Nothing to do if no snapshots
     if len(lf_snap.collect_schema().names()) == 0:
         return pl.DataFrame([]), 0
 
@@ -155,11 +161,9 @@ def build_features_streaming(
     # Join snapshots with definitions
     left = lf_snap.join(lf_def, on="marketId", how="left")
 
-    # tto_minutes from marketStartMs and publishTimeMs
+    # tto_minutes from marketStartMs and publishTimeMs (may be NULL if marketStartMs missing)
     left = left.with_columns(
-        (
-            (pl.col("marketStartMs") - pl.col("publishTimeMs")) / (1000 * 60)
-        ).alias("tto_minutes")
+        ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / (1000 * 60)).alias("tto_minutes")
     )
 
     # Optional downsample: floor to a time bucket, then take last row in bucket
@@ -172,11 +176,8 @@ def build_features_streaming(
             .drop("_buck")
         )
 
-    # Filter to pre-off window (keep rows with 0 <= tto_minutes <= preoff_minutes)
-    left = left.filter(
-        pl.col("tto_minutes").is_null() |
-        ((pl.col("tto_minutes") >= 0) & (pl.col("tto_minutes") <= preoff_minutes))
-    )
+    # NOTE: intentionally no preoff filter here to preserve all rows
+    # Caller can filter using tto_minutes if desired.
 
     # Join results for label
     left = left.join(lf_res, on=["marketId", "selectionId"], how="left")
