@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 import numpy as np
 import polars as pl
@@ -94,10 +94,7 @@ def _to_numpy(df: pl.DataFrame, cols: List[str]) -> np.ndarray:
 # Kelly staking + caps
 # ----------------------------
 def _kelly_fraction(prob: pl.Expr, price: pl.Expr) -> pl.Expr:
-    """
-    f* = ((b * p) - (1 - p)) / b with b = price - 1
-    If b <= 0 or edge <= 0 -> 0
-    """
+    # f* = ((b * p) - (1 - p)) / b, b = price - 1
     b = price - 1.0
     edge = (b * prob) - (1.0 - prob)
     return pl.when((b > 0) & (edge > 0)).then(edge / b).otherwise(0.0)
@@ -110,16 +107,9 @@ def _apply_caps_renorm(
     day_cap: float,
     market_key: str = "marketId",
 ) -> pl.DataFrame:
-    """
-    Proportionally scale stakes down to obey per-market and per-day caps, in that order.
-    """
     s = stake_col
-
-    # Per-market cap: scale stakes within each market to sum <= market_cap
-    by_mkt = (
-        df.group_by(market_key, maintain_order=True)
-        .agg(pl.sum(s).alias("_sum_mkt"))
-    )
+    # per-market cap
+    by_mkt = df.group_by(market_key, maintain_order=True).agg(pl.sum(s).alias("_sum_mkt"))
     df = df.join(by_mkt, on=market_key, how="left").with_columns(
         pl.when(pl.col("_sum_mkt") > market_cap)
         .then(pl.col(s) * (market_cap / pl.col("_sum_mkt")))
@@ -127,12 +117,11 @@ def _apply_caps_renorm(
         .alias(s)
     ).drop("_sum_mkt")
 
-    # Per-day (global) cap: scale all stakes to sum <= day_cap
+    # per-day cap
     sum_day = float(df.select(pl.sum(s).alias("_sum_day"))["_sum_day"][0] or 0.0)
-    if sum_day > day_cap > 0:
+    if day_cap > 0 and sum_day > day_cap:
         scale = day_cap / sum_day
         df = df.with_columns((pl.col(s) * scale).alias(s))
-
     return df
 
 
@@ -140,7 +129,7 @@ def _apply_caps_renorm(
 # Main
 # ----------------------------
 def main():
-    ap = argparse.ArgumentParser("Country-aware simulator with Kelly staking.")
+    ap = argparse.ArgumentParser("Country-aware simulator with Kelly staking (Polars 1.x safe).")
     ap.add_argument("--model", required=True)
     ap.add_argument("--curated", required=True)
     ap.add_argument("--sport", required=True)
@@ -156,8 +145,7 @@ def main():
     ap.add_argument("--min-edge", type=float, default=0.02)
     ap.add_argument("--kelly", type=float, default=0.25)
 
-    # Bankroll and caps
-    ap.add_argument("--bankroll-day", type=float, default=500.0, help="Daily bankroll used for Kelly sizing")
+    ap.add_argument("--bankroll-day", type=float, default=500.0)
     ap.add_argument("--stake-cap-market", type=float, default=50.0)
     ap.add_argument("--stake-cap-day", type=float, default=500.0)
 
@@ -198,13 +186,12 @@ def main():
     p = bst.predict(dX)
     df = df.with_columns(pl.lit(p).alias("p_hat"))
 
-    # Edge (using current LTP odds as price)
-    # edge = p * price - (1 - p); keep only >= min_edge
+    # Edge (using current LTP odds as price), and filter by min-edge
     df = df.with_columns(
         ((pl.col("p_hat") * pl.col("ltp")) - (1.0 - pl.col("p_hat"))).alias("edge")
     ).filter(pl.col("edge") >= args.min_edge)
 
-    # Side selection (auto): if p_hat > implied_prob -> BACK else no bet (for simplicity here)
+    # Side (auto): back if p_hat > implied_prob, else skip
     if "implied_prob" in df.columns:
         df = df.with_columns(
             pl.when(pl.col("p_hat") > pl.col("implied_prob")).then(pl.lit("back")).otherwise(pl.lit("skip")).alias("side")
@@ -212,41 +199,43 @@ def main():
     else:
         df = df.with_columns(pl.lit("back").alias("side"))
 
-    # Kelly stake (pre-caps), per-row: stake = bankroll_day * kelly * f*
+    # Kelly stake before caps
     df = df.with_columns(
-        (args.bankroll_day * args.kelly * _kelly_fraction(pl.col("p_hat"), pl.col("ltp"))).alias("stake")
+        (args.bankroll_day * args.kelly * _kelly_fraction(pl.col("p_hat"), pl.col("ltp"))).alias("stake_raw")
     )
 
-    # Pick top-N per market before caps to avoid stake fan-out
+    # Keep top-N per market by edge (Polars 1.x safe sort)
     df = (
-        df.sort(["marketId", pl.col("edge").desc()])
+        df.sort(["marketId", "edge"], descending=[False, True])
           .with_columns(pl.cum_count().over("marketId").alias("_rn"))
-          .filter(pl.col("_rn") <= args.top_n_per_market)
+          .filter(pl.col("_rn") < args.top_n_per_market)  # 0-based rank -> keep 0..top_n-1
           .drop("_rn")
     )
 
-    # Apply market/day caps with proportional re-normalization
+    # Start from stake_raw
+    df = df.with_columns(pl.col("stake_raw").alias("stake")).drop("stake_raw")
+
+    # Caps + renormalization
     df = _apply_caps_renorm(df, stake_col="stake", market_cap=args.stake_cap_market, day_cap=args.stake_cap_day)
 
     # Enforce Betfair £1 minimum on non-zero stakes
     df = df.with_columns(
-        pl.when(pl.col("stake") > 0.0).then(pl.col("stake").clip(lower_bound=1.0)).otherwise(0.0).alias("stake")
+        pl.when(pl.col("stake") > 0.0).then(pl.max_horizontal(pl.col("stake"), pl.lit(1.0))).otherwise(0.0).alias("stake")
     )
 
-    # Compute PnL with commission (winners only)
-    # pnl = (ltp-1)*stake  (win) * (1-commission); else -stake
-    df = df.with_columns(
-        ((pl.col("ltp") - 1.0) * pl.col("stake") * (1.0 - args.commission)).alias("_win_payout"),
-    )
+    # Realized PnL if label exists, else expected PnL
+    win_payout = ((pl.col("ltp") - 1.0) * pl.col("stake") * (1.0 - args.commission)).alias("_win_payout")
+    df = df.with_columns(win_payout)
     if args.label_col in df.columns:
         df = df.with_columns(
             pl.when(pl.col(args.label_col) == 1).then(pl.col("_win_payout")).otherwise(-pl.col("stake")).alias("pnl")
         )
     else:
-        # If no label, compute expected pnl for reporting
         df = df.with_columns(
-            (pl.col("p_hat") * (pl.col("ltp") - 1.0) * pl.col("stake") * (1.0 - args.commission) - (1.0 - pl.col("p_hat")) * pl.col("stake")).alias("pnl")
+            (pl.col("p_hat") * (pl.col("ltp") - 1.0) * pl.col("stake") * (1.0 - args.commission)
+             - (1.0 - pl.col("p_hat")) * pl.col("stake")).alias("pnl")
         )
+    df = df.drop("_win_payout")
 
     # Persist outputs
     bets_cols = [c for c in ("marketId","selectionId","countryCode","tto_minutes","ltp","p_hat","edge","side","stake","pnl") if c in df.columns]
@@ -256,13 +245,13 @@ def main():
     if "countryCode" in df.columns:
         pnl_by_country = (
             df.group_by("countryCode")
-            .agg([
-                pl.len().alias("n_bets"),
-                pl.sum("stake").alias("stake"),
-                pl.sum("pnl").alias("pnl"),
-            ])
-            .with_columns((pl.col("pnl") / pl.col("stake")).alias("roi"))
-            .sort("roi", descending=True)
+              .agg([
+                  pl.len().alias("n_bets"),
+                  pl.sum("stake").alias("stake"),
+                  pl.sum("pnl").alias("pnl"),
+              ])
+              .with_columns((pl.col("pnl") / pl.col("stake")).alias("roi"))
+              .sort("roi", descending=True)
         )
     else:
         pnl_by_country = pl.DataFrame({"countryCode": [], "n_bets": [], "stake": [], "pnl": [], "roi": []})
