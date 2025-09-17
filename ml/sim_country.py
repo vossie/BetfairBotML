@@ -60,15 +60,13 @@ def _load_booster(path: str) -> xgb.Booster:
     bst.load_model(str(p))
     return bst
 
-
-def _load_meta(path: str) -> dict:
-    p = Path(path)
-    if not p.exists() and not p.is_absolute():
-        alt = OUTPUT_DIR / p.name
-        if alt.exists():
-            p = alt
-    return json.loads(Path(p).read_text())
-
+def _load_meta(p):
+    text = Path(p).read_text().strip()
+    try:
+        return json.loads(text)   # valid JSON path
+    except json.JSONDecodeError:
+        # fallback: assume it's just a newline-separated list
+        return {"features": text.splitlines()}
 
 def add_country_onehots(df: pl.DataFrame, vocab: List[str], other_token="__OTHER__") -> pl.DataFrame:
     if not vocab or "countryCode" not in df.columns:
