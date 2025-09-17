@@ -8,48 +8,133 @@ import pyarrow.dataset as pads
 import pyarrow.fs as pafs
 
 
+# -------------------------
+# Path helpers
+# -------------------------
+
 def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Build partitioned paths for snapshots, market definitions, and results
+    under the curated root (local or s3). Example layout (from user's data):
+      betfair-curated/market_definitions/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+      betfair-curated/orderbook_snapshots_5s/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+      betfair-curated/results/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+    """
     def pfx(name: str) -> str:
         return f"{curated_root.rstrip('/')}/{name}/sport={sport}"
 
     snaps = [f"{pfx('orderbook_snapshots_5s')}/date={d}" for d in dates]
     defs = [f"{pfx('market_definitions')}/date={d}" for d in dates]
-    res = [f"{pfx('results')}/date={d}" for d in dates]
+    res  = [f"{pfx('results')}/date={d}" for d in dates]
     return snaps, defs, res
 
 
-def _scan_parquet(paths: List[str]) -> pl.LazyFrame:
+def _fs_and_path(uri: str):
+    """Return (filesystem, path_without_scheme) for a given local/S3/other URI."""
+    fs, path = pafs.FileSystem.from_uri(uri)
+    return fs, path
+
+
+def _expand_uri(uri: str) -> List[str]:
+    """Expand a file or directory URI into file paths compatible with its filesystem."""
+    fs, path = _fs_and_path(uri)
+    info = fs.get_file_info([path])[0]
+    if info.type == pafs.FileType.Directory:
+        selector = pafs.FileSelector(path, recursive=True)
+        return [fi.path for fi in fs.get_file_info(selector) if fi.is_file]
+    elif info.is_file:
+        return [path]
+    else:
+        return []
+
+
+def _scan_parquet(uris: List[str]) -> pl.LazyFrame:
     """
-    Expand directory-like inputs to concrete parquet file paths and build a single dataset.
-    Works for Local FS and S3/MinIO.
+    Build a LazyFrame from a list of URIs (local or s3://...). All URIs must belong
+    to the same filesystem (e.g., same S3 endpoint). Returns an empty LazyFrame if none.
     """
-    if not paths:
+    if not uris:
         return pl.DataFrame([]).lazy()
 
-    fs, _ = pafs.FileSystem.from_uri(paths[0])
-
-    def _expand(dir_or_file: str) -> List[str]:
-        info = fs.get_file_info([dir_or_file])[0]
-        if info.type == pafs.FileType.File:
-            return [dir_or_file] if dir_or_file.endswith(".parquet") else []
-        elif info.type in (pafs.FileType.Directory, pafs.FileType.NotFound):
-            # NotFound can still be a selector root on object stores
-            selector = pafs.FileSelector(dir_or_file, recursive=True)
-            infos = fs.get_file_info(selector)
-            return [i.path for i in infos if i.type == pafs.FileType.File and i.path.endswith(".parquet")]
-        else:
-            return []
-
+    base_fs, _ = _fs_and_path(uris[0])
     all_files: List[str] = []
-    for p in paths:
-        all_files.extend(_expand(p))
+    for u in uris:
+        fs_u, _ = _fs_and_path(u)
+        if type(fs_u) != type(base_fs):
+            raise ValueError(f"Mixed filesystems not supported: {type(base_fs)} vs {type(fs_u)} for {u}")
+        all_files.extend(_expand_uri(u))
 
     if not all_files:
         return pl.DataFrame([]).lazy()
 
-    ds = pads.dataset(all_files, format="parquet", filesystem=fs)
+    ds = pads.dataset(all_files, format="parquet", filesystem=base_fs)
     tbl = ds.to_table()
     return pl.from_arrow(tbl).lazy()
+
+
+# -------------------------
+# Feature building
+# -------------------------
+
+def _safe_col(df: pl.LazyFrame, name: str) -> pl.Expr:
+    """Return a column if present; else a null placeholder."""
+    if name in df.collect_schema().names():
+        return pl.col(name)
+    return pl.lit(None).alias(name)
+
+
+def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
+    """Add timestamps and simple transforms expected by downstream code."""
+    # publishTimeMs -> ts (datetime) and seconds
+    snaps = snaps.with_columns([
+        (pl.col("publishTimeMs") / 1000).alias("ts_s"),
+    ]).with_columns([
+        pl.from_epoch("ts_s").alias("ts")
+    ])
+
+    # implied_prob = 1/ltp (guarded)
+    if "ltp" in snaps.collect_schema().names():
+        snaps = snaps.with_columns(
+            pl.when((pl.col("ltp").is_not_null()) & (pl.col("ltp") > 0))
+              .then(1.0 / pl.col("ltp"))
+              .otherwise(None)
+              .alias("implied_prob")
+        )
+    else:
+        snaps = snaps.with_columns(pl.lit(None).alias("implied_prob"))
+
+    # Rolling momentum and volume windows: 10s (2 * 5s), 60s (12 * 5s)
+    # These are simplistic diffs over fixed lag counts.
+    by_keys = ["marketId", "selectionId"]
+    schema = snaps.collect_schema().names()
+
+    if all(k in schema for k in by_keys) and "publishTimeMs" in schema:
+        snaps = snaps.sort(by_keys + ["publishTimeMs"])  # ensure order
+
+        if "ltp" in schema:
+            snaps = snaps.with_columns([
+                (pl.col("ltp") - pl.col("ltp").shift(2)).over(by_keys).alias("mom_10s"),
+                (pl.col("ltp") - pl.col("ltp").shift(12)).over(by_keys).alias("mom_60s"),
+            ])
+        else:
+            snaps = snaps.with_columns([pl.lit(None).alias("mom_10s"), pl.lit(None).alias("mom_60s")])
+
+        if "tradedVolume" in schema:
+            snaps = snaps.with_columns([
+                (pl.col("tradedVolume") - pl.col("tradedVolume").shift(2)).over(by_keys).alias("vol_10s"),
+                (pl.col("tradedVolume") - pl.col("tradedVolume").shift(12)).over(by_keys).alias("vol_60s"),
+            ])
+        else:
+            snaps = snaps.with_columns([pl.lit(None).alias("vol_10s"), pl.lit(None).alias("vol_60s")])
+    else:
+        snaps = snaps.with_columns([
+            pl.lit(None).alias("mom_10s"),
+            pl.lit(None).alias("mom_60s"),
+            pl.lit(None).alias("vol_10s"),
+            pl.lit(None).alias("vol_60s"),
+        ])
+
+    return snaps
 
 
 def build_features_streaming(
@@ -57,155 +142,75 @@ def build_features_streaming(
     sport: str,
     dates: List[str],
     preoff_minutes: int = 30,
-    batch_markets: int = 100,     # kept for API compatibility
+    batch_markets: int = 100,     # kept for API compatibility; not used in this single-pass builder
     downsample_secs: Optional[int] = None,
 ) -> Tuple[pl.DataFrame, int]:
     """
-    Build feature frame from curated parquet (local or S3/MinIO) for given sport/dates.
-
-    Returns:
-        (features_df, total_raw_rows_scanned_approx)
+    Build features by scanning partitioned Parquet under curated_root for given dates.
+    Returns (features_df, total_raw_rows).
+    - Includes 'countryCode' from market definitions.
+    - Computes simple time-to-off in minutes from marketStartMs.
+    - Computes basic momentum/volume windows from snapshots.
     """
     snap_paths, def_paths, res_paths = _paths_for_dates(curated_root, sport, dates)
 
     lf_snap = _scan_parquet(snap_paths)
-    lf_def = _scan_parquet(def_paths)
-    lf_res = _scan_parquet(res_paths)
+    lf_def  = _scan_parquet(def_paths)
+    lf_res  = _scan_parquet(res_paths)
 
-    # Resolve schemas once to avoid repeated expensive lookups and warnings.
-    snap_names = set(lf_snap.collect_schema().names())
-    def_names = set(lf_def.collect_schema().names())
-    res_names = set(lf_res.collect_schema().names())
-
-    if not snap_names or not def_names or not res_names:
+    if lf_snap.collect_schema().is_empty():
         return pl.DataFrame([]), 0
 
-    # --- Normalize/select columns from snapshots ---
-    snap_keep_order = (
+    # Minimal subset from snapshots
+    keep_snap = [c for c in [
         "sport", "marketId", "selectionId", "publishTimeMs",
-        "backTicks", "backSizes", "layTicks", "laySizes",
-        "ltpTick", "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1"
-    )
-    keep_snap = [c for c in snap_keep_order if c in snap_names]
+        "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1",
+    ] if c in lf_snap.collect_schema().names()]
+    lf_snap = lf_snap.select(keep_snap)
+    lf_snap = _with_basic_transforms(lf_snap)
 
-    lf_snap = lf_snap.select(
-        *[
-            (pl.col("selectionId").cast(pl.Int64) if c == "selectionId"
-             else pl.col("publishTimeMs").cast(pl.Int64) if c == "publishTimeMs"
-             else pl.col("ltp").cast(pl.Float64) if c == "ltp"
-             else pl.col("ltpTick").cast(pl.Int32) if c == "ltpTick"
-             else pl.col("tradedVolume").cast(pl.Float64) if c == "tradedVolume"
-             else pl.col("spreadTicks").cast(pl.Int32) if c == "spreadTicks"
-             else pl.col("imbalanceBest1").cast(pl.Float64) if c == "imbalanceBest1"
-             else pl.col(c))
-            for c in keep_snap
-        ]
-    )
+    # Market definitions: need marketStartMs and countryCode (if present)
+    if not lf_def.collect_schema().is_empty():
+        keep_def = [c for c in ["marketId", "marketStartMs", "countryCode"] if c in lf_def.collect_schema().names()]
+        lf_def = lf_def.select(keep_def)
+    else:
+        lf_def = pl.DataFrame({"marketId": [], "marketStartMs": [], "countryCode": []}).lazy()
 
-    # --- Definitions ---
-    def_keep_order = ("sport", "marketId", "marketStartMs", "inPlay", "status", "marketType", "countryCode")
-    keep_def = [c for c in def_keep_order if c in def_names]
+    # Results: join for winLabel if available
+    if not lf_res.collect_schema().is_empty():
+        keep_res = [c for c in ["marketId", "selectionId", "winLabel"] if c in lf_res.collect_schema().names()]
+        lf_res = lf_res.select(keep_res)
+    else:
+        lf_res = pl.DataFrame({"marketId": [], "selectionId": [], "winLabel": []}).lazy()
 
-    lf_def = lf_def.select(
-        *[
-            (pl.col("marketStartMs").cast(pl.Int64) if c == "marketStartMs"
-             else pl.col("inPlay").cast(pl.Boolean) if c == "inPlay"
-             else pl.col(c))
-            for c in keep_def
-        ]
-    )
+    # Join snapshots with definitions
+    left = lf_snap.join(lf_def, on="marketId", how="left")
 
-    # --- Results ---
-    res_keep_order = ("sport", "marketId", "selectionId", "winLabel", "runnerStatus", "settledTimeMs")
-    keep_res = [c for c in res_keep_order if c in res_names]
-
-    lf_res = lf_res.select(
-        *[
-            (pl.col("selectionId").cast(pl.Int64) if c == "selectionId"
-             else pl.col("winLabel").cast(pl.Int32) if c == "winLabel"
-             else pl.col("settledTimeMs").cast(pl.Int64) if c == "settledTimeMs"
-             else pl.col(c))
-            for c in keep_res
-        ]
-    )
-
-    # Join definitions (static per market)
-    left = lf_snap.join(lf_def, on=["sport", "marketId"], how="left")
-
-    # Filter by pre-off window: keep snapshots where marketStartMs - publishTimeMs in (0, preoff_minutes]
-    left = left.filter(
-        (pl.col("marketStartMs").is_not_null())
-        & (pl.col("publishTimeMs").is_not_null())
-        & ((pl.col("marketStartMs") - pl.col("publishTimeMs")) > 0)
-        & ((pl.col("marketStartMs") - pl.col("publishTimeMs")) <= preoff_minutes * 60_000)
-    )
-
-    # Compute time-to-off in minutes (bounded) + timestamp
+    # tto_minutes from marketStartMs and publishTimeMs
     left = left.with_columns(
         (
-            ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60_000.0)
-            .clip(lower_bound=0.0, upper_bound=float(preoff_minutes))
-            .alias("tto_minutes")
-        ),
-        pl.from_epoch((pl.col("publishTimeMs") / 1000).cast(pl.Int64)).alias("ts"),
+            (pl.col("marketStartMs") - pl.col("publishTimeMs")) / (1000 * 60)
+        ).alias("tto_minutes")
     )
 
-    # Optional downsampling: one snapshot per bucket per (marketId, selectionId)
-    if downsample_secs and downsample_secs > 0:
-        left = left.with_columns((pl.col("publishTimeMs") // (downsample_secs * 1000)).alias("bucket"))
+    # Optional downsample: floor to a time bucket, then take last row in bucket
+    if downsample_secs:
+        # Compute bucket per market/selection
+        left = left.with_columns(((pl.col("publishTimeMs") // (downsample_secs * 1000)) * (downsample_secs * 1000)).alias("_buck"))
         left = (
-            left.sort(["marketId", "selectionId", "publishTimeMs"])
-            .group_by(["marketId", "selectionId", "bucket"])
-            .agg(pl.all().last())
-            .drop("bucket")
-            .lazy()
+            left
+            .group_by(["marketId", "selectionId", "_buck"])
+            .agg([pl.all().last()])
+            .drop("_buck")
         )
 
-    # Join results to bring the label
-    left = left.join(lf_res, on=["sport", "marketId", "selectionId"], how="left")
+    # Filter to pre-off window (keep rows with 0 <= tto_minutes <= preoff_minutes)
+    left = left.filter((pl.col("tto_minutes") >= 0) & (pl.col("tto_minutes") <= preoff_minutes))
 
-    # Implied prob from ltp
-    left = left.with_columns(
-        pl.when(pl.col("ltp").is_not_null() & (pl.col("ltp") > 0.0))
-        .then(1.0 / pl.col("ltp"))
-        .otherwise(None)
-        .alias("implied_prob")
-    )
+    # Join results for label
+    left = left.join(lf_res, on=["marketId", "selectionId"], how="left")
 
-    # --- Momentum / volatility using as-of self-joins (avoid duplicate 'ltp' collisions) ---
-    base = (
-        left.select(["marketId", "selectionId", "publishTimeMs", "ltp"])
-            .sort(["marketId", "selectionId", "publishTimeMs"])
-    )
-
-    def _lag_frame(delta_ms: int, suffix: str) -> pl.LazyFrame:
-        j = base.join_asof(
-            base.rename({"publishTimeMs": f"publishTimeMs_{suffix}", "ltp": f"ltp_{suffix}"}),
-            left_on="publishTimeMs",
-            right_on=f"publishTimeMs_{suffix}",
-            by=["marketId", "selectionId"],
-            strategy="backward",
-            tolerance=delta_ms,
-        ).select(["marketId", "selectionId", "publishTimeMs", f"ltp_{suffix}"])
-        return j.lazy()
-
-    j10 = _lag_frame(10_000, "10s")
-    j60 = _lag_frame(60_000, "60s")
-
-    left = (
-        left.join(j10, on=["marketId", "selectionId", "publishTimeMs"], how="left")
-            .join(j60, on=["marketId", "selectionId", "publishTimeMs"], how="left")
-            .with_columns(
-                (pl.col("ltp") - pl.col("ltp_10s")).alias("mom_10s"),
-                (pl.col("ltp") - pl.col("ltp_60s")).alias("mom_60s"),
-            )
-            .with_columns(
-                pl.col("mom_10s").abs().alias("vol_10s"),
-                pl.col("mom_60s").abs().alias("vol_60s"),
-            )
-    )
-
-    # Final selection
+    # Final feature selection
     wanted = [
         "sport",
         "marketId",
@@ -222,14 +227,13 @@ def build_features_streaming(
         "mom_60s",
         "vol_10s",
         "vol_60s",
+        "countryCode",
         "winLabel",
     ]
-    # Avoid resolving schema repeatedly
     final_names = set(left.collect_schema().names())
     have = [c for c in wanted if c in final_names]
 
     feat = left.select(have).collect()
-
-    total_raw = feat.height  # approximate scanned rows (post-filters)
+    total_raw = feat.height
 
     return feat, total_raw
