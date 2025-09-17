@@ -163,7 +163,7 @@ def main():
     ap.add_argument("--sport", required=True)
     ap.add_argument("--date", default=None)
     ap.add_argument("--days", type=int, default=1)
-    ap.add_argument("--preoff-mins", type=int, default=30)
+    ap.add_argument("--preoff-mins", type=int, default=180)
     ap.add_argument("--batch-markets", type=int, default=100)
     ap.add_argument("--downsample-secs", type=int, default=0)
     ap.add_argument("--chunk-days", type=int, default=2)
@@ -203,19 +203,42 @@ def main():
             raise SystemExit("No features produced.")
         return pl.concat(parts, how="vertical", rechunk=True)
 
-    df = build(args.preoff_mins).filter(pl.col(args.label_col).is_not_null())
+    df_raw = build(args.preoff_mins)
+print(f"[diag] rows before label filter: {df_raw.height} | cols: {list(df_raw.columns)}")
+# Show small sample of countryCode/marketId presence
+try:
+    print("[diag] sample rows:", df_raw.head(3))
+except Exception:
+    pass
+# Label filter
+df = df_raw.filter(pl.col(args.label_col).is_not_null())
+print(f"[diag] rows after label='{args.label_col}' filter: {df.height}")
+if df.is_empty():
+    # Save tiny snapshot for inspection
+    try:
+        from pathlib import Path as _P
+        _snap = _P("output/diag_features_head.csv")
+        _snap.parent.mkdir(parents=True, exist_ok=True)
+        df_raw.head(1000).write_csv(str(_snap))
+        print(f"[diag] wrote head(1000) to {_snap}")
+    except Exception as _e:
+        print(f"[diag] failed to write snapshot: {_e}")
+
+    if df.is_empty() and args.preoff_mins < 180:
+        print("[info] No features produced at preoff-mins", args.preoff_mins, "- retrying with 180")
+        df = build(180).filter(pl.col(args.label_col).is_not_null())
+
 
     # Build vocab & add one-hots
     vocab = topk_countries(df, args.country_topk)
     # Map a stable country bucket for stratified metrics
-    df = df.with_columns(
-        pl.when(pl.col("countryCode").is_in(vocab))
-          .then(pl.col("countryCode"))
-          .otherwise("__OTHER__")
-          .alias("cc_bucket")
-    )
-
-    df_enc = add_country_onehots(df, vocab)
+df = df.with_columns(
+    pl.when(pl.col("countryCode").is_in(vocab))
+      .then(pl.col("countryCode"))
+      .otherwise("__OTHER__")
+      .alias("cc_bucket")
+)
+df_enc = add_country_onehots(df, vocab)
 
 
     # Train
