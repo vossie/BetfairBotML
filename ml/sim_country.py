@@ -7,6 +7,7 @@ import polars as pl
 import xgboost as xgb
 from pathlib import Path
 
+
 # ----------------------------
 # Utilities
 # ----------------------------
@@ -24,12 +25,25 @@ def _load_booster(path: str) -> xgb.Booster:
     bst.load_model(path)
     return bst
 
-def _implied_prob(df: pl.DataFrame) -> pl.Expr:
+def _implied_prob() -> pl.Expr:
     return 1.0 / pl.col("ltp")
 
 def _kelly_stake(edge: np.ndarray, prob: np.ndarray, kelly: float) -> np.ndarray:
-    """edge = model_pred - implied_prob"""
+    """Kelly fraction stake sizing"""
     return np.clip(kelly * (edge / (1 - prob)), 0, 1)
+
+def _add_country_feat(df: pl.DataFrame) -> pl.DataFrame:
+    if "country_feat" in df.columns:
+        return df
+    if "countryCode" in df.columns:
+        return df.with_columns(
+            pl.col("countryCode")
+              .fill_null("UNK")
+              .cast(pl.Categorical)
+              .to_physical()
+              .alias("country_feat")
+        )
+    return df
 
 
 # ----------------------------
@@ -60,13 +74,13 @@ def main():
     ap.add_argument("--bets-out", type=str, default=None)
     args = ap.parse_args()
 
-    # load model + feature names
+    # load model + features
     bst = _load_booster(args.model)
     feats = bst.feature_names
 
     # --- build features
     from . import features
-    dates = [args.date]  # simplification; real script builds a range
+    dates = [args.date]  # simplified; replace with date range if needed
     df, _ = features.build_features_streaming(
         curated_root=args.curated,
         sport=args.sport,
@@ -79,13 +93,16 @@ def main():
     if args.country_filter:
         df = df.filter(pl.col("countryCode") == args.country_filter)
 
+    # add numeric country feature
+    df = _add_country_feat(df)
+
     # ensure features exist
     X = _to_numpy(df, feats)
     p = bst.predict(xgb.DMatrix(X, feature_names=feats))
 
     # implied prob and edge
     df = df.with_columns([
-        _implied_prob(df).alias("implied_prob"),
+        _implied_prob().alias("implied_prob"),
         pl.Series("model_pred", p),
     ])
     df = df.with_columns((pl.col("model_pred") - pl.col("implied_prob")).alias("edge"))
