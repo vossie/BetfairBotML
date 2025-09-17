@@ -17,7 +17,7 @@ if [[ -z "$DATE_ARG" ]]; then
 fi
 shift || true
 
-MODEL_PATH="./output/xgb_country.json"
+MODEL_PATH="./output/xgb_model_country.json"
 META_PATH="./output/xgb_country_meta.json"
 DAYS_BEFORE="7"
 COUNTRY_FILTER=""
