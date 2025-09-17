@@ -72,7 +72,6 @@ def _build_features_window(
 
 
 def _ensure_country_feat(df: pl.DataFrame) -> pl.DataFrame:
-    # Mirror trainer: derive numeric category code for country
     for cand in ("countryCode", "eventCountryCode", "country"):
         if cand in df.columns:
             try:
@@ -80,7 +79,6 @@ def _ensure_country_feat(df: pl.DataFrame) -> pl.DataFrame:
                     pl.col(cand).fill_null("UNK").cast(pl.Categorical).to_physical().alias("country_feat")
                 )
             except Exception:
-                # Older Polars fallback
                 return df.with_columns(
                     pl.col(cand).fill_null("UNK").cast(pl.Utf8).hash().alias("country_feat")
                 )
@@ -89,7 +87,6 @@ def _ensure_country_feat(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _to_numpy(df: pl.DataFrame, cols: List[str]) -> np.ndarray:
-    # Keep order as in features.txt; fill NaNs conservatively
     return df.select(cols).fill_null(strategy="mean").to_numpy().astype(np.float32, copy=False)
 
 
@@ -124,7 +121,6 @@ def main():
     bst = _load_booster(str(model_path))
     feat_order = _load_feature_list_for_model(model_path)
 
-    # Build feature window
     dates = _dates_back_from(args.date, int(args.days_before))
     df = _build_features_window(
         curated_root=args.curated,
@@ -136,28 +132,22 @@ def main():
         chunk_days=args.chunk_days,
     )
 
-    # Optional filter by country code if present/requested
     if args.country_filter and "countryCode" in df.columns:
         df = df.filter(pl.col("countryCode") == args.country_filter)
 
-    # Ensure derived country feature exists to match training
     df = _ensure_country_feat(df)
 
-    # Keep only rows with label when available (harmless in sim)
     if args.label_col in df.columns:
         df = df.filter(pl.col(args.label_col).is_not_null())
 
     if df.is_empty():
         raise SystemExit("No usable rows after feature build.")
 
-    # Predict with feature names (must match training)
     X = _to_numpy(df, feat_order)
     dX = xgb.DMatrix(X, feature_names=feat_order)
     p = bst.predict(dX)
     df_scored = df.with_columns(pl.lit(p).alias("p_hat"))
 
-    # Build bets using the same utilities as sim.py
-    # Assumes df contains 'implied_prob' (from features builder); if not, consider adding it there.
     bets = _build_bets_table(
         df_scored,
         label_col=args.label_col,
@@ -165,26 +155,34 @@ def main():
         kelly_frac=args.kelly,
         side_mode=args.side,
     )
-
-    # Pick top-N per market (default 1) to avoid fanning out stakes
     bets = _pick_topn_per_market(bets, args.top_n_per_market)
-
-    # Cap at per-market/day budgets and re-normalize (sim.py semantics)
     bets = _cap_stakes(bets, cap_market=args.stake_cap_market, cap_day=args.stake_cap_day)
 
-    # Enforce Betfair £1 minimum stake after caps (final guard)
+    # Enforce £1 minimum stake after caps
     if "stake" in bets.columns:
         bets = bets.with_columns(
             pl.when(pl.col("stake") < 1.0).then(1.0).otherwise(pl.col("stake")).alias("stake")
         )
 
-    # Compute PnL with commission, consistent with sim.py (_pnl_columns applies commission to winners only)
     bets = _pnl_columns(bets, commission=args.commission)
 
-    # Write outputs
+    # Ensure we have countryCode on bets (it may be dropped by bet-building)
+    if "countryCode" not in bets.columns:
+        # Prefer exact pair join; fallback to marketId only if selectionId missing
+        join_keys = [k for k in ("marketId", "selectionId") if k in bets.columns and k in df_scored.columns]
+        if not join_keys:
+            join_keys = ["marketId"]
+        country_map = (
+            df_scored.select([c for c in (join_keys + ["countryCode"]) if c in df_scored.columns])
+            .unique()
+        )
+        if "countryCode" in country_map.columns:
+            bets = bets.join(country_map, on=join_keys, how="left")
+
     bets_out = str(Path(args.bets_out))
     bets.write_csv(bets_out)
 
+    # Aggregate PnL by country
     if "countryCode" in bets.columns:
         pnl_by_country = (
             bets.group_by("countryCode")
@@ -197,12 +195,13 @@ def main():
             .sort("roi", descending=True)
         )
     else:
-        pnl_by_country = pl.DataFrame({"countryCode": [], "n_bets": [], "stake": [], "pnl": [], "roi": []})
+        pnl_by_country = pl.DataFrame(
+            {"countryCode": [], "n_bets": [], "stake": [], "pnl": [], "roi": []}
+        )
 
     pnl_out = str(Path(args.pnl_by_country_out))
     pnl_by_country.write_csv(pnl_out)
 
-    # Console summary
     total_bets = bets.height
     stake_sum = float(bets["stake"].sum()) if total_bets else 0.0
     pnl_sum = float(bets["pnl"].sum()) if total_bets else 0.0
