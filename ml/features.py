@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import List, Tuple, Optional
+import os
 
 import polars as pl
 import pyarrow.dataset as pads
@@ -15,10 +16,10 @@ import pyarrow.fs as pafs
 def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[List[str], List[str], List[str]]:
     """
     Build partitioned paths for snapshots, market definitions, and results
-    under the curated root (local or s3). Example layout (from user's data):
-      betfair-curated/market_definitions/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
-      betfair-curated/orderbook_snapshots_5s/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
-      betfair-curated/results/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+    under the curated root (local or s3). Example layout:
+      <root>/market_definitions/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+      <root>/orderbook_snapshots_5s/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
+      <root>/results/sport=<sport>/date=YYYY-MM-DD/part-*.parquet
     """
     def pfx(name: str) -> str:
         return f"{curated_root.rstrip('/')}/{name}/sport={sport}"
@@ -29,8 +30,53 @@ def _paths_for_dates(curated_root: str, sport: str, dates: List[str]) -> Tuple[L
     return snaps, defs, res
 
 
+def _strip_scheme(url: str) -> str:
+    if url.startswith("https://"):
+        return url[len("https://"):]
+    if url.startswith("http://"):
+        return url[len("http://"):]
+    return url
+
+
+def _make_s3fs() -> pafs.S3FileSystem:
+    """
+    Construct an S3FileSystem using environment variables, so region/endpoint
+    mismatches don't occur (ACCESS_DENIED due to wrong region).
+    Env vars used (best-effort):
+      - AWS_ACCESS_KEY_ID
+      - AWS_SECRET_ACCESS_KEY
+      - AWS_SESSION_TOKEN
+      - AWS_REGION or AWS_DEFAULT_REGION
+      - AWS_ENDPOINT_URL or AWS_S3_ENDPOINT (for MinIO/local gateways)
+    """
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    session_token = os.getenv("AWS_SESSION_TOKEN")
+    region = os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+    endpoint = os.getenv("AWS_ENDPOINT_URL") or os.getenv("AWS_S3_ENDPOINT")
+    scheme = "https"
+    if endpoint and endpoint.startswith("http://"):
+        scheme = "http"
+    endpoint_override = _strip_scheme(endpoint) if endpoint else None
+
+    # pyarrow accepts None for any unset fields.
+    return pafs.S3FileSystem(
+        access_key=access_key,
+        secret_key=secret_key,
+        session_token=session_token,
+        region=region,
+        scheme=scheme,
+        endpoint_override=endpoint_override,
+    )
+
+
 def _fs_and_path(uri: str):
     """Return (filesystem, path_without_scheme) for a given local/S3/other URI."""
+    if uri.startswith("s3://"):
+        fs = _make_s3fs()
+        path = uri[len("s3://"):]
+        return fs, path
+    # Non-S3 -> let Arrow infer
     fs, path = pafs.FileSystem.from_uri(uri)
     return fs, path
 
@@ -76,13 +122,6 @@ def _scan_parquet(uris: List[str]) -> pl.LazyFrame:
 # Feature building
 # -------------------------
 
-def _safe_col(df: pl.LazyFrame, name: str) -> pl.Expr:
-    """Return a column if present; else a null placeholder."""
-    if name in df.collect_schema().names():
-        return pl.col(name)
-    return pl.lit(None).alias(name)
-
-
 def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
     """Add timestamps and simple transforms expected by downstream code."""
     # publishTimeMs -> ts (datetime) and seconds
@@ -93,7 +132,8 @@ def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
     ])
 
     # implied_prob = 1/ltp (guarded)
-    if "ltp" in snaps.collect_schema().names():
+    schema = snaps.collect_schema().names()
+    if "ltp" in schema:
         snaps = snaps.with_columns(
             pl.when((pl.col("ltp").is_not_null()) & (pl.col("ltp") > 0))
               .then(1.0 / pl.col("ltp"))
@@ -104,10 +144,7 @@ def _with_basic_transforms(snaps: pl.LazyFrame) -> pl.LazyFrame:
         snaps = snaps.with_columns(pl.lit(None).alias("implied_prob"))
 
     # Rolling momentum and volume windows: 10s (2 * 5s), 60s (12 * 5s)
-    # These are simplistic diffs over fixed lag counts.
     by_keys = ["marketId", "selectionId"]
-    schema = snaps.collect_schema().names()
-
     if all(k in schema for k in by_keys) and "publishTimeMs" in schema:
         snaps = snaps.sort(by_keys + ["publishTimeMs"])  # ensure order
 
@@ -149,7 +186,7 @@ def build_features_streaming(
     Build features by scanning partitioned Parquet under curated_root for given dates.
     Returns (features_df, total_raw_rows).
     - Includes 'countryCode' from market definitions.
-    - Computes simple time-to-off in minutes from marketStartMs.
+    - Computes time-to-off in minutes from marketStartMs.
     - Computes basic momentum/volume windows from snapshots.
     """
     snap_paths, def_paths, res_paths = _paths_for_dates(curated_root, sport, dates)
@@ -162,10 +199,11 @@ def build_features_streaming(
         return pl.DataFrame([]), 0
 
     # Minimal subset from snapshots
-    keep_snap = [c for c in [
+    keep_snap_wanted = [
         "sport", "marketId", "selectionId", "publishTimeMs",
         "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1",
-    ] if c in lf_snap.collect_schema().names()]
+    ]
+    keep_snap = [c for c in keep_snap_wanted if c in lf_snap.collect_schema().names()]
     lf_snap = lf_snap.select(keep_snap)
     lf_snap = _with_basic_transforms(lf_snap)
 
@@ -195,7 +233,6 @@ def build_features_streaming(
 
     # Optional downsample: floor to a time bucket, then take last row in bucket
     if downsample_secs:
-        # Compute bucket per market/selection
         left = left.with_columns(((pl.col("publishTimeMs") // (downsample_secs * 1000)) * (downsample_secs * 1000)).alias("_buck"))
         left = (
             left
