@@ -1,4 +1,4 @@
-# ml/sim2.py — streaming simulator with execution realism and safe empty-DF guards
+# ml/sim2.py — streaming simulator with execution realism, partial fills, and simple persistence
 from __future__ import annotations
 
 import argparse
@@ -120,6 +120,28 @@ def _step_ticks(odds: float, n: int) -> float:
     return round(curr, 2)
 
 
+def _opposing_best(row: dict, side: str, have_back: bool, have_lay: bool, have_lists: bool) -> tuple[float, float]:
+    """Return (price, size) at best opposing quote for the given row/side."""
+    if side == "back":
+        # match against lays
+        if have_lay:
+            return float(row.get("bestLayOdds", row.get("odds", np.nan))), float(row.get("bestLaySize", np.inf))
+        if have_lists:
+            sizes = row.get("laySizes") or []
+            size = float(sizes[0]) if sizes else float("inf")
+            return float(row.get("odds", np.nan)), size
+        return float(row.get("odds", np.nan)), float("inf")
+    else:
+        # lay → match against backs
+        if have_back:
+            return float(row.get("bestBackOdds", row.get("odds", np.nan))), float(row.get("bestBackSize", np.inf))
+        if have_lists:
+            sizes = row.get("backSizes") or []
+            size = float(sizes[0]) if sizes else float("inf")
+            return float(row.get("odds", np.nan)), size
+        return float(row.get("odds", np.nan)), float("inf")
+
+
 def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
     if "p_hat" not in df.columns:
         raise RuntimeError("p_hat missing. Score the dataframe first.")
@@ -189,7 +211,7 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
     )
 
 
-def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
+def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float, min_floor: float) -> pl.DataFrame:
     if bets.is_empty():
         return bets
 
@@ -213,7 +235,7 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
 
     b2 = b1.with_columns([
         pl.when(pl.col("_stake_mkt") <= 0.0).then(0.0)
-        .when(pl.col("_stake_mkt") < 1.0).then(1.0)
+        .when(pl.col("_stake_mkt") < min_floor).then(min_floor)
         .otherwise(pl.col("_stake_mkt")).alias("_stake_floor")
     ])
 
@@ -230,16 +252,16 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
             stake_new = np.zeros_like(stake)
             if k > 0:
                 idx_pos = np.flatnonzero(pos)[:k]
-                stake_new[idx_pos] = 1.0
+                stake_new[idx_pos] = min_floor
             return df.with_columns(pl.Series("_stake_grouped", stake_new))
-        base = float(n_pos)
+        base = float(n_pos) * min_floor
         budget = cap - base
-        excess = np.where(pos, np.maximum(stake - 1.0, 0.0), 0.0)
+        excess = np.where(pos, np.maximum(stake - min_floor, 0.0), 0.0)
         sum_excess = float(excess.sum())
         if sum_excess <= budget + 1e-12:
             return df.with_columns(pl.Series("_stake_grouped", stake))
         scale = budget / sum_excess if sum_excess > 0 else 0.0
-        stake_new = np.where(pos, 1.0 + excess * scale, 0.0)
+        stake_new = np.where(pos, min_floor + excess * scale, 0.0)
         return df.with_columns(pl.Series("_stake_grouped", stake_new))
 
     if hasattr(b2.group_by("marketId"), "map_groups"):
@@ -288,6 +310,8 @@ class StreamState:
         self.last_bet_ts: Dict[Tuple[str, int], int] = {}
         self.open_count_by_market: Dict[str, int] = {}
         self.exposure_day: float = 0.0
+        # simple persistence for unmatched remainders
+        self.unmatched: List[Dict] = []
 
     def can_place(self, mkt: str, sel: int, now_ms: int, stake: float) -> bool:
         key = (mkt, sel)
@@ -305,8 +329,12 @@ class StreamState:
         self.open_count_by_market[mkt] = self.open_count_by_market.get(mkt, 0) + 1
         self.exposure_day += stake
 
+    def add_exposure(self, stake: float):
+        self.exposure_day += stake
+
     def settle_market(self, mkt: str):
         self.open_count_by_market[mkt] = 0
+        # optionally: drop unmatched for this market (not essential here)
 
 
 def main():
@@ -332,8 +360,12 @@ def main():
     ap.add_argument("--max-open-per-market", type=int, default=1, help="Throttle concurrent bets per market.")
     ap.add_argument("--max-exposure-day", type=float, default=5000.0, help="Cap total daily exposure (sum of stakes).")
     ap.add_argument("--place-until-mins", type=float, default=1.0, help="Stop placing when tto_minutes <= this (final minute freeze).")
+    # Persistence (simple queue model)
+    ap.add_argument("--persistence", choices=["lapse", "keep"], default="keep",
+                    help="What to do with unmatched remainder: 'keep' tries to fill across subsequent buckets.")
+    ap.add_argument("--rest-secs", type=int, default=15, help="How long to keep trying to match remainder before lapsing.")
     # Execution realism
-    ap.add_argument("--min-stake", type=float, default=2.0, help="Minimum tradable stake; orders below are rejected.")
+    ap.add_argument("--min-stake", type=float, default=1.0, help="Minimum tradable stake; orders below are rejected (Betfair API min is £1).")
     ap.add_argument("--tick-snap", action="store_true", help="Snap execution odds to Betfair tick ladder.")
     ap.add_argument("--slip-ticks", type=int, default=1, help="Adverse slippage in ticks applied due to latency.")
     # Selection & staking
@@ -437,21 +469,103 @@ def main():
     placed_rows: List[pl.DataFrame] = []
     stream_log_rows: List[Dict] = []
 
+    # helper: try to fill unmatched remainders present in state
+    def _try_fill_unmatched(arrivals_df: pl.DataFrame, now_ms: int):
+        if not state.unmatched or arrivals_df.is_empty():
+            return
+        cols = set(arrivals_df.columns)
+        have_back = {"bestBackOdds", "bestBackSize"}.issubset(cols)
+        have_lay = {"bestLayOdds", "bestLaySize"}.issubset(cols)
+        have_lists = {"backSizes", "laySizes"}.issubset(cols)
+        snap = arrivals_df.sort("publishTimeMs").group_by(["marketId", "selectionId"]).tail(1)
+        snap_map = {(r["marketId"], int(r["selectionId"])): r for r in snap.iter_rows(named=True)}
+
+        still: List[Dict] = []
+        exec_rows = []
+
+        for od in state.unmatched:
+            if now_ms - od["placed_ms"] > args.rest_secs * 1000 or args.persistence == "lapse":
+                stream_log_rows.append({
+                    "publishTimeMs": now_ms, "marketId": od["marketId"], "selectionId": od["selectionId"],
+                    "event": "lapse_unfilled", "remaining": od["remaining"]
+                })
+                continue
+
+            key = (od["marketId"], od["selectionId"])
+            row = snap_map.get(key)
+            if not row:
+                still.append(od)
+                continue
+
+            best_px, best_sz = _opposing_best(row, od["side"], have_back, have_lay, have_lists)
+            if not np.isfinite(best_px) or best_sz <= 0:
+                still.append(od)
+                continue
+
+            # Fill only if the market "crosses" our limit
+            limit_px = od["limit_px"]
+            cross = (od["side"] == "back" and best_px <= limit_px) or (od["side"] == "lay" and best_px >= limit_px)
+            if not cross:
+                still.append(od)
+                continue
+
+            fill_amt = min(od["remaining"], float(best_sz))
+            if fill_amt <= 0:
+                still.append(od)
+                continue
+
+            # record execution at opposing price
+            exec_rows.append({
+                "marketId": od["marketId"],
+                "selectionId": od["selectionId"],
+                "publishTimeMs": now_ms,
+                "tto_minutes": row.get("tto_minutes"),
+                "side": od["side"],
+                "stake": float(fill_amt),
+                "odds": row.get("odds", best_px),
+                "odds_exec": float(best_px),
+                "winLabel": row.get("winLabel"),
+                "p_hat": row.get("p_hat"),
+                "edge": row.get("edge"),
+            })
+            stream_log_rows.append({
+                "publishTimeMs": now_ms, "marketId": od["marketId"], "selectionId": od["selectionId"],
+                "event": "place_partial", "stake": float(fill_amt), "odds_exec": float(best_px)
+            })
+            od["remaining"] -= float(fill_amt)
+            state.add_exposure(float(fill_amt))
+
+            if od["remaining"] > 1e-9:
+                still.append(od)
+
+        state.unmatched = still
+        if exec_rows:
+            placed_rows.append(pl.DataFrame(exec_rows))
+
     for _, arrivals in df_feat.group_by("_bucket", maintain_order=True):
         arrivals = arrivals.drop("_bucket")
         now_ms = int(arrivals["publishTimeMs"].max()) + args.latency_ms
 
-        # stop placing very late
-        arrivals = arrivals.filter(pl.col("tto_minutes") > args.place_until_mins)
-        if not arrivals.is_empty():
-            scored = _score_arrivals(arrivals)
+        # settle markets that have started (based on this bucket)
+        finishers = arrivals.filter(pl.col("tto_minutes") <= 0)
+        if not finishers.is_empty():
+            for mkt in finishers.select("marketId").unique().to_series().to_list():
+                state.settle_market(mkt)
+
+        # optional final-minute freeze for NEW placements
+        arrivals_for_new = arrivals.filter(pl.col("tto_minutes") > args.place_until_mins)
+
+        # first, try to fill any previously unmatched
+        _try_fill_unmatched(arrivals, now_ms)
+
+        if not arrivals_for_new.is_empty():
+            scored = _score_arrivals(arrivals_for_new)
 
             # candidate bets
             cands = _build_bets_table(scored, label_col=args.label_col, min_edge=args.min_edge, kelly_frac=args.kelly, side_mode=args.side)
             cands = _pick_topn_per_market(cands, args.top_n_per_market)
-            cands = _cap_stakes(cands, cap_market=args.stake_cap_market, cap_day=args.stake_cap_day)
+            cands = _cap_stakes(cands, cap_market=args.stake_cap_market, cap_day=args.stake_cap_day, min_floor=args.min_stake)
 
-            # execution realism (L1 fill, tick-snap, slippage, min-stake)
             if not cands.is_empty():
                 executed_rows = []
                 cols = set(cands.columns)
@@ -459,47 +573,27 @@ def main():
                 have_lay = {"bestLayOdds", "bestLaySize"}.issubset(cols)
                 have_lists = {"backSizes", "laySizes"}.issubset(cols)
 
-                def _extract_best(row, side: str):
-                    if side == "back":
-                        # match against lays
-                        if have_lay:
-                            return float(row.get("bestLayOdds", row.get("odds", np.nan))), float(row.get("bestLaySize", np.inf))
-                        if have_lists:
-                            sizes = row.get("laySizes") or []
-                            size = float(sizes[0]) if sizes else float("inf")
-                            return float(row.get("odds", np.nan)), size
-                        return float(row.get("odds", np.nan)), float("inf")
-                    else:
-                        # lay → match against backs
-                        if have_back:
-                            return float(row.get("bestBackOdds", row.get("odds", np.nan))), float(row.get("bestBackSize", np.inf))
-                        if have_lists:
-                            sizes = row.get("backSizes") or []
-                            size = float(sizes[0]) if sizes else float("inf")
-                            return float(row.get("odds", np.nan)), size
-                        return float(row.get("odds", np.nan)), float("inf")
-
                 for r in cands.iter_rows(named=True):
                     mkt = r["marketId"]
                     sel = int(r["selectionId"])
                     side = r.get("side", "back")
                     stake_req = float(r.get("stake", 0.0))
 
-                    # throttles
-                    if stake_req <= 0:
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "zero_stake"})
+                    # throttles for NEW placements
+                    if stake_req < args.min_stake:
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "below_min_stake"})
                         continue
                     if not state.can_place(mkt, sel, now_ms, stake_req):
                         stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "throttle_or_cap"})
                         continue
 
                     # level-1 quote
-                    q_price, q_size = _extract_best(r, side)
-                    if not np.isfinite(q_price) or q_price <= 1.0:
+                    q_price, q_size = _opposing_best(r, side, have_back, have_lay, have_lists)
+                    if not np.isfinite(q_price) or q_price <= 1.0 or q_size <= 0:
                         stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "no_quote"})
                         continue
 
-                    # tick snap + adverse slippage
+                    # tick snap + adverse slippage on NEW placement
                     px_exec = _snap_to_tick(q_price) if args.tick_snap else float(q_price)
                     if args.slip_ticks != 0 and args.latency_ms > 0:
                         if side == "back":
@@ -507,26 +601,32 @@ def main():
                         else:
                             px_exec = _step_ticks(px_exec, +abs(args.slip_ticks))  # worse for layer is higher odds
 
-                    # fill size (partial allowed), then min stake
+                    # immediate fill at L1 (can be < min-stake): accept partials since stake_req >= min-stake
                     fill = min(stake_req, float(q_size))
-                    if fill < args.min_stake:
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "insufficient_size_or_below_min"})
-                        continue
+                    if fill > 0:
+                        state.register_bet(mkt, sel, now_ms, float(fill))
+                        executed_rows.append({
+                            **{k: r.get(k) for k in r.keys()},
+                            "stake": float(fill),
+                            "odds_exec": float(px_exec),
+                        })
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "place", "stake": float(fill), "odds_exec": float(px_exec)})
 
-                    # accept
-                    state.register_bet(mkt, sel, now_ms, fill)
-                    r_out = {**{k: r.get(k) for k in r.keys()}, "stake": fill, "odds_exec": px_exec}
-                    executed_rows.append(r_out)
-                    stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "place", "stake": fill, "odds_exec": px_exec})
+                    # persist unmatched remainder if requested
+                    remaining = stake_req - float(fill)
+                    if remaining > 1e-9 and args.persistence == "keep":
+                        state.unmatched.append({
+                            "marketId": mkt,
+                            "selectionId": sel,
+                            "side": side,
+                            "limit_px": float(px_exec),  # our limit at submission after snap+slip
+                            "remaining": float(remaining),
+                            "placed_ms": now_ms,
+                        })
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "queue_remainder", "remaining": float(remaining), "limit_px": float(px_exec)})
 
                 if executed_rows:
                     placed_rows.append(pl.DataFrame(executed_rows))
-
-        # settle markets that have started (using arrivals of this bucket)
-        finishers = arrivals.filter(pl.col("tto_minutes") <= 0)
-        if not finishers.is_empty():
-            for mkt in finishers.select("marketId").unique().to_series().to_list():
-                state.settle_market(mkt)
 
     # Build bets df with known schema even if empty
     if placed_rows:
@@ -548,7 +648,6 @@ def main():
     if not bets.is_empty():
         bets = _pnl_columns(bets, commission=args.commission)
     else:
-        # ensure pnl exists
         if "pnl" not in bets.columns:
             bets = bets.with_columns(pl.lit(None).cast(pl.Float64).alias("pnl"))
 
