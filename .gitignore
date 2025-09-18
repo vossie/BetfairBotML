@@ -1,5 +1,6 @@
 /.venv/
 /bin/set-env-vars-prod.sh
 /output/*.json
+/output/*.csv
 *.idea*
 ml/__pycache__/*
