@@ -29,6 +29,15 @@ fi
 echo "Running streaming simulator (single-model) for date: ${DATE_ARG}"
 echo "Model: ${MODEL_PATH}"
 
+# execution & queueing
+MIN_STAKE=1.0
+SLIP_TICKS=0
+COOLDOWN_SECS=10
+PLACE_UNTIL=0
+MAX_OPEN_PER_MARKET=2
+PERSISTENCE=keep
+REST_SECS=10
+
 STAKE_CAP_MKT=50
 STAKE_CAP_DAY=2000
 MAX_EXPOSURE_DAY=5000
@@ -43,8 +52,6 @@ SIDE=auto
 
 STREAM_BUCKET=5
 LATENCY_MS=300
-COOLDOWN_SECS=60
-PLACE_UNTIL=1
 
 CURATED="/mnt/nvme/betfair-curated"
 SPORT="horse-racing"
@@ -52,9 +59,6 @@ SPORT="horse-racing"
 OUT_BETS="./output/bets.csv"
 OUT_AGG="./output/bets_by_market.csv"
 OUT_BIN="./output/pnl_by_tto_bin.csv"
-
-MIN_STAKE=1.0
-SLIP_TICKS=1
 
 BASE_ARGS=(
   --stake-cap-market ${STAKE_CAP_MKT}
@@ -82,11 +86,15 @@ BASE_ARGS=(
   --latency-ms ${LATENCY_MS}
   --cooldown-secs ${COOLDOWN_SECS}
   --place-until-mins ${PLACE_UNTIL}
+  --max-open-per-market ${MAX_OPEN_PER_MARKET}
+  --persistence ${PERSISTENCE}
+  --rest-secs ${REST_SECS}
 
   --min-stake ${MIN_STAKE}
   --tick-snap
   --slip-ticks ${SLIP_TICKS}
 )
+
 
 # IMPORTANT: This entry points to ml.sim2 (streaming version).
 PY_ENTRY="ml.sim2"
