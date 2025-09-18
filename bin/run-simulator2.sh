@@ -38,8 +38,8 @@ echo "Key set:  $( [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY
 cd /opt/BetfairBotML
 
 BASE_ARGS=(
-  --stake-cap-market 50 \
-  --stake-cap-day 2000 \
+  --stake-cap-market 50
+  --stake-cap-day 2000
   --max-exposure-day 5000
   --days-before 1
   --curated /mnt/nvme/betfair-curated
