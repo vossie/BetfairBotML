@@ -2,20 +2,15 @@
 set -euo pipefail
 
 # Usage:
-#   run-simulator-0-30.sh 2025-09-17               # single-model, default model path
-#   run-simulator-0-30.sh 2025-09-17 --model       # single-model, default ./output/xgb_model.json
-#   run-simulator-0-30.sh 2025-09-17 --model ./output/custom.json
+#   run-simulator2-0-30.sh 2025-09-17               # single-model, default model path ./output/xgb_model.json
+#   run-simulator2-0-30.sh 2025-09-17 --model       # single-model, default path
+#   run-simulator2-0-30.sh 2025-09-17 --model ./output/custom.json
 #
 # Notes:
-# - This script is for the streaming simulator using a SINGLE model.
-# - It limits simulation/placements to the last 30 minutes pre-off.
-# - Adjust the Python module below if your entry point differs (ml.sim vs ml.sim2).
-#
-# Optional: load env (comment out if not needed)
-# source "$(dirname "$0")/set-env-vars-prod.sh" 2>/dev/null || true
-#
-# Optional: change into your project directory
-# cd /opt/BetfairBotML 2>/dev/null || true
+# - Focuses on the last 30 minutes pre-off (preoff-mins=30).
+# - Uses SINGLE model entry point and execution realism flags:
+#     --min-stake 2.0, --tick-snap, --slip-ticks 1
+# - Adjust PY_ENTRY below if your module is different (e.g., ml.sim2).
 
 DATE_ARG="${1:-}"
 if [[ -z "$DATE_ARG" ]]; then
@@ -24,13 +19,17 @@ if [[ -z "$DATE_ARG" ]]; then
 fi
 shift || true
 
-MODEL_PATH="./output/xgb_model.json"
+MODEL_PATH=""
 if [[ "${1:-}" == "--model" ]]; then
   shift || true
-  if [[ -n "${1:-}" && "${1}" != --* ]]; then
-    MODEL_PATH="${1}"
+  MODEL_PATH="${1:-}"
+  if [[ -z "$MODEL_PATH" || "$MODEL_PATH" == --* ]]; then
+    MODEL_PATH="./output/xgb_model.json"
+  else
     shift || true
   fi
+else
+  MODEL_PATH="./output/xgb_model.json"
 fi
 
 echo "Running streaming simulator (single-model) for date: ${DATE_ARG}"
@@ -40,6 +39,7 @@ echo "Model: ${MODEL_PATH}"
 STAKE_CAP_MKT=50
 STAKE_CAP_DAY=2000
 MAX_EXPOSURE_DAY=5000
+
 PREOFF_MINS=30
 MIN_EDGE=0.02
 KELLY=0.25
@@ -54,7 +54,15 @@ PLACE_UNTIL=1
 
 CURATED="/mnt/nvme/betfair-curated"
 SPORT="horse-racing"
+
 OUT_BETS="./output/bets.csv"
+OUT_AGG="./output/bets_by_market.csv"
+OUT_BIN="./output/pnl_by_tto_bin.csv"
+
+# Execution realism
+MIN_STAKE=2.0
+TICK_SNAP=--tick-snap
+SLIP_TICKS=1
 # --------------------------------
 
 BASE_ARGS=(
@@ -76,18 +84,24 @@ BASE_ARGS=(
   --side ${SIDE}
 
   --bets-out "${OUT_BETS}"
+  --agg-out "${OUT_AGG}"
+  --bin-out "${OUT_BIN}"
 
   --stream-bucket-secs ${STREAM_BUCKET}
   --latency-ms ${LATENCY_MS}
   --cooldown-secs ${COOLDOWN_SECS}
   --place-until-mins ${PLACE_UNTIL}
+
+  --min-stake ${MIN_STAKE}
+  ${TICK_SNAP}
+  --slip-ticks ${SLIP_TICKS}
 )
 
 # Choose the Python entry point for the streaming sim.
 # If your single-model entry point is ml.sim2, change "ml.sim" to "ml.sim2" below.
-PY_ENTRY="ml.sim2"
+PY_ENTRY="ml.sim"
 
-# Use local venv if present, otherwise fall back to system python
+# Prefer local venv, else fall back to system python
 if [[ -x ".venv/bin/python" ]]; then
   PY=".venv/bin/python"
 else
