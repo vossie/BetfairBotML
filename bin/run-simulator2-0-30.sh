@@ -29,8 +29,26 @@ fi
 echo "Running streaming simulator (single-model) for date: ${DATE_ARG}"
 echo "Model: ${MODEL_PATH}"
 
-DAYS_BEFORE=1
+# execution & queueing
+MIN_STAKE=1.0
+SLIP_TICKS=0
+COOLDOWN_SECS=10
+PLACE_UNTIL=0
+MAX_OPEN_PER_MARKET=2
+PERSISTENCE=keep
+REST_SECS=10
+
+STAKE_CAP_MKT=50
+STAKE_CAP_DAY=2000
+MAX_EXPOSURE_DAY=5000
+
 PREOFF_MINS=30
+MIN_EDGE=0.01
+KELLY=0.25
+COMMISSION=0.05
+TOP_N=1
+SIDE=auto
+
 STREAM_BUCKET=5
 LATENCY_MS=300
 
@@ -41,38 +59,18 @@ OUT_BETS="./output/bets.csv"
 OUT_AGG="./output/bets_by_market.csv"
 OUT_BIN="./output/pnl_by_tto_bin.csv"
 
-# execution & queueing
-MIN_STAKE=1.0
-SLIP_TICKS=1
-COOLDOWN_SECS=30
-PLACE_UNTIL=0
-MAX_OPEN_PER_MARKET=2
-PERSISTENCE=lapse
-REST_SECS=0
+DAYS_BEFORE=1
 
-# bankroll
-STAKE_CAP_MKT=8
-STAKE_CAP_DAY=400
-MAX_EXPOSURE_DAY=600
-
-# selection & sizing
-MIN_EDGE=0.12          # pickier; cut marginal edges
-KELLY=0.05             # tiny sizing until we see green
-SIDE=back              # keep it simple; lays can nuke you when mispriced
-TOP_N=1
-COMMISSION=0.05
-
-# strongly recommended filters (add to sim if not present yet)
-ODDS_MIN=1.6           # avoid very short where commission/slip crush EV
-ODDS_MAX=6.0           # avoid wild longshots until calibrated
-MAX_STAKE_PER_BET=5    # hard cap per bet (requires tiny code hook below)
+# End config
 
 BASE_ARGS=(
   --stake-cap-market ${STAKE_CAP_MKT}
   --stake-cap-day ${STAKE_CAP_DAY}
   --max-exposure-day ${MAX_EXPOSURE_DAY}
 
+
   --days-before ${DAYS_BEFORE}
+  --days-before 0
   --curated "${CURATED}"
   --sport "${SPORT}"
   --date "${DATE_ARG}"
