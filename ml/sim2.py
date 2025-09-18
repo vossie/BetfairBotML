@@ -1,10 +1,10 @@
-# ml/sim2.py — streaming simulator with execution realism, partial fills, and simple persistence
+# ml/sim2.py — streaming simulator with execution realism, back/lay guardrails, partial fills, and simple persistence
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import polars as pl
@@ -247,14 +247,15 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float, min_floor
         if n_pos == 0 or cap <= 0:
             stake[:] = 0.0
             return df.with_columns(pl.Series("_stake_grouped", stake))
-        if cap < n_pos:
-            k = int(cap)
+        # if cap < base, select top k by priority at min_floor
+        base = float(n_pos) * min_floor
+        if cap < base:
+            k = max(0, int(cap // min_floor))
             stake_new = np.zeros_like(stake)
             if k > 0:
                 idx_pos = np.flatnonzero(pos)[:k]
                 stake_new[idx_pos] = min_floor
             return df.with_columns(pl.Series("_stake_grouped", stake_new))
-        base = float(n_pos) * min_floor
         budget = cap - base
         excess = np.where(pos, np.maximum(stake - min_floor, 0.0), 0.0)
         sum_excess = float(excess.sum())
@@ -310,19 +311,18 @@ class StreamState:
         self.last_bet_ts: Dict[Tuple[str, int], int] = {}
         self.open_count_by_market: Dict[str, int] = {}
         self.exposure_day: float = 0.0
-        # simple persistence for unmatched remainders
         self.unmatched: List[Dict] = []
 
-    def can_place(self, mkt: str, sel: int, now_ms: int, stake: float) -> bool:
+    def can_place(self, mkt: str, sel: int, now_ms: int, stake: float) -> Tuple[bool, str]:
         key = (mkt, sel)
         last = self.last_bet_ts.get(key)
         if last is not None and (now_ms - last) < self.cooldown_secs * 1000:
-            return False
+            return False, "cooldown"
         if self.open_count_by_market.get(mkt, 0) >= self.max_open_per_market:
-            return False
+            return False, "max_open_per_market"
         if self.exposure_day + stake > self.max_exposure_day:
-            return False
-        return True
+            return False, "max_exposure_day"
+        return True, "ok"
 
     def register_bet(self, mkt: str, sel: int, now_ms: int, stake: float):
         self.last_bet_ts[(mkt, sel)] = now_ms
@@ -334,7 +334,6 @@ class StreamState:
 
     def settle_market(self, mkt: str):
         self.open_count_by_market[mkt] = 0
-        # optionally: drop unmatched for this market (not essential here)
 
 
 def main():
@@ -377,6 +376,16 @@ def main():
     ap.add_argument("--top-n-per-market", type=int, default=1)
     ap.add_argument("--stake-cap-market", type=float, default=50.0)
     ap.add_argument("--stake-cap-day", type=float, default=2000.0)
+    # Guardrails / EV / odds
+    ap.add_argument("--odds-min", type=float, default=1.6, help="Global lower odds bound at decision time.")
+    ap.add_argument("--odds-max", type=float, default=6.0, help="Global upper odds bound at decision time.")
+    ap.add_argument("--back-odds-min", type=float, default=None, help="Override lower bound for BACK; default=odds-min.")
+    ap.add_argument("--back-odds-max", type=float, default=None, help="Override upper bound for BACK; default=odds-max.")
+    ap.add_argument("--lay-odds-min", type=float, default=None, help="Override lower bound for LAY; default=odds-min.")
+    ap.add_argument("--lay-odds-max", type=float, default=None, help="Override upper bound for LAY; default=odds-max.")
+    ap.add_argument("--max-stake-per-bet", type=float, default=5.0, help="Hard cap per bet after all scaling.")
+    ap.add_argument("--max-liability-per-bet", type=float, default=20.0, help="LAY: cap (odds-1)*stake to this amount.")
+    ap.add_argument("--min-ev", dest="min_ev", type=float, default=0.02, help="Min EV per £1 at execution odds (after commission).")
     # Outputs
     ap.add_argument("--bets-out", default="bets.csv")
     ap.add_argument("--agg-out", default="bets_by_market.csv")
@@ -583,14 +592,26 @@ def main():
                     if stake_req < args.min_stake:
                         stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "below_min_stake"})
                         continue
-                    if not state.can_place(mkt, sel, now_ms, stake_req):
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "throttle_or_cap"})
+                    ok, why = state.can_place(mkt, sel, now_ms, stake_req)
+                    if not ok:
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": why})
                         continue
 
                     # level-1 quote
                     q_price, q_size = _opposing_best(r, side, have_back, have_lay, have_lists)
                     if not np.isfinite(q_price) or q_price <= 1.0 or q_size <= 0:
                         stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "no_quote"})
+                        continue
+
+                    # pick side-aware odds band (falls back to global bounds)
+                    if side == "back":
+                        omin = args.back_odds_min if args.back_odds_min is not None else args.odds_min
+                        omax = args.back_odds_max if args.back_odds_max is not None else args.odds_max
+                    else:
+                        omin = args.lay_odds_min if args.lay_odds_min is not None else args.odds_min
+                        omax = args.lay_odds_max if args.lay_odds_max is not None else args.odds_max
+                    if (q_price < omin) or (q_price > omax):
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "odds_band"})
                         continue
 
                     # tick snap + adverse slippage on NEW placement
@@ -600,6 +621,28 @@ def main():
                             px_exec = _step_ticks(px_exec, -abs(args.slip_ticks))  # worse for backer is lower odds
                         else:
                             px_exec = _step_ticks(px_exec, +abs(args.slip_ticks))  # worse for layer is higher odds
+
+                    # EV-at-execution gate (after snap/slip, with commission)
+                    p = float(r.get("p_hat", 0.0))
+                    if side == "back":
+                        ev_per_1 = p * (px_exec - 1.0) * (1.0 - args.commission) - (1.0 - p)
+                    else:
+                        ev_per_1 = (1.0 - p) * (1.0 - args.commission) - p * (px_exec - 1.0)
+                    if ev_per_1 < args.min_ev:
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel,
+                                                "event": "reject", "reason": "ev_below_threshold", "ev": ev_per_1, "px_exec": px_exec})
+                        continue
+
+                    # Per-bet caps
+                    stake_req = min(stake_req, args.max_stake_per_bet)
+                    if side == "lay":
+                        mult = max(px_exec - 1.0, 1e-9)  # liability = mult * stake
+                        max_stake_by_liab = args.max_liability_per_bet / mult
+                        if max_stake_by_liab <= 0:
+                            stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel,
+                                                    "event": "reject", "reason": "liability_cap_zero"})
+                            continue
+                        stake_req = min(stake_req, max_stake_by_liab)
 
                     # immediate fill at L1 (can be < min-stake): accept partials since stake_req >= min-stake
                     fill = min(stake_req, float(q_size))
