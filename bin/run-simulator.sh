@@ -41,7 +41,7 @@ BASE_ARGS=(
   --stake-cap-market 50
   --stake-cap-day 2000
   --max-exposure-day 5000
-  --days-before 1
+  --days-before 0
   --curated /mnt/nvme/betfair-curated
   --sport horse-racing
   --date "$DATE_ARG"

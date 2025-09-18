@@ -41,17 +41,31 @@ BASE_ARGS=(
   --stake-cap-market 50
   --stake-cap-day 2000
   --max-exposure-day 5000
-  --days-before 1
+
+  --days-before 0
   --curated /mnt/nvme/betfair-curated
   --sport horse-racing
   --date "$DATE_ARG"
-  --preoff-mins 180
+
+  # only simulate final 30 mins before off
+  --preoff-mins 30
+
   --min-edge 0.02
   --kelly 0.25
   --commission 0.05
   --top-n-per-market 1
   --side auto
+
+  # nice-to-have outputs (optional)
   --bets-out ./output/bets.csv
+  --agg-out ./output/bets_by_market.csv
+  --bin-out ./output/pnl_by_tto_bin.csv
+
+  # streaming realism (optional but recommended if you’re using the streaming sim)
+  --stream-bucket-secs 5
+  --latency-ms 300
+  --cooldown-secs 60
+  --place-until-mins 1
 )
 
 if [[ "$MODE" == "single" ]]; then
