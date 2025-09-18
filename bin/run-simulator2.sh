@@ -56,7 +56,7 @@ BASE_ARGS=(
 
 if [[ "$MODE" == "single" ]]; then
   echo "Running simulator in SINGLE-model mode with: $MODEL_PATH"
-  .venv/bin/python -m ml.sim --model "$MODEL_PATH" "${BASE_ARGS[@]}"
+  .venv/bin/python -m ml.sim2 --model "$MODEL_PATH" "${BASE_ARGS[@]}"
 else
   echo "Running simulator in DUAL-model mode with: ./output/model_30.json and ./output/model_180.json"
   .venv/bin/python -m ml.sim2 \
