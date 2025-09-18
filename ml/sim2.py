@@ -98,6 +98,50 @@ def _predict_proba(df: pl.DataFrame, booster: xgb.Booster, feature_cols: List[st
 
 
 # ----------------------------- betting helpers -----------------------------
+# --- Betfair tick ladder helpers ---
+
+# odds bands and tick sizes per Betfair ladder
+_TICK_BANDS = [
+    (1.01, 2.0, 0.01),
+    (2.0, 3.0, 0.02),
+    (3.0, 4.0, 0.05),
+    (4.0, 6.0, 0.1),
+    (6.0, 10.0, 0.2),
+    (10.0, 20.0, 0.5),
+    (20.0, 30.0, 1.0),
+    (30.0, 50.0, 2.0),
+    (50.0, 100.0, 5.0),
+    (100.0, 1000.0, 10.0),
+]
+
+
+def _tick_size(odds: float) -> float:
+    for lo, hi, step in _TICK_BANDS:
+        if lo <= odds < hi:
+            return step
+    return 10.0
+
+
+def _snap_to_tick(odds: float) -> float:
+    odds = max(1.01, min(1000.0, float(odds)))
+    step = _tick_size(odds)
+    lo = 1.01
+    # compute number of steps from floor of band start; approximate by rounding to nearest multiple
+    return round((odds - lo) / step) * step + lo
+
+
+def _step_ticks(odds: float, n: int) -> float:
+    # move n ticks across the ladder (positive increases odds)
+    if n == 0:
+        return _snap_to_tick(odds)
+    curr = _snap_to_tick(odds)
+    direction = 1 if n > 0 else -1
+    for _ in range(abs(n)):
+        step = _tick_size(curr)
+        curr += direction * step
+        curr = max(1.01, min(1000.0, curr))
+    return curr
+
 
 def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
     """
@@ -313,26 +357,30 @@ def _pnl_columns(bets: pl.DataFrame, commission: float) -> pl.DataFrame:
     """
     Compute PnL per bet including Betfair commission on winnings.
       - BACK:
-          win: (odds - 1) * stake * (1 - commission)
+          win: (odds_exec - 1) * stake * (1 - commission)
           lose: -stake
       - LAY:
           selection loses: stake * (1 - commission)
-          selection wins : -(odds - 1) * stake
+          selection wins : -(odds_exec - 1) * stake
+    Falls back to 'odds' if 'odds_exec' missing.
     """
     if bets.is_empty():
         return bets
 
-    back_win = (pl.col("odds") - 1.0) * pl.col("stake") * (1.0 - commission)
+    odds_col = pl.when(pl.col("odds_exec").is_not_null()).then(pl.col("odds_exec")).otherwise(pl.col("odds")).alias("_od")
+
+    back_win = (pl.col("_od") - 1.0) * pl.col("stake") * (1.0 - commission)
     back_lose = -pl.col("stake")
 
     lay_win = pl.col("stake") * (1.0 - commission)              # selection loses
-    lay_lose = -(pl.col("odds") - 1.0) * pl.col("stake")        # selection wins
+    lay_lose = -(pl.col("_od") - 1.0) * pl.col("stake")        # selection wins
 
     pnl_back = pl.when(pl.col("winLabel") == 1).then(back_win).otherwise(back_lose)
     pnl_lay = pl.when(pl.col("winLabel") == 0).then(lay_win).otherwise(lay_lose)
 
     pnl = pl.when(pl.col("side") == "back").then(pnl_back).otherwise(pnl_lay)
-    return bets.with_columns(pnl.alias("pnl"))
+    out = bets.with_columns([odds_col, pnl.alias("pnl")]).drop("_od")
+    return out
 
 
 def _binwise_pnl(bets: pl.DataFrame, edges: List[int]) -> pl.DataFrame:
@@ -405,7 +453,7 @@ class StreamState:
 # ----------------------------- main -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Streaming-style wagering sim from trained model(s).")
+    ap = argparse.ArgumentParser(description="Streaming-style wagering sim from trained model(s).").")
 
     # Mutually exclusive modes, defaults resolved at runtime:
     ap.add_argument("--model", help="Single model path (JSON).", default=None)
@@ -433,6 +481,11 @@ def main():
     ap.add_argument("--max-open-per-market", type=int, default=1, help="Throttle concurrent bets per market.")
     ap.add_argument("--max-exposure-day", type=float, default=1000.0, help="Cap total daily exposure (sum of stakes).")
     ap.add_argument("--place-until-mins", type=float, default=1.0, help="Stop placing when tto_minutes <= this (final minute freeze).")
+
+    # Execution realism
+    ap.add_argument("--min-stake", type=float, default=2.0, help="Minimum tradable stake; orders below are rejected.")
+    ap.add_argument("--tick-snap", action="store_true", help="Snap execution odds to Betfair tick ladder.")
+    ap.add_argument("--slip-ticks", type=int, default=1, help="Adverse slippage in ticks applied due to latency.").")
 
     # Selection & staking
     ap.add_argument("--label-col", default="winLabel")
@@ -569,26 +622,86 @@ def main():
             cands = _pick_topn_per_market(cands, args.top_n_per_market)
             cands = _cap_stakes(cands, cap_market=args.stake_cap_market, cap_day=args.stake_cap_day)
 
-            # Enforce streaming constraints: cooldown, open-per-market, exposure. Keep accepted only
+            # Enforce streaming constraints + execution realism (fills at L1 with slippage/tick-snap)
             if not cands.is_empty():
-                kept_mask = []
+                executed_rows = []
+
+                # choose columns for best quotes if present
+                cols = set(cands.columns)
+                have_back = {"bestBackOdds", "bestBackSize"}.issubset(cols)
+                have_lay = {"bestLayOdds", "bestLaySize"}.issubset(cols)
+                have_lists = {"backSizes", "laySizes"}.issubset(cols)
+
+                def _extract_best(row, side: str):
+                    # returns (price, size) at best level for the CONTRARY side
+                    if side == "back":
+                        # match against lays
+                        if have_lay:
+                            return float(row.get("bestLayOdds", row.get("odds", np.nan))), float(row.get("bestLaySize", np.inf))
+                        if have_lists:
+                            sizes = row.get("laySizes") or []
+                            size = float(sizes[0]) if sizes else float("inf")
+                            return float(row.get("odds", np.nan)), size
+                        return float(row.get("odds", np.nan)), float("inf")
+                    else:  # lay → match against backs
+                        if have_back:
+                            return float(row.get("bestBackOdds", row.get("odds", np.nan))), float(row.get("bestBackSize", np.inf))
+                        if have_lists:
+                            sizes = row.get("backSizes") or []
+                            size = float(sizes[0]) if sizes else float("inf")
+                            return float(row.get("odds", np.nan)), size
+                        return float(row.get("odds", np.nan)), float("inf")
+
                 for r in cands.iter_rows(named=True):
                     mkt = r["marketId"]
                     sel = int(r["selectionId"])
-                    stake = float(r.get("stake", 0.0))
-                    if stake <= 0:
-                        kept_mask.append(False)
+                    stake_req = float(r.get("stake", 0.0))
+                    side = r.get("side", "back")
+
+                    # throttle checks first
+                    if stake_req <= 0.0:
                         stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "zero_stake"})
                         continue
-                    if state.can_place(mkt, sel, now_ms, stake):
-                        kept_mask.append(True)
-                        state.register_bet(mkt, sel, now_ms, stake)
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "place", "stake": stake})
-                    else:
-                        kept_mask.append(False)
+                    if not state.can_place(mkt, sel, now_ms, stake_req):
                         stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "throttle_or_cap"})
-                if any(kept_mask):
-                    placed_rows.append(cands.filter(pl.Series(kept_mask)))
+                        continue
+
+                    # level-1 quote
+                    q_price, q_size = _extract_best(r, side)
+                    if not np.isfinite(q_price) or q_price <= 1.0:
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "no_quote"})
+                        continue
+
+                    # optional tick snap
+                    px_exec = _snap_to_tick(q_price) if args.tick_snap else float(q_price)
+
+                    # adverse slippage due to latency: move by +/− slip_ticks against us
+                    if args.slip_ticks != 0 and args.latency_ms > 0:
+                        if side == "back":
+                            # worse for backer is LOWER odds
+                            px_exec = _step_ticks(px_exec, -abs(args.slip_ticks))
+                        else:  # lay
+                            # worse for layer is HIGHER odds
+                            px_exec = _step_ticks(px_exec, +abs(args.slip_ticks))
+
+                    # enforce min stake and available size
+                    fill = min(stake_req, float(q_size))
+                    if fill < args.min_stake:
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "insufficient_size_or_below_min"})
+                        continue
+
+                    # accept and record
+                    state.register_bet(mkt, sel, now_ms, fill)
+                    row_out = {
+                        **{k: r.get(k) for k in r.keys()},
+                        "stake": fill,
+                        "odds_exec": px_exec,
+                    }
+                    executed_rows.append(row_out)
+                    stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "place", "stake": fill, "odds_exec": px_exec})
+
+                if executed_rows:
+                    placed_rows.append(pl.DataFrame(executed_rows))
 
         # settle markets that have effectively started (tto<=0) in this bucket
         finishers = arrivals.filter(pl.col("tto_minutes") <= 0)
