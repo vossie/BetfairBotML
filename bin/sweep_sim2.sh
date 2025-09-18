@@ -1,12 +1,15 @@
-cd /opt/BetfairBotML && cat > sweep_sim2.sh <<'SH'
+cd /opt/BetfairBotML
+rm -f sweep_sim2.sh
+cat > sweep_sim2.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 cd /opt/BetfairBotML
 
-# Module that DOES the whole sweep (load once, score once)
+# Module that runs the whole sweep (load once, score once)
 MODULE="${MODULE:-ml.sim2_all}"
 
-# Edit this grid or override: GRID='key=[...], key=[...]' ./sweep_sim2.sh
+# Edit this or override at call-time:
+#   GRID='side=[back,lay,auto], min_edge=[0.06:0.12:0.02], kelly=[0.05,0.1,0.25]' ./sweep_sim2.sh
 GRID="${GRID:-side=[auto], min_edge=[0.05:0.12:0.01], kelly=[0.05,0.10,0.15,0.25], min_ev=[0.02,0.03,0.05], odds_min=[1.5,1.6], odds_max=[4.0,5.0,6.0,8.0], max_stake_per_bet=[2,3], slip_ticks=[0,1,2]}"
 
 PYTHONPATH=. python -m "$MODULE" \
