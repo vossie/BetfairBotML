@@ -44,7 +44,7 @@ BASE_ARGS=(
   --days-before 1
   --curated /mnt/nvme/betfair-curated
   --sport horse-racing
-  --date "$DATE_ARG" --days 1
+  --date "$DATE_ARG"
   --preoff-mins 180
   --min-edge 0.02
   --kelly 0.25
