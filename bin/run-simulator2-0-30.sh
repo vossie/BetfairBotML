@@ -99,7 +99,7 @@ BASE_ARGS=(
 
 # Choose the Python entry point for the streaming sim.
 # If your single-model entry point is ml.sim2, change "ml.sim" to "ml.sim2" below.
-PY_ENTRY="ml.sim"
+PY_ENTRY="ml.sim2"
 
 # Prefer local venv, else fall back to system python
 if [[ -x ".venv/bin/python" ]]; then
