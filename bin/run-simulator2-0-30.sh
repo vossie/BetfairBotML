@@ -29,26 +29,7 @@ fi
 echo "Running streaming simulator (single-model) for date: ${DATE_ARG}"
 echo "Model: ${MODEL_PATH}"
 
-# execution & queueing
-MIN_STAKE=1.0
-SLIP_TICKS=0
-COOLDOWN_SECS=15
-PLACE_UNTIL=0
-MAX_OPEN_PER_MARKET=20
-PERSISTENCE=keep
-REST_SECS=5
-
-STAKE_CAP_MKT=100
-STAKE_CAP_DAY=2500
-MAX_EXPOSURE_DAY=5000
-
 PREOFF_MINS=30
-MIN_EDGE=0.05
-KELLY=0.25
-COMMISSION=0.05
-TOP_N=1
-SIDE=auto
-
 STREAM_BUCKET=5
 LATENCY_MS=300
 
@@ -58,6 +39,27 @@ SPORT="horse-racing"
 OUT_BETS="./output/bets.csv"
 OUT_AGG="./output/bets_by_market.csv"
 OUT_BIN="./output/pnl_by_tto_bin.csv"
+
+# execution & queueing
+MIN_STAKE=1.0
+SLIP_TICKS=1
+COOLDOWN_SECS=20
+PLACE_UNTIL=0
+MAX_OPEN_PER_MARKET=4
+PERSISTENCE=lapse
+REST_SECS=0
+
+# bankroll
+STAKE_CAP_MKT=20
+STAKE_CAP_DAY=1000
+MAX_EXPOSURE_DAY=1500
+
+# selection & sizing
+MIN_EDGE=0.07
+KELLY=0.25
+COMMISSION=0.05
+TOP_N=1
+SIDE=auto
 
 BASE_ARGS=(
   --stake-cap-market ${STAKE_CAP_MKT}
