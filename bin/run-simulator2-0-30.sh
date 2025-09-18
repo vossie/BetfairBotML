@@ -52,7 +52,7 @@ OUT_BETS="./output/bets.csv"
 OUT_AGG="./output/bets_by_market.csv"
 OUT_BIN="./output/pnl_by_tto_bin.csv"
 
-MIN_STAKE=2.0
+MIN_STAKE=1.0
 SLIP_TICKS=1
 
 BASE_ARGS=(
