@@ -1,10 +1,10 @@
-# ml/sim2.py — streaming simulator with simple execution realism
+# ml/sim2.py — streaming simulator with execution realism and safe empty-DF guards
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 import numpy as np
 import polars as pl
@@ -12,8 +12,10 @@ import xgboost as xgb
 
 from . import features
 
+
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def _outpath(p: str) -> str:
     pp = Path(p)
@@ -21,15 +23,12 @@ def _outpath(p: str) -> str:
         return str(pp)
     return str(OUTPUT_DIR / pp.name)
 
+
 def _daterange(end_date_str: str, days: int) -> List[str]:
     end = datetime.strptime(end_date_str, "%Y-%m-%d").date()
     start = end - timedelta(days=days - 1)
-    out: List[str] = []
-    d = start
-    while d <= end:
-        out.append(d.strftime("%Y-%m-%d"))
-        d += timedelta(days=1)
-    return out
+    return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+
 
 def _is_numeric_dtype(dt) -> bool:
     try:
@@ -40,6 +39,7 @@ def _is_numeric_dtype(dt) -> bool:
             pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
             pl.Float32, pl.Float64,
         }
+
 
 def _select_feature_cols(df: pl.DataFrame, label_col: str) -> List[str]:
     exclude = {
@@ -59,6 +59,7 @@ def _select_feature_cols(df: pl.DataFrame, label_col: str) -> List[str]:
         raise RuntimeError("No numeric feature columns found.")
     return cols
 
+
 def _load_booster(path: str) -> xgb.Booster:
     p = Path(path)
     if not p.exists() and not p.is_absolute():
@@ -69,6 +70,7 @@ def _load_booster(path: str) -> xgb.Booster:
     bst.load_model(str(p))
     return bst
 
+
 def _predict_proba(df: pl.DataFrame, booster: xgb.Booster, feature_cols: List[str]) -> np.ndarray:
     X = df.select(feature_cols).fill_null(strategy="mean").to_numpy().astype(np.float32, copy=False)
     dm = xgb.DMatrix(X)
@@ -77,7 +79,8 @@ def _predict_proba(df: pl.DataFrame, booster: xgb.Booster, feature_cols: List[st
         p = p[:, 1] if p.shape[1] > 1 else p.ravel()
     return p
 
-# --- Betfair tick ladder ---
+
+# --- Betfair tick ladder helpers ---
 _TICK_BANDS = [
     (1.01, 2.0, 0.01),
     (2.0, 3.0, 0.02),
@@ -90,17 +93,22 @@ _TICK_BANDS = [
     (50.0, 100.0, 5.0),
     (100.0, 1000.0, 10.0),
 ]
+
+
 def _tick_size(odds: float) -> float:
     for lo, hi, step in _TICK_BANDS:
         if lo <= odds < hi:
             return step
     return 10.0
+
+
 def _snap_to_tick(odds: float) -> float:
     odds = max(1.01, min(1000.0, float(odds)))
     step = _tick_size(odds)
-    # snap to nearest step from 1.01 baseline
     steps = round((odds - 1.01) / step)
     return round(1.01 + steps * step, 2)
+
+
 def _step_ticks(odds: float, n: int) -> float:
     curr = _snap_to_tick(odds)
     if n == 0:
@@ -108,16 +116,16 @@ def _step_ticks(odds: float, n: int) -> float:
     direction = 1 if n > 0 else -1
     for _ in range(abs(n)):
         s = _tick_size(curr)
-        curr += direction * s
-        curr = max(1.01, min(1000.0, curr))
+        curr = max(1.01, min(1000.0, curr + direction * s))
     return round(curr, 2)
+
 
 def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
     if "p_hat" not in df.columns:
         raise RuntimeError("p_hat missing. Score the dataframe first.")
-    if "ltp" not in df.columns and "odds" not in df.columns:
+    src = "ltp" if "ltp" in df.columns else ("odds" if "odds" in df.columns else None)
+    if not src:
         raise RuntimeError("ltp/odds missing for implied prob.")
-    src = "ltp" if "ltp" in df.columns else "odds"
     out = df.with_columns([
         pl.when(pl.col(src) > 1.0).then(pl.col(src)).otherwise(None).alias("odds"),
     ]).drop_nulls(["odds"])
@@ -140,11 +148,13 @@ def _edge_columns(df: pl.DataFrame, side: str = "auto") -> pl.DataFrame:
         ])
     return out
 
+
 def _kelly_stake_units(p: np.ndarray, odds: np.ndarray, frac: float) -> np.ndarray:
     b = np.maximum(odds - 1.0, 1e-9)
     q = 1.0 - p
     f = frac * (b * p - q) / b
     return np.clip(f, 0.0, 1.0)
+
 
 def _build_bets_table(df: pl.DataFrame, label_col: str, min_edge: float, kelly_frac: float, side_mode: str) -> pl.DataFrame:
     df2 = _edge_columns(df, side=side_mode).filter(pl.col("edge") >= min_edge)
@@ -156,12 +166,13 @@ def _build_bets_table(df: pl.DataFrame, label_col: str, min_edge: float, kelly_f
         pl.col(label_col).alias("winLabel"),
     ])
     keep = [
-        "sport","marketId","selectionId","publishTimeMs","tto_minutes",
-        "odds","implied_prob","p_hat","edge","side","stake_unit","winLabel",
-        "bestBackOdds","bestBackSize","bestLayOdds","bestLaySize","backSizes","laySizes",
+        "sport", "marketId", "selectionId", "publishTimeMs", "tto_minutes",
+        "odds", "implied_prob", "p_hat", "edge", "side", "stake_unit", "winLabel",
+        "bestBackOdds", "bestBackSize", "bestLayOdds", "bestLaySize", "backSizes", "laySizes",
     ]
     have = [c for c in keep if c in df2.columns]
     return df2.select(have)
+
 
 def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
     if bets.is_empty():
@@ -174,28 +185,32 @@ def _pick_topn_per_market(bets: pl.DataFrame, top_n: int) -> pl.DataFrame:
             pl.arange(0, length_expr()).over("marketId").alias("rank_in_market"),
         )
         .filter(pl.col("rank_in_market") < top_n)
-        .drop(["n_in_market","rank_in_market"])
+        .drop(["n_in_market", "rank_in_market"])
     )
+
 
 def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.DataFrame:
     if bets.is_empty():
         return bets
+
     with_priority = bets.with_columns([
         (pl.col("edge") if "edge" in bets.columns else pl.lit(0.0)).alias("_priority_edge"),
         pl.col("stake_unit").alias("_priority_stake_unit"),
     ])
+
     mkt_sum = with_priority.group_by("marketId").agg(pl.sum("stake_unit").alias("_sum_mkt"))
     b1 = (
         with_priority.join(mkt_sum, on="marketId", how="left")
         .with_columns([
             pl.when(pl.col("_sum_mkt") > 0)
-              .then(pl.min_horizontal([pl.lit(1.0), pl.lit(cap_market) / pl.col("_sum_mkt")]))
-              .otherwise(pl.lit(0.0))
-              .alias("_mkt_scale")
+             .then(pl.min_horizontal([pl.lit(1.0), pl.lit(cap_market) / pl.col("_sum_mkt")]))
+             .otherwise(pl.lit(0.0))
+             .alias("_mkt_scale")
         ])
         .with_columns([(pl.col("stake_unit") * pl.col("_mkt_scale")).alias("_stake_mkt")])
-        .drop("_sum_mkt","_mkt_scale")
+        .drop("_sum_mkt", "_mkt_scale")
     )
+
     b2 = b1.with_columns([
         pl.when(pl.col("_stake_mkt") <= 0.0).then(0.0)
         .when(pl.col("_stake_mkt") < 1.0).then(1.0)
@@ -203,7 +218,7 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
     ])
 
     def _renorm_group(df: pl.DataFrame, cap: float) -> pl.DataFrame:
-        df = df.sort(by=["_priority_edge","_priority_stake_unit"], descending=[True, True])
+        df = df.sort(by=["_priority_edge", "_priority_stake_unit"], descending=[True, True])
         stake = df["_stake_floor"].to_numpy().astype(float)
         pos = stake > 0
         n_pos = int(pos.sum())
@@ -232,35 +247,37 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float) -> pl.Dat
     else:
         parts = []
         for mkt in b2.select("marketId").unique().to_series().to_list():
-            parts.append(_renorm_group(b2.filter(pl.col("marketId")==mkt), cap_market))
+            parts.append(_renorm_group(b2.filter(pl.col("marketId") == mkt), cap_market))
         b3 = pl.concat(parts, how="vertical")
 
-    b4 = b3.with_columns([(pl.col("publishTimeMs") // (1000*60*60*24)).alias("_day_bucket")])
+    b4 = b3.with_columns([(pl.col("publishTimeMs") // (1000 * 60 * 60 * 24)).alias("_day_bucket")])
     if hasattr(b4.group_by("_day_bucket"), "map_groups"):
         b5 = b4.group_by("_day_bucket", maintain_order=True).map_groups(lambda g: _renorm_group(g, cap_day))
     else:
         parts = []
         for day in b4.select("_day_bucket").unique().to_series().to_list():
-            parts.append(_renorm_group(b4.filter(pl.col("_day_bucket")==day), cap_day))
+            parts.append(_renorm_group(b4.filter(pl.col("_day_bucket") == day), cap_day))
         b5 = pl.concat(parts, how="vertical")
 
-    out = b5.rename({"_stake_grouped":"stake"}).drop(
-        "_priority_edge","_priority_stake_unit","_stake_mkt","_stake_floor","_day_bucket"
+    out = b5.rename({"_stake_grouped": "stake"}).drop(
+        "_priority_edge", "_priority_stake_unit", "_stake_mkt", "_stake_floor", "_day_bucket"
     )
     return out
+
 
 def _pnl_columns(bets: pl.DataFrame, commission: float) -> pl.DataFrame:
     if bets.is_empty():
         return bets
-    odds_col = pl.when(pl.col("odds_exec").is_not_null()).then(pl.col("odds_exec")).otherwise(pl.col("odds")).alias("_od")
-    back_win = (pl.col("_od") - 1.0) * pl.col("stake") * (1.0 - commission)
+    odds_col = pl.col("odds_exec") if "odds_exec" in bets.columns else pl.col("odds")
+    back_win = (odds_col - 1.0) * pl.col("stake") * (1.0 - commission)
     back_lose = -pl.col("stake")
     lay_win = pl.col("stake") * (1.0 - commission)
-    lay_lose = -(pl.col("_od") - 1.0) * pl.col("stake")
+    lay_lose = -(odds_col - 1.0) * pl.col("stake")
     pnl_back = pl.when(pl.col("winLabel") == 1).then(back_win).otherwise(back_lose)
     pnl_lay = pl.when(pl.col("winLabel") == 0).then(lay_win).otherwise(lay_lose)
     pnl = pl.when(pl.col("side") == "back").then(pnl_back).otherwise(pnl_lay)
-    return bets.with_columns([odds_col, pnl.alias("pnl")]).drop("_od")
+    return bets.with_columns(pnl.alias("pnl"))
+
 
 class StreamState:
     def __init__(self, cooldown_secs: int, max_open_per_market: int, max_exposure_day: float, latency_ms: int):
@@ -268,9 +285,10 @@ class StreamState:
         self.max_open_per_market = max_open_per_market
         self.max_exposure_day = max_exposure_day
         self.latency_ms = latency_ms
-        self.last_bet_ts: Dict[Tuple[str,int], int] = {}
-        self.open_count_by_market: Dict[str,int] = {}
+        self.last_bet_ts: Dict[Tuple[str, int], int] = {}
+        self.open_count_by_market: Dict[str, int] = {}
         self.exposure_day: float = 0.0
+
     def can_place(self, mkt: str, sel: int, now_ms: int, stake: float) -> bool:
         key = (mkt, sel)
         last = self.last_bet_ts.get(key)
@@ -281,19 +299,24 @@ class StreamState:
         if self.exposure_day + stake > self.max_exposure_day:
             return False
         return True
+
     def register_bet(self, mkt: str, sel: int, now_ms: int, stake: float):
         self.last_bet_ts[(mkt, sel)] = now_ms
         self.open_count_by_market[mkt] = self.open_count_by_market.get(mkt, 0) + 1
         self.exposure_day += stake
+
     def settle_market(self, mkt: str):
         self.open_count_by_market[mkt] = 0
 
+
 def main():
     ap = argparse.ArgumentParser(description="Streaming-style wagering sim from trained model(s).")
+    # Mode
     ap.add_argument("--model", help="Single model path (JSON).", default=None)
     ap.add_argument("--model-30", help="Short-horizon model path.", default=None)
     ap.add_argument("--model-180", help="Long-horizon model path.", default=None)
     ap.add_argument("--gate-mins", type=float, default=45.0, help="Boundary: <=gate uses model-30; >gate uses model-180.")
+    # Data
     ap.add_argument("--curated", required=True)
     ap.add_argument("--sport", required=True)
     ap.add_argument("--date", required=True, help="End date (YYYY-MM-DD) to run up to (inclusive).")
@@ -318,7 +341,7 @@ def main():
     ap.add_argument("--min-edge", type=float, default=0.02)
     ap.add_argument("--kelly", type=float, default=0.25)
     ap.add_argument("--commission", type=float, default=0.05)
-    ap.add_argument("--side", choices=["back","lay","auto"], default="auto")
+    ap.add_argument("--side", choices=["back", "lay", "auto"], default="auto")
     ap.add_argument("--top-n-per-market", type=int, default=1)
     ap.add_argument("--stake-cap-market", type=float, default=50.0)
     ap.add_argument("--stake-cap-day", type=float, default=2000.0)
@@ -330,6 +353,7 @@ def main():
 
     args = ap.parse_args()
 
+    # Resolve mode
     single = args.model is not None
     dual = (args.model_30 is not None) or (args.model_180 is not None)
     if single and dual:
@@ -338,7 +362,8 @@ def main():
         m1 = OUTPUT_DIR / "xgb_model.json"
         if not m1.exists():
             raise SystemExit("No model path provided and default ./output/xgb_model.json not found")
-        args.model = str(m1); single = True
+        args.model = str(m1)
+        single = True
 
     booster_single = booster_30 = booster_180 = None
     if single:
@@ -349,12 +374,11 @@ def main():
         booster_30 = _load_booster(args.model_30)
         booster_180 = _load_booster(args.model_180)
 
-    days_total = int(args.days_before) + 1
-    dates = _daterange(args.date, days_total)
-
+    # Build features
+    dates = _daterange(args.date, int(args.days_before) + 1)
     df_parts: List[pl.DataFrame] = []
     for i in range(0, len(dates), args.chunk_days):
-        dchunk = dates[i:i+args.chunk_days]
+        dchunk = dates[i:i + args.chunk_days]
         df_c, _ = features.build_features_streaming(
             curated_root=args.curated,
             sport=args.sport,
@@ -365,12 +389,20 @@ def main():
         )
         if not df_c.is_empty():
             df_parts.append(df_c)
+
     if not df_parts:
-        raise SystemExit("No features produced for given date range.")
+        # Graceful empty run
+        print("No features produced for given date range.")
+        pl.DataFrame({"marketId": [], "n_bets": [], "stake_total": [], "pnl_total": []}).write_csv(_outpath(args.agg_out))
+        pl.DataFrame({"tto_bin": [], "n_bets": [], "stake": [], "pnl": []}).write_csv(_outpath(args.bin_out))
+        pl.DataFrame([]).write_csv(_outpath(args.bets_out))
+        return
+
     df_feat = pl.concat(df_parts, how="vertical", rechunk=True)
 
+    # Stream clock buckets
     bucket_ms = max(1, int(args.stream_bucket_secs)) * 1000
-    df_feat = df_feat.sort(["publishTimeMs","marketId","selectionId"]).with_columns(
+    df_feat = df_feat.sort(["publishTimeMs", "marketId", "selectionId"]).with_columns(
         (pl.col("publishTimeMs") // bucket_ms).alias("_bucket")
     )
 
@@ -379,7 +411,7 @@ def main():
             return arrivals
         if dual:
             early = arrivals.filter(pl.col("tto_minutes") > args.gate_mins)
-            late  = arrivals.filter(pl.col("tto_minutes") <= args.gate_mins)
+            late = arrivals.filter(pl.col("tto_minutes") <= args.gate_mins)
             parts = []
             if not early.is_empty():
                 fcols = _select_feature_cols(early, args.label_col)
@@ -405,25 +437,31 @@ def main():
     placed_rows: List[pl.DataFrame] = []
     stream_log_rows: List[Dict] = []
 
-    for bucket_id, arrivals in df_feat.group_by("_bucket", maintain_order=True):
+    for _, arrivals in df_feat.group_by("_bucket", maintain_order=True):
         arrivals = arrivals.drop("_bucket")
         now_ms = int(arrivals["publishTimeMs"].max()) + args.latency_ms
+
+        # stop placing very late
         arrivals = arrivals.filter(pl.col("tto_minutes") > args.place_until_mins)
         if not arrivals.is_empty():
             scored = _score_arrivals(arrivals)
+
+            # candidate bets
             cands = _build_bets_table(scored, label_col=args.label_col, min_edge=args.min_edge, kelly_frac=args.kelly, side_mode=args.side)
             cands = _pick_topn_per_market(cands, args.top_n_per_market)
             cands = _cap_stakes(cands, cap_market=args.stake_cap_market, cap_day=args.stake_cap_day)
 
+            # execution realism (L1 fill, tick-snap, slippage, min-stake)
             if not cands.is_empty():
                 executed_rows = []
                 cols = set(cands.columns)
-                have_back = {"bestBackOdds","bestBackSize"}.issubset(cols)
-                have_lay  = {"bestLayOdds","bestLaySize"}.issubset(cols)
-                have_lists = {"backSizes","laySizes"}.issubset(cols)
+                have_back = {"bestBackOdds", "bestBackSize"}.issubset(cols)
+                have_lay = {"bestLayOdds", "bestLaySize"}.issubset(cols)
+                have_lists = {"backSizes", "laySizes"}.issubset(cols)
 
                 def _extract_best(row, side: str):
                     if side == "back":
+                        # match against lays
                         if have_lay:
                             return float(row.get("bestLayOdds", row.get("odds", np.nan))), float(row.get("bestLaySize", np.inf))
                         if have_lists:
@@ -432,6 +470,7 @@ def main():
                             return float(row.get("odds", np.nan)), size
                         return float(row.get("odds", np.nan)), float("inf")
                     else:
+                        # lay → match against backs
                         if have_back:
                             return float(row.get("bestBackOdds", row.get("odds", np.nan))), float(row.get("bestBackSize", np.inf))
                         if have_lists:
@@ -441,55 +480,95 @@ def main():
                         return float(row.get("odds", np.nan)), float("inf")
 
                 for r in cands.iter_rows(named=True):
-                    mkt = r["marketId"]; sel = int(r["selectionId"]); side = r.get("side","back")
+                    mkt = r["marketId"]
+                    sel = int(r["selectionId"])
+                    side = r.get("side", "back")
                     stake_req = float(r.get("stake", 0.0))
+
+                    # throttles
                     if stake_req <= 0:
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event":"reject","reason":"zero_stake"})
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "zero_stake"})
                         continue
                     if not state.can_place(mkt, sel, now_ms, stake_req):
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event":"reject","reason":"throttle_or_cap"})
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "throttle_or_cap"})
                         continue
 
+                    # level-1 quote
                     q_price, q_size = _extract_best(r, side)
                     if not np.isfinite(q_price) or q_price <= 1.0:
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event":"reject","reason":"no_quote"})
-                        continue
-                    px_exec = _snap_to_tick(q_price) if args.tick_snap else float(q_price)
-                    if args.slip_ticks != 0 and args.latency_ms > 0:
-                        px_exec = _step_ticks(px_exec, -abs(args.slip_ticks)) if side == "back" else _step_ticks(px_exec, +abs(args.slip_ticks))
-                    fill = min(stake_req, float(q_size))
-                    if fill < args.min_stake:
-                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event":"reject","reason":"insufficient_size_or_below_min"})
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "no_quote"})
                         continue
 
+                    # tick snap + adverse slippage
+                    px_exec = _snap_to_tick(q_price) if args.tick_snap else float(q_price)
+                    if args.slip_ticks != 0 and args.latency_ms > 0:
+                        if side == "back":
+                            px_exec = _step_ticks(px_exec, -abs(args.slip_ticks))  # worse for backer is lower odds
+                        else:
+                            px_exec = _step_ticks(px_exec, +abs(args.slip_ticks))  # worse for layer is higher odds
+
+                    # fill size (partial allowed), then min stake
+                    fill = min(stake_req, float(q_size))
+                    if fill < args.min_stake:
+                        stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "reject", "reason": "insufficient_size_or_below_min"})
+                        continue
+
+                    # accept
                     state.register_bet(mkt, sel, now_ms, fill)
                     r_out = {**{k: r.get(k) for k in r.keys()}, "stake": fill, "odds_exec": px_exec}
                     executed_rows.append(r_out)
-                    stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event":"place","stake": fill, "odds_exec": px_exec})
+                    stream_log_rows.append({"publishTimeMs": now_ms, "marketId": mkt, "selectionId": sel, "event": "place", "stake": fill, "odds_exec": px_exec})
+
                 if executed_rows:
                     placed_rows.append(pl.DataFrame(executed_rows))
 
-        # settle using arrivals only for this bucket
+        # settle markets that have started (using arrivals of this bucket)
         finishers = arrivals.filter(pl.col("tto_minutes") <= 0)
         if not finishers.is_empty():
             for mkt in finishers.select("marketId").unique().to_series().to_list():
                 state.settle_market(mkt)
 
-    bets = pl.concat(placed_rows, how="vertical") if placed_rows else pl.DataFrame([])
-    bets = _pnl_columns(bets, commission=args.commission)
+    # Build bets df with known schema even if empty
+    if placed_rows:
+        bets = pl.concat(placed_rows, how="vertical")
+    else:
+        bets = pl.DataFrame(schema={
+            "marketId": pl.Utf8,
+            "selectionId": pl.Int64,
+            "publishTimeMs": pl.Int64,
+            "tto_minutes": pl.Float64,
+            "side": pl.Utf8,
+            "stake": pl.Float64,
+            "odds": pl.Float64,
+            "odds_exec": pl.Float64,
+            "winLabel": pl.Int64,
+            "pnl": pl.Float64,
+        })
 
-    agg = (
-        bets.group_by("marketId")
-        .agg([pl.len().alias("n_bets"), pl.sum("stake").alias("stake_total"), pl.sum("pnl").alias("pnl_total")])
-        .sort("marketId")
-    )
+    if not bets.is_empty():
+        bets = _pnl_columns(bets, commission=args.commission)
+    else:
+        # ensure pnl exists
+        if "pnl" not in bets.columns:
+            bets = bets.with_columns(pl.lit(None).cast(pl.Float64).alias("pnl"))
 
-    edges = [0,30,60,90,120,180]
+    # Per-market aggregation (safe on empty)
+    if bets.is_empty():
+        agg = pl.DataFrame({"marketId": [], "n_bets": [], "stake_total": [], "pnl_total": []})
+    else:
+        agg = (
+            bets.group_by("marketId")
+            .agg([pl.len().alias("n_bets"), pl.sum("stake").alias("stake_total"), pl.sum("pnl").alias("pnl_total")])
+            .sort("marketId")
+        )
+
+    # Binwise pnl (safe on empty)
+    edges = [0, 30, 60, 90, 120, 180]
     if not bets.is_empty() and "tto_minutes" in bets.columns:
-        labels = [f"{edges[i]:02d}-{edges[i+1]:02d}" for i in range(len(edges)-1)]
+        labels = [f"{edges[i]:02d}-{edges[i+1]:02d}" for i in range(len(edges) - 1)]
         expr = pl.when((pl.col("tto_minutes") > edges[0]) & (pl.col("tto_minutes") <= edges[1])).then(pl.lit(labels[0]))
-        for i in range(1,len(labels)):
-            lo,hi = edges[i], edges[i+1]
+        for i in range(1, len(labels)):
+            lo, hi = edges[i], edges[i + 1]
             expr = expr.when((pl.col("tto_minutes") > lo) & (pl.col("tto_minutes") <= hi)).then(pl.lit(labels[i]))
         expr = expr.otherwise(pl.lit(None)).alias("tto_bin")
         tmp = bets.with_columns(expr)
@@ -499,8 +578,9 @@ def main():
             .sort("tto_bin")
         )
     else:
-        bin_pnl = pl.DataFrame({"tto_bin":[], "n_bets":[], "stake":[], "pnl":[]})
+        bin_pnl = pl.DataFrame({"tto_bin": [], "n_bets": [], "stake": [], "pnl": []})
 
+    # Write outputs
     bets_out = _outpath(args.bets_out)
     agg_out = _outpath(args.agg_out)
     bin_out = _outpath(args.bin_out)
@@ -516,12 +596,14 @@ def main():
     stake_sum = float(bets["stake"].sum()) if total_bets else 0.0
     pnl_sum = float(bets["pnl"].sum()) if total_bets else 0.0
     roi = (pnl_sum / stake_sum) if stake_sum > 0 else 0.0
+
     print(f"Saved bets to {bets_out}")
     print(f"Saved per-market aggregation to {agg_out}")
     print(f"Saved binwise pnl to {bin_out}")
     if stream_log_rows:
         print(f"Saved stream log to {log_out}")
     print(f"Summary: n_bets={total_bets} stake={stake_sum:.2f} pnl={pnl_sum:.2f} ROI={roi:.3%}")
+
 
 if __name__ == "__main__":
     main()
