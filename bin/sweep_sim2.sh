@@ -49,6 +49,8 @@ for MIN_EDGE in 0.05 0.07 0.10; do
       --max-stake-per-bet 3.0 \
       --max-liability-per-bet 20.0 \
       --min-ev 0.03 2>&1)
+      --sweep-grid "side=[auto], min_edge=[0.05:0.12:0.01], kelly=[0.05,0.10,0.15,0.25], min_ev=[0.02,0.03,0.05], odds_min=[1.5,1.6], odds_max=[6.0,8.0], max_stake_per_bet=[2,3], slip_ticks=[0,1,2]" \
+      --sweep-parallel 0
     LINE=$(echo "$LOG" | grep -E 'Summary: n_bets=' | tail -n1) || true
     if [[ -z "${LINE:-}" ]]; then
       echo "WARN: No summary parsed for combo $i" >&2
