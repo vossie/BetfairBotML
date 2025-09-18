@@ -225,7 +225,7 @@ def _cap_stakes(bets: pl.DataFrame, cap_market: float, cap_day: float, min_floor
         with_priority.join(mkt_sum, on="marketId", how="left")
         .with_columns([
             pl.when(pl.col("_sum_mkt") > 0)
-             .then(pl.min_horizontal([pl.lit(1.0), pl.lit(cap_market) / pl.col("_sum_mkt")]))
+             .then((pl.lit(cap_market) / pl.col("_sum_mkt")))
              .otherwise(pl.lit(0.0))
              .alias("_mkt_scale")
         ])
