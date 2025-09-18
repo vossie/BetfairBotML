@@ -10,7 +10,7 @@ import numpy as np
 import polars as pl
 import xgboost as xgb
 
-from . import features
+from ml import features
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

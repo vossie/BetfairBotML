@@ -4,3 +4,4 @@
 /output/*.csv
 *.idea*
 ml/__pycache__/*
+/ml/.ipynb_checkpoints/

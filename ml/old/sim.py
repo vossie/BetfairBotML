@@ -10,7 +10,7 @@ import numpy as np
 import polars as pl
 import xgboost as xgb
 
-from . import features
+from ml import features
 
 # ----------------------------- constants & IO helpers -----------------------------
 
