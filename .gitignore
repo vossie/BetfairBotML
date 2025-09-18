@@ -2,3 +2,4 @@
 /bin/set-env-vars-prod.sh
 /output/*.json
 *.idea*
+ml/__pycache__/*
