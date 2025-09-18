@@ -3,7 +3,7 @@ cd /opt/BetfairBotML && cat > sweep_sim2.sh <<'SH'
 set -euo pipefail
 cd /opt/BetfairBotML
 
-# Use ml.sim2 by default; change to ml.sim2_all if you prefer
+# Use ml.sim2 by default; set MODULE=ml.sim2_all to target that module.
 MODULE="${MODULE:-ml.sim2}"
 
 OUT="./output/sweep_results.csv"
@@ -49,8 +49,6 @@ for MIN_EDGE in 0.05 0.07 0.10; do
       --max-stake-per-bet 3.0 \
       --max-liability-per-bet 20.0 \
       --min-ev 0.03 2>&1)
-      --sweep-grid "side=[auto], min_edge=[0.05:0.12:0.01], kelly=[0.05,0.10,0.15,0.25], min_ev=[0.02,0.03,0.05], odds_min=[1.5,1.6], odds_max=[6.0,8.0], max_stake_per_bet=[2,3], slip_ticks=[0,1,2]" \
-      --sweep-parallel 0
     LINE=$(echo "$LOG" | grep -E 'Summary: n_bets=' | tail -n1) || true
     if [[ -z "${LINE:-}" ]]; then
       echo "WARN: No summary parsed for combo $i" >&2
@@ -60,13 +58,13 @@ for MIN_EDGE in 0.05 0.07 0.10; do
     STAKE=$(echo "$LINE" | awk -F'[ =]+' '{for(i=1;i<=NF;i++) if($i=="stake"){print $(i+1); exit}}' | tr -d ',')
     PNL=$(echo "$LINE" | awk -F'[ =]+' '{for(i=1;i<=NF;i++) if($i=="pnl"){print $(i+1); exit}}' | tr -d ',')
     ROI=$(echo "$LINE" | awk -F'ROI=' '{print $2}' | tr -d '% ')
+
     echo "$i,$MIN_EDGE,$KELLY,$NBETS,$STAKE,$PNL,$ROI" >> "$OUT"
   done
 done
 
 echo
 echo "=== BEST BY ROI ==="
-# print header + best row (highest ROI)
 { head -n1 "$OUT"; tail -n +2 "$OUT" | sort -t, -k7,7nr | head -n1; }
 SH
 chmod +x sweep_sim2.sh
