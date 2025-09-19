@@ -20,8 +20,8 @@ for p in "${DATASETS[@]}"; do
   DEST="${DEST_ROOT}/${BUCKET}/${p}/sport=${SPORT}/date=${DATE}/"
 
   echo "Preparing destination $DEST ..."
-  sudo mkdir -p "$DEST"
-  sudo chown -R "$USER:$USER" "$DEST"
+  mkdir -p "$DEST"
+  chown -R "$USER:$USER" "$DEST"
 
   echo "Syncing $SRC -> $DEST"
   mc mirror --overwrite --preserve "$SRC" "$DEST"
