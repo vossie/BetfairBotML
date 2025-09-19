@@ -2,9 +2,9 @@
 """
 Temporal trainer with two heads (value + price-move), CUDA default, and no-leak labels.
 - Validation window: [ASOF-1, ASOF]; Train: last --train-days ending at (ASOF-2)
-- Uses pm_labels.add_price_move_labels (BACKWARD as-of at t+h with tight tolerance)
 - Robust value backtest knobs: RAW/CAL, (no) sum-to-one, overround comparator, per-market topK,
-  flat/Kelly stakes, LTP range filter, and ROI-by-odds table for taken trades.
+  flat/Kelly stakes, LTP range filter, ROI-by-odds table, Back/Lay/Both recommendations CSV,
+  and PM threshold sweep (precision/recall/F1/N/avg future ticks).
 """
 from __future__ import annotations
 
@@ -159,7 +159,7 @@ def _roi_by_odds_table(ltp: np.ndarray, y: np.ndarray, profit: np.ndarray) -> Li
         out.append({"lo": lo, "hi": hi, "n": n, "hit": hit, "roi": roi})
     return out
 
-# ----------------------------- value backtest -----------------------------
+# ----------------------------- value backtest (with recos & sides) -----------------------------
 def backtest_value(
     df: pl.DataFrame,
     p_model: np.ndarray,
@@ -167,7 +167,7 @@ def backtest_value(
     edge_thresh: float,
     do_sum_to_one: bool,
     market_prob_mode: str,    # "ltp" | "overround"
-    per_market_topk: int,     # e.g. 1 or 2 (TOTAL across sides)
+    per_market_topk: int,     # total across sides
     stake_mode: str,          # "flat" | "kelly"
     kelly_cap: float,
     ltp_min: float,
@@ -176,14 +176,13 @@ def backtest_value(
 ) -> Dict[str, object]:
     """
     Select trades per market (top-K by edge) for back, lay, or both.
-    Returns metrics + roi_by_odds + recos list with indices into the filtered array.
-    Lay model: edge_lay = p_market - p_model; select when > threshold.
+    Lay edge = p_market - p_model; Back edge = p_model - p_market.
     Profit model:
       Back: win => (odds-1)*(1-comm); lose => -1
       Lay:  lose => +1*(1-comm);       win  => -(odds-1)
     Stakes:
       - flat: stake=1.0 for all
-      - kelly: supported for BACK only (capped). For LAY we keep flat (kelly disabled).
+      - kelly: supported for BACK only (capped). For LAY we keep flat.
     """
     assert side in {"back", "lay", "both"}
 
@@ -222,10 +221,10 @@ def backtest_value(
             if s > 0:
                 p[idxs] = p[idxs] / s
 
-    edge_back = p - pm           # want > +threshold
-    edge_lay  = pm - p           # want > +threshold
+    edge_back = p - pm           # > threshold -> back
+    edge_lay  = pm - p           # > threshold -> lay
 
-    # Build per-market candidate list [(idx, edge, side_str)]
+    # Per-market candidate list [(idx, edge, side_str)]
     take_mask = np.zeros_like(p, dtype=bool)
     take_side = np.empty_like(p, dtype=object)
 
@@ -244,7 +243,6 @@ def backtest_value(
 
         if not cand:
             continue
-        # pick top-K by edge magnitude (already positive)
         cand.sort(key=lambda t: t[1], reverse=True)
         for idx, _e, sd in cand[:per_market_topk]:
             take_mask[idx] = True
@@ -255,7 +253,6 @@ def backtest_value(
                 "roi_by_odds": [], "recos": []}
 
     # Stakes
-    # Back Kelly (cap), Lay Kelly -> disabled => flat
     stake = np.ones(int(take_mask.sum()), dtype=float)
     sel_idx = np.where(take_mask)[0]
     sel_side = take_side[take_mask]
@@ -263,10 +260,10 @@ def backtest_value(
     sel_l = l[take_mask]
     sel_y = y[take_mask]
     sel_pm = pm[take_mask]
-    sel_edge_back = sel_p - sel_pm  # useful for logging
+    sel_edge_back = sel_p - sel_pm  # for logging
 
     if stake_mode == "kelly":
-        # for BACK only
+        # apply only for BACK selections; LAY remains flat
         for i in range(len(stake)):
             if sel_side[i] == "back":
                 dec = sel_l[i]
@@ -276,7 +273,6 @@ def backtest_value(
                 f = np.clip(np.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0), 0.0, kelly_cap)
                 stake[i] = float(f)
             else:
-                # lay -> keep flat
                 stake[i] = 1.0
 
     # Profit per bet
@@ -286,36 +282,42 @@ def backtest_value(
         if sel_side[i] == "back":
             profit[i] = (dec - 1.0) * (1.0 - commission) * stake[i] if sel_y[i] == 1 else -1.0 * stake[i]
         else:  # lay
-            # we "win" if runner loses
             profit[i] = (1.0 - commission) * stake[i] if sel_y[i] == 0 else -(dec - 1.0) * stake[i]
 
     n = len(stake)
     roi = float(profit.sum() / (n if stake_mode == "flat" else max(1.0, stake.sum())))
-    hit_rate = float((sel_y == 1).mean())  # for mixed sides this is just "winLabel" rate, mainly diagnostic
+    hit_rate = float((sel_y == 1).mean())
     avg_edge = float(np.mean(sel_edge_back[sel_side == "back"])) if np.any(sel_side == "back") else float("nan")
 
-    # Per-odds ROI table (use decimal odds = sel_l)
+    # ROI-by-odds table
     roi_tbl = _roi_by_odds_table(sel_l, sel_y, profit)
 
-    # Emit recos (indices map the filtered arrays; we output absolute values)
-    recos = []
-    # map back to original df slice (finite & price_ok)
+    # Build recommendation rows (absolute indices back to df)
+    # Map chosen indices back to original df indices
     base_mask = np.zeros_like(p_model, dtype=bool); base_mask[finite] = True
     base_idx = np.where(base_mask)[0]
-    price_idx = np.where(price_ok)[0]
-    abs_idx = base_idx[price_idx][sel_idx]
+    price_mask = np.zeros_like(base_idx, dtype=bool); price_mask[:] = True  # we rebuilt arrays; reconstruct mapping:
+    # reconstruct price_ok mapping in finite space
+    finite_idx = base_idx
+    l_finite = ltp[finite]
+    price_ok_all = (l_finite >= ltp_min) & (l_finite <= ltp_max)
+    price_idx = finite_idx[price_ok_all]
+    abs_idx = price_idx[sel_idx]
 
+    recos = []
+    mkt = df["marketId"].to_numpy()
+    selid = df["selectionId"].to_numpy()
     for i in range(n):
+        ai = int(abs_idx[i])
         recos.append({
-            "abs_idx": int(abs_idx[i]),
-            "marketId": str(df["marketId"][abs_idx[i]]),
-            "selectionId": int(df["selectionId"][abs_idx[i]]),
+            "marketId": str(mkt[ai]),
+            "selectionId": int(selid[ai]),
             "ltp": float(sel_l[i]),
             "side": str(sel_side[i]),
             "stake": float(stake[i]),
             "p_model": float(sel_p[i]),
             "p_market": float(sel_pm[i]),
-            "edge_back": float(sel_edge_back[i]),
+            "edge_back": float(sel_edge_back[i]),  # positive means model>market
         })
 
     return {
@@ -327,7 +329,7 @@ def backtest_value(
         "recos": recos,
     }
 
-# ----------------------------- metrics -----------------------------
+# ----------------------------- metrics & PM sweep -----------------------------
 def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     eps = 1e-12
     p_clip = np.clip(p, eps, 1 - eps)
@@ -344,10 +346,7 @@ def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     return {"logloss": float(logloss), "auc": float(auc)}
 
 def _pm_threshold_sweep(p: np.ndarray, y: np.ndarray, fut_ticks: np.ndarray) -> None:
-    """
-    Print precision/recall/F1/N/avg_future_move for p_pm_up at thresholds 0.50..0.90.
-    y is binary {0,1}; fut_ticks is pm_delta_ticks (float).
-    """
+    """Print precision/recall/F1/N/avg_future_move for p_pm_up at thresholds 0.50..0.90."""
     ths = np.arange(0.50, 0.95, 0.05)  # 0.50, 0.55, ..., 0.90
     pos = (y == 1)
     n_pos = int(pos.sum())
@@ -407,6 +406,7 @@ def train_temporal(
     kelly_cap: float,
     ltp_min: float,
     ltp_max: float,
+    side: str,
 ) -> None:
     asof = _parse_date(asof_date)
     plan = build_split(asof, train_days)
@@ -511,11 +511,12 @@ def train_temporal(
         kelly_cap=kelly_cap,
         ltp_min=ltp_min,
         ltp_max=ltp_max,
+        side=side,
     )
     print("[Backtest @ validation — value]")
     print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
 
-    # Tiny ROI-by-odds table
+    # ROI-by-odds table
     roi_tbl = pnl.get("roi_by_odds", [])
     if roi_tbl:
         print("\n[Value head — ROI by decimal odds bucket]")
@@ -523,6 +524,16 @@ def train_temporal(
         for row in roi_tbl:
             lo, hi, n, hit, roi = row["lo"], row["hi"], row["n"], row["hit"], row["roi"]
             print(f"  [{lo:4.2f},{hi:6.2f})  {n:5d}  {hit:5.3f}  {roi:6.3f}")
+
+    # Save recommendations from validation as a CSV (action plan)
+    recs = pnl.get("recos", [])
+    if recs:
+        rec_df = pl.DataFrame(recs).select([
+            "marketId","selectionId","ltp","side","stake","p_model","p_market","edge_back"
+        ])
+        rec_file = OUTPUT_DIR / f"edge_recos_valid_{asof_date}_T{train_days}.csv"
+        rec_df.write_csv(str(rec_file))
+        print(f"\nSaved recommendations → {rec_file}")
 
     # -------- price-move head (short horizon) --------
     ytr_pm = df_train["pm_up"].to_numpy().astype(np.float32)
@@ -590,7 +601,7 @@ def train_temporal(
 def main():
     ap = argparse.ArgumentParser(description=(
         "Temporal split with 2-day validation, value+price heads, calibration, robust value backtest, "
-        "LTP filtering, PM threshold sweep, and ROI-by-odds reporting."
+        "LTP filtering, PM threshold sweep, ROI-by-odds, and recos CSV."
     ))
     # Data
     ap.add_argument("--curated", required=True, help="/mnt/nvme/betfair-curated or s3://bucket")
@@ -625,7 +636,7 @@ def main():
     ap.add_argument("--market-prob", choices=["ltp", "overround"], default="overround",
                     help="Comparator prob: raw LTP implied or overround-normalized within market")
     ap.add_argument("--per-market-topk", type=int, default=1,
-                    help="Take top-K edges per market that exceed threshold (default 1)")
+                    help="Take top-K edges per market that exceed threshold (total across sides)")
     ap.add_argument("--stake", choices=["flat", "kelly"], default="flat",
                     help="Stake model for backtest")
     ap.add_argument("--kelly-cap", type=float, default=0.05,
@@ -634,6 +645,8 @@ def main():
                     help="Minimum decimal odds to include in backtest")
     ap.add_argument("--ltp-max", type=float, default=1000.0,
                     help="Maximum decimal odds to include in backtest")
+    ap.add_argument("--side", choices=["back","lay","both"], default="back",
+                    help="Trade side selection policy for backtest and recos")
 
     args = ap.parse_args()
 
@@ -663,6 +676,7 @@ def main():
         kelly_cap=args.kelly_cap,
         ltp_min=args.ltp_min,
         ltp_max=args.ltp_max,
+        side=args.side,
     )
 
 if __name__ == "__main__":
