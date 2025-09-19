@@ -411,6 +411,7 @@ def train_temporal(
     ltp_min: float,
     ltp_max: float,
     side: str,
+    bankroll_nom: float,
 ) -> None:
     asof = _parse_date(asof_date)
     plan = build_split(asof, train_days)
@@ -537,11 +538,17 @@ def train_temporal(
         by_side = rec_df_all.group_by("side").agg([
             pl.len().alias("n"),
             pl.mean("edge_back").alias("avg_edge"),
-            pl.mean("stake").alias("avg_stake"),
+            pl.mean("stake").alias("avg_stake_frac"),
         ])
         print("\n[Backtest — side summary]")
         for row in by_side.iter_rows(named=True):
-            print(f"  side={row['side']:>4}  n={row['n']:>5}  avg_edge={row['avg_edge']:.4f}  avg_stake={row['avg_stake']:.3f}")
+            stake_frac = float(row["avg_stake_frac"])
+            stake_gbp = stake_frac * bankroll_nom
+            print(
+                f"  side={row['side']:>4}  n={row['n']:>5}  "
+                f"avg_edge={row['avg_edge']:.4f}  "
+                f"avg_stake_frac={stake_frac:.4f}  avg_stake_gbp=£{stake_gbp:.2f}"
+            )
 
         rec_df = rec_df_all.select([
             "marketId","selectionId","ltp","side","stake","p_model","p_market","edge_back"
@@ -575,7 +582,7 @@ def train_temporal(
         flat_roi = flat_profit / flat_gross if flat_gross > 0 else float("nan")
 
         # Kelly (nominal £1000), same cap as backtest
-        bankroll_nom = 1000.0
+
         kelly_fraction = 1.0   # set <1 for fractional Kelly
         stake_floor = 0.0      # e.g. 5.0 to avoid tiny stakes
         cap = float(kelly_cap)
@@ -713,6 +720,8 @@ def main():
                     help="Maximum decimal odds to include in backtest")
     ap.add_argument("--side", choices=["back","lay","both"], default="back",
                     help="Trade side selection policy for backtest and recos")
+    ap.add_argument("--bankroll-nom", type=float, default=1000.0,
+                    help="Nominal bankroll used for Kelly reporting/comparison & stake prints")
 
     args = ap.parse_args()
 
@@ -743,6 +752,7 @@ def main():
         ltp_min=args.ltp_min,
         ltp_max=args.ltp_max,
         side=args.side,
+        bankroll_nom=args.bankroll_nom,
     )
 
 if __name__ == "__main__":

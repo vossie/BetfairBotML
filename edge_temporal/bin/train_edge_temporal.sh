@@ -56,6 +56,8 @@ KELLY_CAP="${KELLY_CAP:-0.05}"               # max Kelly fraction (if STAKE=kell
 PM_HORIZON_SECS="${PM_HORIZON_SECS:-300}"
 PM_TICK_THRESHOLD="${PM_TICK_THRESHOLD:-1}"
 PM_SLACK_SECS="${PM_SLACK_SECS:-3}"
+BANKROLL_NOM="${BANKROLL_NOM:-1000}"
+
 
 # Device
 DEVICE="${DEVICE:-cuda}"
@@ -141,4 +143,5 @@ python3 "${ML_PY}" \
   --ltp-min "${LTP_MIN}" \
   --ltp-max "${LTP_MAX}" \
   --side "${SIDE}" \
-  --device "${DEVICE}"
+  --device "${DEVICE}" \
+  --bankroll-nom "${BANKROLL_NOM}" \
