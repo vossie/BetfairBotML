@@ -100,14 +100,25 @@ def _select_feature_cols(df: pl.DataFrame, label_cols: List[str]) -> List[str]:
     exclude = {
         "marketId", "selectionId", "ts", "ts_ms", "publishTimeMs",
         "runnerStatus", *label_cols,
+        "ltpTick_fut", "ltp_fut", "ts_s_right", "ts_s_join", "future_delta_sec",
     }
     cols: List[str] = []
     for name, dtype in df.schema.items():
-        if name in exclude:
+        lname = name.lower()
+        if (
+            name in exclude
+            or "label" in lname
+            or "target" in lname
+            or lname.startswith("pm_")
+            or lname.endswith("_fut")
+            or lname.endswith("_join")
+            or lname.endswith("_right")
+            or "future" in lname
+        ):
             continue
-        if "label" in name.lower() or "target" in name.lower():
-            continue
-        if _isnum(dtype):
+        if dtype in {pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+                     pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+                     pl.Float32, pl.Float64}:
             cols.append(name)
     if not cols:
         raise RuntimeError("No numeric feature columns found after exclusions.")
