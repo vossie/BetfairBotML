@@ -182,7 +182,7 @@ def add_price_move_labels(
         right_on="ts_s_right",
         strategy="backward",
         by=["marketId", "selectionId"],
-        tolerance=2 * horizon_secs,
+        tolerance=0,  # <- make this ZERO
     )
 
     if "ltpTick" in base.columns:
