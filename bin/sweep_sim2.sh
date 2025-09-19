@@ -1,21 +1,15 @@
-cd /opt/BetfairBotML
-rm -f sweep_sim2.sh
-cat > sweep_sim2.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 cd /opt/BetfairBotML
 
-# Module that runs the WHOLE sweep (loads once, scores once)
 MODULE="${MODULE:-ml.sim2_all}"
-
-# Grid for the sweep (edit here or override with: GRID='key=[...], key=[...]' ./sweep_sim2.sh)
 GRID="${GRID:-side=[auto], min_edge=[0.05:0.12:0.01], kelly=[0.05,0.10,0.15,0.25], min_ev=[0.02,0.03,0.05], odds_min=[1.5,1.6], odds_max=[4.0,5.0,6.0,8.0], max_stake_per_bet=[2,3], slip_ticks=[0,1,2]}"
 
 PYTHONPATH=. python -m "$MODULE" \
   --model ./output/xgb_model.json \
   --curated /mnt/nvme/betfair-curated \
   --sport horse-racing \
-  --date 2025-09-17 \
+  --date 2025-09-18 \
   --days-before 1 \
   --preoff-mins 30 \
   --stream-bucket-secs 5 \
@@ -47,8 +41,3 @@ PYTHONPATH=. python -m "$MODULE" \
   --min-ev 0.03 \
   --sweep-grid "$GRID" \
   --sweep-parallel 0
-SH
-# guard against Windows CRLF; ignore if dos2unix isn't installed
-dos2unix sweep_sim2.sh 2>/dev/null || true
-chmod +x sweep_sim2.sh
-./sweep_sim2.sh
