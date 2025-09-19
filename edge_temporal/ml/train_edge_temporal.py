@@ -421,7 +421,7 @@ def main():
     ap.add_argument("--downsample-secs", type=int, default=0)
 
     # Model
-    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="cuda")
     ap.add_argument("--label-col", default="winLabel")
     ap.add_argument("--n-estimators", type=int, default=2000)
     ap.add_argument("--learning-rate", type=float, default=0.03)
