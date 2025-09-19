@@ -48,7 +48,7 @@ PM_SLACK_SECS="${PM_SLACK_SECS:-3}"
 PER_MARKET_TOPK="${PER_MARKET_TOPK:-2}"     # good balance of N and quality
 STAKE="${STAKE:-flat}"                      # keep flat until we confirm stability
 KELLY_CAP="${KELLY_CAP:-0.05}"              # ignored unless STAKE=kelly
-
+SIDE="${SIDE:-back}"
 
 # ---- args ----
 if [[ $# -lt 1 ]]; then
@@ -134,4 +134,6 @@ python3 "${ML_PY}" \
   --kelly-cap "${KELLY_CAP}" \
   --ltp-min "${LTP_MIN}" \
   --ltp-max "${LTP_MAX}" \
-  --device cuda
+  --device cuda \
+  --side "${SIDE}"
+

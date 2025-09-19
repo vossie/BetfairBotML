@@ -167,98 +167,164 @@ def backtest_value(
     edge_thresh: float,
     do_sum_to_one: bool,
     market_prob_mode: str,    # "ltp" | "overround"
-    per_market_topk: int,     # e.g. 1 or 2
+    per_market_topk: int,     # e.g. 1 or 2 (TOTAL across sides)
     stake_mode: str,          # "flat" | "kelly"
     kelly_cap: float,
     ltp_min: float,
     ltp_max: float,
+    side: str = "back",       # "back" | "lay" | "both"
 ) -> Dict[str, object]:
+    """
+    Select trades per market (top-K by edge) for back, lay, or both.
+    Returns metrics + roi_by_odds + recos list with indices into the filtered array.
+    Lay model: edge_lay = p_market - p_model; select when > threshold.
+    Profit model:
+      Back: win => (odds-1)*(1-comm); lose => -1
+      Lay:  lose => +1*(1-comm);       win  => -(odds-1)
+    Stakes:
+      - flat: stake=1.0 for all
+      - kelly: supported for BACK only (capped). For LAY we keep flat (kelly disabled).
+    """
+    assert side in {"back", "lay", "both"}
+
     pim = df["implied_prob"].to_numpy()
-    market_ids = df["marketId"].to_numpy()
+    mids = df["marketId"].to_numpy()
     y = df["winLabel"].to_numpy().astype(int)
     ltp = df["ltp"].to_numpy()
+
     finite = np.isfinite(p_model) & np.isfinite(pim) & np.isfinite(ltp)
-
     if finite.sum() == 0:
-        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"), "roi_by_odds": []}
+        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"),
+                "roi_by_odds": [], "recos": []}
 
+    # base slice
     p = p_model[finite].copy()
-    pim_f = pim[finite].copy()
-    mids = market_ids[finite]
+    pm = pim[finite].copy()
+    m = mids[finite]
     y = y[finite]
-    ltp = ltp[finite]
+    l = ltp[finite]
 
-    # LTP filter BEFORE selection
-    price_ok = (ltp >= ltp_min) & (ltp <= ltp_max)
+    # LTP filter
+    price_ok = (l >= ltp_min) & (l <= ltp_max)
     if not price_ok.any():
-        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"), "roi_by_odds": []}
-    p = p[price_ok]
-    pim_f = pim_f[price_ok]
-    mids = mids[price_ok]
-    y = y[price_ok]
-    ltp = ltp[price_ok]
+        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"),
+                "roi_by_odds": [], "recos": []}
+    p, pm, m, y, l = p[price_ok], pm[price_ok], m[price_ok], y[price_ok], l[price_ok]
 
     # Comparator probability
     if market_prob_mode == "overround":
-        pim_f = _overround_adjust(pim_f, mids)
+        pm = _overround_adjust(pm, m)
 
-    # Optional normalization of model probs by market
+    # Optional normalize model probs within market
     if do_sum_to_one:
-        for idxs in _group_indices(mids):
+        for idxs in _group_indices(m):
             s = p[idxs].sum()
             if s > 0:
                 p[idxs] = p[idxs] / s
 
-    edge = p - pim_f
+    edge_back = p - pm           # want > +threshold
+    edge_lay  = pm - p           # want > +threshold
 
-    # Per-market selection: top-K edges above threshold
-    take = np.zeros_like(edge, dtype=bool)
-    for idxs in _group_indices(mids):
-        ei = edge[idxs]
-        cand = np.where(ei > edge_thresh)[0]
-        if cand.size == 0:
+    # Build per-market candidate list [(idx, edge, side_str)]
+    take_mask = np.zeros_like(p, dtype=bool)
+    take_side = np.empty_like(p, dtype=object)
+
+    for idxs in _group_indices(m):
+        cand = []
+
+        if side in {"back", "both"}:
+            cb = np.where(edge_back[idxs] > edge_thresh)[0]
+            for ii in cb:
+                cand.append((idxs[ii], float(edge_back[idxs][ii]), "back"))
+
+        if side in {"lay", "both"}:
+            cl = np.where(edge_lay[idxs] > edge_thresh)[0]
+            for ii in cl:
+                cand.append((idxs[ii], float(edge_lay[idxs][ii]), "lay"))
+
+        if not cand:
             continue
-        top = cand[np.argsort(ei[cand])[-per_market_topk:]]
-        mask = np.zeros_like(ei, dtype=bool)
-        mask[top] = True
-        take[idxs] = mask
+        # pick top-K by edge magnitude (already positive)
+        cand.sort(key=lambda t: t[1], reverse=True)
+        for idx, _e, sd in cand[:per_market_topk]:
+            take_mask[idx] = True
+            take_side[idx] = sd
 
-    if take.sum() == 0:
-        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan), "roi_by_odds": []}
+    if take_mask.sum() == 0:
+        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan),
+                "roi_by_odds": [], "recos": []}
 
     # Stakes
-    if stake_mode == "flat":
-        stake = np.ones_like(p[take], dtype=float)
-    else:
-        dec = _decimal_odds_from_ltp(ltp[take])
-        b = (dec - 1.0) * (1.0 - commission)
-        q = 1.0 - p[take]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            f = (b * p[take] - q) / np.where(b == 0, np.nan, b)
-        f = np.clip(np.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0), 0.0, kelly_cap)
-        stake = f
+    # Back Kelly (cap), Lay Kelly -> disabled => flat
+    stake = np.ones(int(take_mask.sum()), dtype=float)
+    sel_idx = np.where(take_mask)[0]
+    sel_side = take_side[take_mask]
+    sel_p = p[take_mask]
+    sel_l = l[take_mask]
+    sel_y = y[take_mask]
+    sel_pm = pm[take_mask]
+    sel_edge_back = sel_p - sel_pm  # useful for logging
+
+    if stake_mode == "kelly":
+        # for BACK only
+        for i in range(len(stake)):
+            if sel_side[i] == "back":
+                dec = sel_l[i]
+                b = (dec - 1.0) * (1.0 - commission)
+                q = 1.0 - sel_p[i]
+                f = (b * sel_p[i] - q) / (b if b != 0 else 1e-12)
+                f = np.clip(np.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0), 0.0, kelly_cap)
+                stake[i] = float(f)
+            else:
+                # lay -> keep flat
+                stake[i] = 1.0
 
     # Profit per bet
-    dec = _decimal_odds_from_ltp(ltp[take])
-    win_prof = stake * (dec - 1.0) * (1.0 - commission)
-    loss_prof = -stake
-    profit = np.where(y[take] == 1, win_prof, loss_prof)
+    profit = np.zeros_like(stake, dtype=float)
+    for i in range(len(stake)):
+        dec = sel_l[i]
+        if sel_side[i] == "back":
+            profit[i] = (dec - 1.0) * (1.0 - commission) * stake[i] if sel_y[i] == 1 else -1.0 * stake[i]
+        else:  # lay
+            # we "win" if runner loses
+            profit[i] = (1.0 - commission) * stake[i] if sel_y[i] == 0 else -(dec - 1.0) * stake[i]
 
-    n = int(take.sum())
-    if stake_mode == "flat":
-        roi = float(profit.sum() / max(1, n))  # per 1-unit bet
-    else:
-        roi = float(profit.sum() / max(1.0, stake.sum()))
+    n = len(stake)
+    roi = float(profit.sum() / (n if stake_mode == "flat" else max(1.0, stake.sum())))
+    hit_rate = float((sel_y == 1).mean())  # for mixed sides this is just "winLabel" rate, mainly diagnostic
+    avg_edge = float(np.mean(sel_edge_back[sel_side == "back"])) if np.any(sel_side == "back") else float("nan")
 
-    # Build tiny ROI-by-odds table on taken trades
-    roi_table = _roi_by_odds_table(dec, y[take], profit)
+    # Per-odds ROI table (use decimal odds = sel_l)
+    roi_tbl = _roi_by_odds_table(sel_l, sel_y, profit)
+
+    # Emit recos (indices map the filtered arrays; we output absolute values)
+    recos = []
+    # map back to original df slice (finite & price_ok)
+    base_mask = np.zeros_like(p_model, dtype=bool); base_mask[finite] = True
+    base_idx = np.where(base_mask)[0]
+    price_idx = np.where(price_ok)[0]
+    abs_idx = base_idx[price_idx][sel_idx]
+
+    for i in range(n):
+        recos.append({
+            "abs_idx": int(abs_idx[i]),
+            "marketId": str(df["marketId"][abs_idx[i]]),
+            "selectionId": int(df["selectionId"][abs_idx[i]]),
+            "ltp": float(sel_l[i]),
+            "side": str(sel_side[i]),
+            "stake": float(stake[i]),
+            "p_model": float(sel_p[i]),
+            "p_market": float(sel_pm[i]),
+            "edge_back": float(sel_edge_back[i]),
+        })
 
     return {
         "n_trades": n,
         "roi": roi,
-        "hit_rate": float(y[take].mean()),
-        "avg_edge": float(edge[take].mean()),
-        "roi_by_odds": roi_table,
+        "hit_rate": hit_rate,
+        "avg_edge": avg_edge,
+        "roi_by_odds": roi_tbl,
+        "recos": recos,
     }
 
 # ----------------------------- metrics -----------------------------
