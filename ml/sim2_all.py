@@ -110,8 +110,7 @@ def _parse_grid_spec(grid_str: str, args_ns: argparse.Namespace) -> Dict[str, Li
 
 # ------------------ Main ------------------
 def main():
-    # let Polars format nicely; threads set via env in launcher
-    pl.Config.set_global_string_cache(True)
+
     pl.Config.set_tbl_rows(100)
     pl.Config.set_fmt_str_lengths(120)
 
