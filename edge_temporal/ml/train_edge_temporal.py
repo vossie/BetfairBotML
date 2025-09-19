@@ -154,25 +154,51 @@ def _sum_to_one_by_market(probs: np.ndarray, market_ids: np.ndarray) -> np.ndarr
     return probs
 
 
-def backtest_value(df: pl.DataFrame, p_raw: np.ndarray, commission: float, edge_thresh: float) -> Dict[str, float]:
-    market_ids = df["marketId"].to_numpy()
-    p = _sum_to_one_by_market(p_raw, market_ids)
+def backtest_value(
+    df: pl.DataFrame,
+    p_model: np.ndarray,
+    commission: float,
+    edge_thresh: float,
+    do_sum_to_one: bool,
+) -> Dict[str, float]:
+    # align and mask finite rows
     pim = df["implied_prob"].to_numpy()
-    edge = p - pim
+    finite = np.isfinite(p_model) & np.isfinite(pim)
+
+    if finite.sum() == 0:
+        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan")}
+
+    p = p_model[finite].copy()
+    pim_f = pim[finite]
+    market_ids = df["marketId"].to_numpy()[finite]
+    y = df["winLabel"].to_numpy().astype(int)[finite]
+    ltp = df["ltp"].to_numpy()[finite]
+
+    # optional sum-to-one normalization (can compress edges)
+    if do_sum_to_one:
+        for m in np.unique(market_ids):
+            mask = (market_ids == m)
+            s = p[mask].sum()
+            if s > 0:
+                p[mask] /= s
+
+    edge = p - pim_f
     sel = edge > edge_thresh
+
     if sel.sum() == 0:
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan)}
-    ltp = df["ltp"].to_numpy()
-    y = df["winLabel"].to_numpy().astype(int)
+
     profit = np.where(y == 1, (ltp - 1.0) * (1.0 - commission), -1.0)
     pnl = profit[sel].sum()
     n = int(sel.sum())
+
     return {
         "n_trades": n,
         "roi": float(pnl / n),
         "hit_rate": float(y[sel].mean()),
         "avg_edge": float(edge[sel].mean()),
     }
+
 
 
 # ----------------------------- FS guards -----------------------------
@@ -399,6 +425,9 @@ def main():
     ap.add_argument("--pm-horizon-secs", type=int, default=60, help="Short-horizon seconds for price-move label")
     ap.add_argument("--pm-tick-threshold", type=int, default=1, help="Minimum future move in ticks to label as 1")
     ap.add_argument("--pm-slack-secs", type=int, default=3, help="Tolerance slack around horizon for asof join")
+
+    ap.add_argument("--edge-prob", choices=["raw", "cal"], default="cal", help="Use raw or calibrated probabilities for edge calc")
+    ap.add_argument("--no-sum-to-one", action="store_true", help="Disable per-market sum-to-one normalization in backtest")
 
     args = ap.parse_args()
 
