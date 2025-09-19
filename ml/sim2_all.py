@@ -1,9 +1,11 @@
 from __future__ import annotations
-import argparse, itertools, os, time
+import argparse, itertools, os, time, io
+from contextlib import redirect_stdout
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import polars as pl
+import re
 
 from .sim2 import (
     simulate_once,
@@ -40,8 +42,12 @@ def _ensure_worker_init(ipc_path: Optional[str], model_paths: Dict[str, Optional
         if _BOOSTER_180 is None and _MODEL_PATHS.get("model_180"):
             _BOOSTER_180 = _load_booster(_MODEL_PATHS["model_180"])
 
+_SUMMARY_RE = re.compile(
+    r"Summary:\s*n_bets=(?P<n_bets>-?\d+)\s+stake=(?P<stake>-?\d+(?:\.\d+)?)\s+pnl=(?P<pnl>-?\d+(?:\.\d+)?)\s+ROI=(?P<roi>-?\d+(?:\.\d+)?)%"
+)
+
 def _run_combo(task):
-    """Worker: run a single parameter combo."""
+    """Worker: run a single parameter combo. Capture stdout -> parse Summary line."""
     (idx, keys, vals, args_dict, ipc_path, model_paths) = task
     _ensure_worker_init(ipc_path, model_paths)
 
@@ -54,9 +60,26 @@ def _run_combo(task):
     else:
         bs = None; b30 = _BOOSTER_30; b180 = _BOOSTER_180
 
-    summary = simulate_once(a, _DF_IPC_CACHE, bs, b30, b180,
-                            out_prefix=f"combo_{idx}", write_bets=False)
-    return {"combo": idx, **{k: v for k, v in zip(keys, vals)}, **summary}
+    # Run and capture the Summary line that simulate_once prints
+    buf = io.StringIO()
+    try:
+        with redirect_stdout(buf):
+            simulate_once(a, _DF_IPC_CACHE, bs, b30, b180)
+    except Exception as e:
+        # return a failed row so the sweep continues
+        return {"combo": idx, **{k:v for k,v in zip(keys, vals)}, "n_bets": 0, "stake": 0.0, "pnl": 0.0, "roi": 0.0, "status": f"fail:{type(e).__name__}"}
+
+    out = buf.getvalue()
+    m = _SUMMARY_RE.search(out)
+    if not m:
+        # no summary printed, still return a row
+        return {"combo": idx, **{k:v for k,v in zip(keys, vals)}, "n_bets": 0, "stake": 0.0, "pnl": 0.0, "roi": 0.0, "status": "nosummary"}
+
+    n_bets = int(m.group("n_bets"))
+    stake  = float(m.group("stake"))
+    pnl    = float(m.group("pnl"))
+    roi    = float(m.group("roi")) / 100.0
+    return {"combo": idx, **{k:v for k,v in zip(keys, vals)}, "n_bets": n_bets, "stake": stake, "pnl": pnl, "roi": roi, "status": "ok"}
 
 # ------------------ Grid parsing helpers ------------------
 def _coerce_like(example: Any, s: str) -> Any:
@@ -110,9 +133,12 @@ def _parse_grid_spec(grid_str: str, args_ns: argparse.Namespace) -> Dict[str, Li
 
 # ------------------ Main ------------------
 def main():
-
-    pl.Config.set_tbl_rows(100)
-    pl.Config.set_fmt_str_lengths(120)
+    # Polars pretty printing (methods available on 1.33)
+    try:
+        pl.Config.set_tbl_rows(100)
+        pl.Config.set_fmt_str_lengths(120)
+    except Exception:
+        pass
 
     ap = argparse.ArgumentParser(description="Load-once, score-once parameter sweep to find best combo (by ROI).")
     # models
