@@ -226,6 +226,31 @@ def backtest_value(
         "avg_edge": float(edge[take].mean()),
     }
 
+def _pm_threshold_sweep(p: np.ndarray, y: np.ndarray, fut_ticks: np.ndarray) -> None:
+    """
+    Print precision/recall/F1/N/avg_future_move for p_pm_up at thresholds 0.50..0.90.
+    y is binary {0,1}; fut_ticks is pm_delta_ticks (float).
+    """
+    ths = np.arange(0.50, 0.95, 0.05)  # 0.50, 0.55, ..., 0.90
+    pos = (y == 1)
+    n_pos = int(pos.sum())
+    print("\n[PM threshold sweep]")
+    print("  th   N_sel  precision  recall   F1     avg_move_ticks")
+    for th in ths:
+        sel = (p >= th)
+        n_sel = int(sel.sum())
+        if n_sel == 0 or n_pos == 0:
+            prec = rec = f1 = 0.0
+            avg_mv = float("nan")
+        else:
+            tp = int((sel & pos).sum())
+            prec = tp / n_sel
+            rec  = tp / n_pos
+            f1   = 0.0 if (prec + rec) == 0 else (2 * prec * rec) / (prec + rec)
+            avg_mv = float(np.mean(fut_ticks[sel])) if n_sel else float("nan")
+        print(f"  {th:0.2f}  {n_sel:6d}   {prec:8.3f}  {rec:6.3f}  {f1:6.3f}   {avg_mv:14.2f}")
+
+
 # ----------------------------- metrics -----------------------------
 def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     eps = 1e-12
@@ -405,6 +430,14 @@ def train_temporal(
     print(f"\n[Price-move head: horizon={pm_horizon_secs}s, threshold={pm_tick_threshold}t]")
     print(f"  logloss={metrics_pm['logloss']:.4f} auc={metrics_pm['auc']:.3f}  acc@0.5={acc:.3f}")
     print(f"  taken_signals={taken}  hit_rate={hit_up:.3f}  avg_future_move_ticks={avg_move_ticks:.2f}")
+
+    # PM threshold sweep for quick operating-point selection
+    _pm_threshold_sweep(
+        p=p_valid_pm,
+        y=yva_pm.astype(int),
+        fut_ticks=df_valid["pm_delta_ticks"].to_numpy()
+    )
+
 
     # Save artifacts
     value_name = f"edge_value_xgb_{preoff_minutes}m_{asof_date}_T{train_days}.json"
