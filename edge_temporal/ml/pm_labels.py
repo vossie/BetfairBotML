@@ -91,6 +91,14 @@ def add_price_move_labels(
         tolerance=tol,
     )
 
+    # keep only futures that are close to the target horizon
+    # delta_sec = (t+h) - matched_future_time  ∈ [0, slack_secs]
+    joined = joined.with_columns(
+        (pl.col("ts_s_join") - pl.col("ts_s_right")).alias("future_delta_sec")
+    ).filter(
+        (pl.col("future_delta_sec") >= 0) & (pl.col("future_delta_sec") <= slack_secs)
+    )
+
     # compute delta in ticks (or approximate from ltp buckets)
     if use_ticks:
         delta_ticks = (pl.col("ltpTick_fut") - pl.col("ltpTick"))
