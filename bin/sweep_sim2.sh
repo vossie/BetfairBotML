@@ -1,27 +1,14 @@
-#!/usr/bin/env bash
-set -euo pipefail
 cd /opt/BetfairBotML
+# Let Polars use all cores; prevent BLAS oversubscription
+export POLARS_MAX_THREADS=$(nproc)
+export RAYON_NUM_THREADS=$(nproc)
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 
-# Use all cores unless overridden
-CORES=${CORES:-$(nproc)}
-
-# Let Polars/Rayon use all cores (and avoid MKL/OpenMP oversubscription)
-export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$CORES}"
-export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$CORES}"
-export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
-export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
-export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
-
-MODULE="${MODULE:-ml.sim2_all}"
-GRID="${GRID:-side=[auto], min_edge=[0.05:0.12:0.01], kelly=[0.05,0.10,0.15,0.25], min_ev=[0.02,0.03,0.05], odds_min=[1.5,1.6], odds_max=[4.0,5.0,6.0,8.0], max_stake_per_bet=[2,3], slip_ticks=[0,1,2]}"
-
-echo "Running with CORES=$CORES, POLARS_MAX_THREADS=$POLARS_MAX_THREADS"
-PYTHONPATH=. python -m "$MODULE" \
+PYTHONPATH=. python -m ml.sim2_all \
   --model ./output/xgb_model.json \
   --curated /mnt/nvme/betfair-curated \
   --sport horse-racing \
-  --date 2025-09-17 \
+  --date 2025-09-18 \
   --days-before 1 \
   --preoff-mins 30 \
   --stream-bucket-secs 5 \
@@ -51,5 +38,5 @@ PYTHONPATH=. python -m "$MODULE" \
   --min-edge 0.08 \
   --kelly 0.10 \
   --min-ev 0.03 \
-  --sweep-grid "$GRID" \
-  --sweep-parallel "${SWEEP_PARALLEL:-$CORES}"
+  --sweep-grid "side=[auto], min_edge=[0.05:0.12:0.01], kelly=[0.05,0.10,0.15,0.25], min_ev=[0.02,0.03,0.05], odds_min=[1.5,1.6], odds_max=[4.0,5.0,6.0,8.0], max_stake_per_bet=[2,3], slip_ticks=[0,1,2]" \
+  --sweep-parallel 0
