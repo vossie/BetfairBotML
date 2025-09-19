@@ -108,6 +108,12 @@ echo
 # ---- run Python ----
 export PYTHONPATH="${ML_ROOT}/ml:${PYTHONPATH:-}"
 
+# ... keep existing content ...
+
+LTP_MIN="${LTP_MIN:-1.01}"
+LTP_MAX="${LTP_MAX:-1000}"
+
+# ---- run Python ----
 python3 "${ML_PY}" \
   --curated "${CURATED_ROOT}" \
   --sport "${SPORT}" \
@@ -126,4 +132,6 @@ python3 "${ML_PY}" \
   --per-market-topk "${PER_MARKET_TOPK}" \
   --stake "${STAKE}" \
   --kelly-cap "${KELLY_CAP}" \
+  --ltp-min "${LTP_MIN}" \
+  --ltp-max "${LTP_MAX}" \
   --device cuda

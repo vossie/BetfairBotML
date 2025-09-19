@@ -3,8 +3,8 @@
 Temporal trainer with two heads (value + price-move), CUDA default, and no-leak labels.
 - Validation window: [ASOF-1, ASOF]; Train: last --train-days ending at (ASOF-2)
 - Uses pm_labels.add_price_move_labels (BACKWARD as-of at t+h with tight tolerance)
-- Adds robust value backtest knobs: RAW/CAL, (no) sum-to-one, overround comparator, per-market topK, flat/Kelly stakes
-- Skips missing dates gracefully, saves models & validation CSV to output/
+- Robust value backtest knobs: RAW/CAL, (no) sum-to-one, overround comparator, per-market topK,
+  flat/Kelly stakes, LTP range filter, and ROI-by-odds table for taken trades.
 """
 from __future__ import annotations
 
@@ -117,7 +117,7 @@ def _device_params(device: str) -> Tuple[Dict, str]:
 
 # ----------------------------- value backtest helpers -----------------------------
 def _group_indices(ids: np.ndarray):
-    """Return list of index arrays, grouped by market id (stable-ish order)."""
+    """Return list of index arrays, grouped by market id (stable order)."""
     order = np.argsort(ids, kind="mergesort")
     ids_sorted = ids[order]
     groups = []
@@ -140,6 +140,25 @@ def _decimal_odds_from_ltp(ltp: np.ndarray) -> np.ndarray:
     # If ltp is already decimal odds, this is identity.
     return ltp
 
+def _roi_by_odds_table(ltp: np.ndarray, y: np.ndarray, profit: np.ndarray) -> List[Dict[str, float]]:
+    """
+    Compute tiny ROI-by-odds table over taken trades.
+    Returns list of dicts with: lo, hi, n, hit, roi.
+    """
+    bins = np.array([1.01, 1.5, 2.0, 3.0, 5.0, 10.0, 50.0, 1000.0], dtype=float)
+    out: List[Dict[str, float]] = []
+    for i in range(len(bins) - 1):
+        lo, hi = bins[i], bins[i + 1]
+        m = (ltp >= lo) & (ltp < hi)
+        n = int(m.sum())
+        if n == 0:
+            hit = float("nan"); roi = float("nan")
+        else:
+            hit = float(y[m].mean())
+            roi = float(profit[m].sum() / n)
+        out.append({"lo": lo, "hi": hi, "n": n, "hit": hit, "roi": roi})
+    return out
+
 # ----------------------------- value backtest -----------------------------
 def backtest_value(
     df: pl.DataFrame,
@@ -148,10 +167,12 @@ def backtest_value(
     edge_thresh: float,
     do_sum_to_one: bool,
     market_prob_mode: str,    # "ltp" | "overround"
-    per_market_topk: int,     # e.g. 1
+    per_market_topk: int,     # e.g. 1 or 2
     stake_mode: str,          # "flat" | "kelly"
-    kelly_cap: float = 0.05,  # max Kelly fraction
-) -> Dict[str, float]:
+    kelly_cap: float,
+    ltp_min: float,
+    ltp_max: float,
+) -> Dict[str, object]:
     pim = df["implied_prob"].to_numpy()
     market_ids = df["marketId"].to_numpy()
     y = df["winLabel"].to_numpy().astype(int)
@@ -159,13 +180,23 @@ def backtest_value(
     finite = np.isfinite(p_model) & np.isfinite(pim) & np.isfinite(ltp)
 
     if finite.sum() == 0:
-        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan")}
+        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"), "roi_by_odds": []}
 
     p = p_model[finite].copy()
     pim_f = pim[finite].copy()
     mids = market_ids[finite]
     y = y[finite]
     ltp = ltp[finite]
+
+    # LTP filter BEFORE selection
+    price_ok = (ltp >= ltp_min) & (ltp <= ltp_max)
+    if not price_ok.any():
+        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"), "roi_by_odds": []}
+    p = p[price_ok]
+    pim_f = pim_f[price_ok]
+    mids = mids[price_ok]
+    y = y[price_ok]
+    ltp = ltp[price_ok]
 
     # Comparator probability
     if market_prob_mode == "overround":
@@ -193,7 +224,7 @@ def backtest_value(
         take[idxs] = mask
 
     if take.sum() == 0:
-        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan)}
+        return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan), "roi_by_odds": []}
 
     # Stakes
     if stake_mode == "flat":
@@ -217,14 +248,34 @@ def backtest_value(
     if stake_mode == "flat":
         roi = float(profit.sum() / max(1, n))  # per 1-unit bet
     else:
-        roi = float(profit.sum() / max(1.0, stake.sum()))  # per unit stake
+        roi = float(profit.sum() / max(1.0, stake.sum()))
+
+    # Build tiny ROI-by-odds table on taken trades
+    roi_table = _roi_by_odds_table(dec, y[take], profit)
 
     return {
         "n_trades": n,
         "roi": roi,
         "hit_rate": float(y[take].mean()),
         "avg_edge": float(edge[take].mean()),
+        "roi_by_odds": roi_table,
     }
+
+# ----------------------------- metrics -----------------------------
+def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
+    eps = 1e-12
+    p_clip = np.clip(p, eps, 1 - eps)
+    logloss = -np.mean(y_true * np.log(p_clip) + (1 - y_true) * np.log(1 - p_clip))
+    try:
+        from sklearn.metrics import roc_auc_score
+        auc = float(roc_auc_score(y_true, p))
+    except Exception:
+        order = np.argsort(p)
+        ranks = np.empty_like(order); ranks[order] = np.arange(len(p))
+        pos = y_true == 1
+        n_pos = int(pos.sum()); n_neg = len(p) - n_pos
+        auc = 0.5 if (n_pos == 0 or n_neg == 0) else (float(ranks[pos].sum()) - n_pos * (n_pos - 1) / 2) / (n_pos * n_neg)
+    return {"logloss": float(logloss), "auc": float(auc)}
 
 def _pm_threshold_sweep(p: np.ndarray, y: np.ndarray, fut_ticks: np.ndarray) -> None:
     """
@@ -250,22 +301,18 @@ def _pm_threshold_sweep(p: np.ndarray, y: np.ndarray, fut_ticks: np.ndarray) -> 
             avg_mv = float(np.mean(fut_ticks[sel])) if n_sel else float("nan")
         print(f"  {th:0.2f}  {n_sel:6d}   {prec:8.3f}  {rec:6.3f}  {f1:6.3f}   {avg_mv:14.2f}")
 
+# ----------------------------- FS guards -----------------------------
+def _has_snapshot_day(curated_root: str, sport: str, day: str) -> bool:
+    p = Path(curated_root) / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={day}"
+    return p.exists()
 
-# ----------------------------- metrics -----------------------------
-def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
-    eps = 1e-12
-    p_clip = np.clip(p, eps, 1 - eps)
-    logloss = -np.mean(y_true * np.log(p_clip) + (1 - y_true) * np.log(1 - p_clip))
-    try:
-        from sklearn.metrics import roc_auc_score
-        auc = float(roc_auc_score(y_true, p))
-    except Exception:
-        order = np.argsort(p)
-        ranks = np.empty_like(order); ranks[order] = np.arange(len(p))
-        pos = y_true == 1
-        n_pos = int(pos.sum()); n_neg = len(p) - n_pos
-        auc = 0.5 if (n_pos == 0 or n_neg == 0) else (float(ranks[pos].sum()) - n_pos * (n_pos - 1) / 2) / (n_pos * n_neg)
-    return {"logloss": float(logloss), "auc": float(auc)}
+def _filter_dates_with_data(curated_root: str, sport: str, dates: List[str]) -> List[str]:
+    ok, missing = [], []
+    for d in dates:
+        (ok if _has_snapshot_day(curated_root, sport, d) else missing).append(d)
+    if missing:
+        print(f"WARN: Skipping {len(missing)} day(s) with no snapshots: {', '.join(missing)}")
+    return ok
 
 # ----------------------------- training -----------------------------
 def train_temporal(
@@ -292,6 +339,8 @@ def train_temporal(
     per_market_topk: int,
     stake_mode: str,
     kelly_cap: float,
+    ltp_min: float,
+    ltp_max: float,
 ) -> None:
     asof = _parse_date(asof_date)
     plan = build_split(asof, train_days)
@@ -327,10 +376,6 @@ def train_temporal(
         )
         return df
 
-    # FS helpers
-    # (defined after use above to keep code tidy)
-    # -----------------------------
-    # Build
     df_train = _build(plan.train_dates)
     df_valid = _build(plan.valid_dates)
 
@@ -398,9 +443,20 @@ def train_temporal(
         per_market_topk=per_market_topk,
         stake_mode=stake_mode,
         kelly_cap=kelly_cap,
+        ltp_min=ltp_min,
+        ltp_max=ltp_max,
     )
     print("[Backtest @ validation — value]")
     print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
+
+    # Tiny ROI-by-odds table
+    roi_tbl = pnl.get("roi_by_odds", [])
+    if roi_tbl:
+        print("\n[Value head — ROI by decimal odds bucket]")
+        print("  bucket         n    hit    roi")
+        for row in roi_tbl:
+            lo, hi, n, hit, roi = row["lo"], row["hi"], row["n"], row["hit"], row["roi"]
+            print(f"  [{lo:4.2f},{hi:6.2f})  {n:5d}  {hit:5.3f}  {roi:6.3f}")
 
     # -------- price-move head (short horizon) --------
     ytr_pm = df_train["pm_up"].to_numpy().astype(np.float32)
@@ -438,7 +494,6 @@ def train_temporal(
         fut_ticks=df_valid["pm_delta_ticks"].to_numpy()
     )
 
-
     # Save artifacts
     value_name = f"edge_value_xgb_{preoff_minutes}m_{asof_date}_T{train_days}.json"
     pm_name = f"edge_price_xgb_{pm_horizon_secs}s_{preoff_minutes}m_{asof_date}_T{train_days}.json"
@@ -465,23 +520,11 @@ def train_temporal(
     rep.write_csv(str(rep_file))
     print(f"Saved validation detail → {rep_file}")
 
-# ----------------------------- FS guards (after training defs for clarity) -----------------------------
-def _has_snapshot_day(curated_root: str, sport: str, day: str) -> bool:
-    p = Path(curated_root) / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={day}"
-    return p.exists()
-
-def _filter_dates_with_data(curated_root: str, sport: str, dates: List[str]) -> List[str]:
-    ok, missing = [], []
-    for d in dates:
-        (ok if _has_snapshot_day(curated_root, sport, d) else missing).append(d)
-    if missing:
-        print(f"WARN: Skipping {len(missing)} day(s) with no snapshots: {', '.join(missing)}")
-    return ok
-
 # ----------------------------- CLI -----------------------------
 def main():
     ap = argparse.ArgumentParser(description=(
-        "Temporal split with 2-day validation, value+price heads, calibration, and robust value backtest."
+        "Temporal split with 2-day validation, value+price heads, calibration, robust value backtest, "
+        "LTP filtering, PM threshold sweep, and ROI-by-odds reporting."
     ))
     # Data
     ap.add_argument("--curated", required=True, help="/mnt/nvme/betfair-curated or s3://bucket")
@@ -521,6 +564,10 @@ def main():
                     help="Stake model for backtest")
     ap.add_argument("--kelly-cap", type=float, default=0.05,
                     help="Max Kelly fraction (if --stake kelly)")
+    ap.add_argument("--ltp-min", type=float, default=1.01,
+                    help="Minimum decimal odds to include in backtest")
+    ap.add_argument("--ltp-max", type=float, default=1000.0,
+                    help="Maximum decimal odds to include in backtest")
 
     args = ap.parse_args()
 
@@ -548,6 +595,8 @@ def main():
         per_market_topk=args.per_market_topk,
         stake_mode=args.stake,
         kelly_cap=args.kelly_cap,
+        ltp_min=args.ltp_min,
+        ltp_max=args.ltp_max,
     )
 
 if __name__ == "__main__":
