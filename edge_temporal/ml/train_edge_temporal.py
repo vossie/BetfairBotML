@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 """
-Temporal trainer (value + price-move), CUDA default, robust logging, and practical backtest.
+Temporal trainer (value + price-move), CUDA default, robust logging, PM gate,
+and practical backtest with side-aware edges and Kelly/flat staking.
 
 Validation window: [ASOF-1, ASOF]
 Training window:   last --train-days ending at (ASOF-2)
-
-Features:
-- Value head (win probability) + optional isotonic calibration
-- Price-move head (short-horizon) with no-leak labels
-- PM cutoff gate (--pm-cutoff) + PM threshold sweep
-- Backtest with edge-threshold, per-market topK, odds band, market prob mode,
-  sum-to-one normalization, back/lay or both sides, kelly/flat staking, and
-  ROI-by-odds bucket table. Saves recommendations CSV.
-
-Outputs in project-level output/ dir.
 """
 
 from __future__ import annotations
@@ -90,7 +81,7 @@ def _device_params(device: str) -> Tuple[Dict, str]:
         except Exception:
             device = "cpu"
     if device == "cuda":
-        return {"device": "cuda", "tree_method": "hist", "predictor": "gpu_predictor"}, "Using GPU (CUDA)"
+        return {"device": "cuda", "tree_method": "hist"}, "Using GPU (CUDA)"
     return {"device": "cpu", "tree_method": "hist"}, "Using CPU"
 
 
@@ -102,7 +93,7 @@ def _select_feature_cols(df: pl.DataFrame, label_cols: List[str]) -> List[str]:
         # explicit futures / matching columns
         "ltpTick_fut", "ltp_fut", "ts_s_right", "ts_s_join", "future_delta_sec",
         # probabilities that can be targets or derived
-        "p_pm_up",
+        "p_pm_up", "p_win_raw", "p_win_cal",
     }
     cols: List[str] = []
     for name, dt in df.schema.items():
@@ -180,7 +171,6 @@ def _per_market_topk_mask(market_ids: np.ndarray, score: np.ndarray, k: int) -> 
         idx = np.where(mask)[0]
         if idx.size == 0:
             continue
-        # top-k by score
         order = np.argsort(score[idx])[::-1]
         ksel = idx[order[:k]]
         keep[ksel] = True
@@ -216,37 +206,40 @@ def backtest_value(
     p_market_base = _compute_market_prob(df, market_prob_mode)
     if do_sum_to_one:
         # optional sum-to-one of model probabilities per market
-        mids = df["marketId"].to_numpy()
+        mids_all = df["marketId"].to_numpy()
         p_norm = p_model.copy()
-        for m in np.unique(mids):
-            mask = mids == m
+        for m in np.unique(mids_all):
+            mask = mids_all == m
             s = p_norm[mask].sum()
             if s > 0:
                 p_norm[mask] /= s
-        p_used = p_norm
+        p_used_all = p_norm
     else:
-        p_used = p_model
+        p_used_all = p_model
 
     # Edges for both sides
-    edge_back = p_used - p_market_base              # positive -> back value
-    edge_lay = p_market_base - p_used              # positive -> lay value
+    edge_back_all = p_used_all - p_market_base              # positive -> back value
+    edge_lay_all  = p_market_base - p_used_all              # positive -> lay value
 
-    # Base mask: finite, odds band
-    finite = np.isfinite(edge_back) & odds_mask & np.isfinite(df["winLabel"].to_numpy())
+    # Base mask: finite, odds band, valid labels
+    y_all = df["winLabel"].to_numpy().astype(int)
+    finite = np.isfinite(edge_back_all) & odds_mask & np.isfinite(y_all)
     if finite.sum() == 0:
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"), "recos": []}
 
     mids = df["marketId"].to_numpy()[finite]
     selids = df["selectionId"].to_numpy()[finite]
     odds_f = ltp[finite]
-    y = df["winLabel"].to_numpy().astype(int)[finite]
+    y = y_all[finite]
 
-    eb = edge_back[finite]
-    el = edge_lay[finite]
+    eb = edge_back_all[finite]
+    el = edge_lay_all[finite]
+    p_used = p_used_all[finite]
+    p_mkt  = p_market_base[finite]
 
     # Select side(s)
     take_back = eb > edge_thresh
-    take_lay = el > edge_thresh
+    take_lay  = el > edge_thresh
 
     if side == "back":
         which = take_back
@@ -257,7 +250,6 @@ def backtest_value(
         side_arr = np.where(which, "lay", "skip")
         score = el
     else:  # both
-        # Build combined candidates: pick better of the two per runner
         both_candidates = np.stack([eb, el], axis=1)
         side_choice = np.where(eb >= el, "back", "lay")
         best_edge = np.max(both_candidates, axis=1)
@@ -265,19 +257,18 @@ def backtest_value(
         side_arr = np.where(which, side_choice, "skip")
         score = best_edge
 
-    # Filter only selected rows
     sel_mask = which
     if sel_mask.sum() == 0:
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan), "recos": []}
 
-    mids_s = mids[sel_mask]
-    selids_s = selids[sel_mask]
-    odds_s = odds_f[sel_mask]
-    y_s = y[sel_mask]
-    side_s = side_arr[sel_mask]
-    edge_s = score[sel_mask]
-    p_used_s = p_used[finite][sel_mask]
-    p_mkt_s = p_market_base[finite][sel_mask]
+    mids_s  = mids[sel_mask]
+    selids_s= selids[sel_mask]
+    odds_s  = odds_f[sel_mask]
+    y_s     = y[sel_mask]
+    side_s  = side_arr[sel_mask]
+    edge_s  = score[sel_mask]
+    p_used_s= p_used[sel_mask]
+    p_mkt_s = p_mkt[sel_mask]
 
     # Per-market topK across sides (use edge score)
     keep = _per_market_topk_mask(mids_s, edge_s, per_market_topk)
@@ -291,10 +282,14 @@ def backtest_value(
     # Staking
     stake = np.ones(n, dtype=float)  # flat baseline £1
     if stake_mode == "kelly":
-        # Kelly fraction for BACK only; for LAY we use a simple flat £1 unless you want Kelly for lay too
         for i in range(n):
             if side_s[i] == "back":
                 dec = odds_s[i]
+                # EV guard: skip if back EV ≤ 0
+                breakeven = 1.0 / (((dec - 1.0) * (1.0 - commission)) + 1.0)
+                if p_used_s[i] <= breakeven:
+                    stake[i] = 0.0
+                    continue
                 b = (dec - 1.0) * (1.0 - commission)
                 q = 1.0 - p_used_s[i]
                 denom = b if b != 0 else 1e-12
@@ -303,31 +298,26 @@ def backtest_value(
                 f *= kelly_fraction
                 stake[i] = max(stake_floor, f * bankroll_nom)
             else:
-                # Simple policy: flat £1 for lay (you can later add a Kelly-for-lay variant)
+                # Flat £1 for lay (could later implement lay-specific Kelly)
                 stake[i] = 1.0
 
     # Profit per trade
-    if n > 0:
-        unit_ret_back = _back_profit_back(odds_s, y_s, np.ones_like(stake), commission)
-        unit_ret_lay = _lay_profit_lay(odds_s, y_s, np.ones_like(stake), commission)
-        unit_ret = np.where(side_s == "back", unit_ret_back, unit_ret_lay)
-        pnl = unit_ret * stake
-    else:
-        unit_ret = np.array([])
-        pnl = np.array([])
+    unit_ret_back = _back_profit_back(odds_s, y_s, np.ones_like(stake), commission)
+    unit_ret_lay  = _lay_profit_lay(odds_s, y_s, np.ones_like(stake), commission)
+    unit_ret = np.where(side_s == "back", unit_ret_back, unit_ret_lay)
+    pnl = unit_ret * stake
 
     total_profit = float(pnl.sum())
     total_staked = float(stake.sum()) if stake_mode == "kelly" else float(n)  # flat £1 baseline
     roi = float(total_profit / max(1.0, total_staked))
     hit_rate = float((y_s == 1).mean()) if n else 0.0
 
-    # Recos payload (save both fraction proxy and £)
+    # Recos payload (include side-aware edge)
     recos: List[Dict] = []
-    # Approximate stake fraction (for back only) for CSV transparency
     stake_frac_proxy = []
     for i in range(n):
         frac = 0.0
-        if stake_mode == "kelly" and side_s[i] == "back":
+        if stake_mode == "kelly" and side_s[i] == "back" and bankroll_nom > 0:
             dec = odds_s[i]
             b = (dec - 1.0) * (1.0 - commission)
             q = 1.0 - p_used_s[i]
@@ -335,6 +325,10 @@ def backtest_value(
             f_raw = (b * p_used_s[i] - q) / denom
             frac = float(np.clip(np.nan_to_num(f_raw, nan=0.0, posinf=0.0, neginf=0.0), 0.0, kelly_cap) * kelly_fraction)
         stake_frac_proxy.append(frac)
+
+        edge_back_val = float(p_used_s[i] - p_mkt_s[i])
+        edge_lay_val  = float(p_mkt_s[i] - p_used_s[i])
+        edge_side_val = edge_back_val if side_s[i] == "back" else edge_lay_val
 
         recos.append({
             "marketId": mids_s[i],
@@ -345,7 +339,7 @@ def backtest_value(
             "stake_frac": frac,
             "p_model": float(p_used_s[i]),
             "p_market": float(p_mkt_s[i]),
-            "edge_back": float(edge_s[i]) if side_s[i] == "back" else float(-edge_s[i]),  # for lay, negative of back edge
+            "edge_side": edge_side_val,
         })
 
     return {
@@ -563,19 +557,22 @@ def train_temporal(
         print(f"  {th:0.2f} {n_sel:6d}      {prec:0.3f}   {rec:0.3f}   {f1:0.3f}           {avg_ticks:0.2f}")
 
     # -------- backtest / recommendations on validation --------
-    # Prepare frame for PM gate (we keep it simple: attach p_pm_up to df_valid)
-    df_valid_bt = df_valid.with_columns(
-        pl.Series("p_pm_up", p_valid_pm)
-    )
-    # PM cutoff gate (filter the rows before backtest)
+    # Attach predictions BEFORE any filtering to keep alignment
+    df_valid_bt = df_valid.with_columns([
+        pl.Series("p_win_raw", p_valid_val),
+        pl.Series("p_win_cal", p_cal_val),
+        pl.Series("p_pm_up",  p_valid_pm),
+    ])
+    # PM cutoff gate
     df_valid_bt = apply_pm_cutoff(df_valid_bt, pm_cutoff=pm_cutoff)
 
     # Choose which probs feed edge calc
-    use_p = p_cal_val if edge_prob == "cal" else p_valid_val
+    use_col = "p_win_cal" if edge_prob == "cal" else "p_win_raw"
+    p_used_vec = df_valid_bt[use_col].to_numpy()
 
     pnl = backtest_value(
         df=df_valid_bt,
-        p_model=use_p[: df_valid_bt.height],  # align after gate
+        p_model=p_used_vec,
         commission=commission,
         edge_thresh=edge_thresh,
         do_sum_to_one=(not no_sum_to_one),
@@ -594,39 +591,32 @@ def train_temporal(
     print("\n[Backtest @ validation — value]")
     print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
 
-    # ROI by odds buckets
+    # ROI by odds buckets + side summary + recos CSV + staking comparison
     recs = pnl.get("recos", [])
     if recs:
         rec_df_all = pl.DataFrame(recs)
         # buckets
         edges = [1.01, 1.50, 2.00, 3.00, 5.00, 10.00, 50.00, 1000.0]
-        out_rows = []
-        for lo, hi in zip(edges[:-1], edges[1:]):
-            mask = (rec_df_all["ltp"] >= lo) & (rec_df_all["ltp"] < hi)
-            sub = rec_df_all.filter(mask)
-            if sub.height == 0:
-                out_rows.append((f"[{lo:.2f}, {hi:5.2f})", 0, float("nan"), float("nan")))
-                continue
-            # simulate per bucket using unit_ret for side, scaled by stake_gbp
-            idx = mask.to_numpy().nonzero()[0]
-            unit_ret = np.asarray(pnl["unit_ret"])[idx]
-            stakes = sub["stake_gbp"].to_numpy()
-            wins = None  # not needed for ROI since we have unit_ret
-            profit = float(np.sum(unit_ret * stakes))
-            staked = float(np.sum(stakes))
-            roi_b = profit / staked if staked > 0 else float("nan")
-            # crude "hit" as mean of (unit_ret>0)
-            hit = float((unit_ret > 0).mean()) if unit_ret.size else float("nan")
-            out_rows.append((f"[{lo:.2f}, {hi:5.2f})", int(sub.height), hit, roi_b))
         print("\n[Value head — ROI by decimal odds bucket]")
         print("  bucket         n    hit    roi")
-        for b, n_b, hit_b, roi_b in out_rows:
-            print(f"  {b:>12} {n_b:6d}  {'' if np.isnan(hit_b) else f'{hit_b:0.3f}':>5}  {'' if np.isnan(roi_b) else f'{roi_b:0.3f}':>6}")
+        unit_ret = np.asarray(pnl["unit_ret"])
+        stakes = np.asarray(pnl["stakes"], dtype=float)
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            mask = (rec_df_all["ltp"] >= lo) & (rec_df_all["ltp"] < hi)
+            idx = mask.to_numpy().nonzero()[0]
+            if idx.size == 0:
+                print(f"  [{lo:0.2f}, {hi:6.2f})      0               ")
+                continue
+            profit = float(np.sum(unit_ret[idx] * stakes[idx]))
+            staked = float(np.sum(stakes[idx]))
+            roi_b = profit / staked if staked > 0 else float("nan")
+            hit = float((unit_ret[idx] > 0).mean()) if idx.size else float("nan")
+            print(f"  [{lo:0.2f}, {hi:6.2f}) {len(idx):6d}  {'' if np.isnan(hit) else f'{hit:0.3f}':>5}  {'' if np.isnan(roi_b) else f'{roi_b:0.3f}':>6}")
 
         # Side summary
         by_side = rec_df_all.group_by("side").agg([
             pl.len().alias("n"),
-            pl.mean("edge_back").alias("avg_edge"),
+            pl.mean("edge_side").alias("avg_edge"),
             pl.mean("stake_gbp").alias("avg_stake_gbp"),
         ])
         print("\n[Backtest — side summary]")
@@ -635,7 +625,7 @@ def train_temporal(
 
         # Save recos CSV
         rec_df = rec_df_all.select([
-            "marketId","selectionId","ltp","side","stake_gbp","stake_frac","p_model","p_market","edge_back"
+            "marketId","selectionId","ltp","side","stake_gbp","stake_frac","p_model","p_market","edge_side"
         ])
         rec_file = OUTPUT_DIR / f"edge_recos_valid_{_fmt(asof)}_T{train_days}.csv"
         rec_df.write_csv(str(rec_file))
@@ -649,13 +639,15 @@ def train_temporal(
         flat_staked = flat_stake * n_trades
         flat_roi = flat_profit / flat_staked if flat_staked > 0 else 0.0
 
-        kelly_stakes = np.asarray(pnl["stakes"])
+        kelly_stakes = np.asarray(pnl["stakes"], dtype=float)
         kelly_profit = float(np.sum(unit_ret * kelly_stakes))
         kelly_staked = float(np.sum(kelly_stakes))
         kelly_roi = kelly_profit / kelly_staked if kelly_staked > 0 else 0.0
         kelly_avg = float(kelly_staked / max(1, n_trades))
 
         print("\n[Staking comparison]")
+        if stake_mode != "kelly":
+            print("  (Note) Run was STAKE=flat; 'Kelly' line below uses the same stakes (diagnostic only).")
         print(f"  Flat £10 stake    → trades={n_trades}  staked=£{flat_staked:.2f}  profit=£{flat_profit:.2f}  roi={flat_roi:.3f}")
         print(f"  Kelly (nom £{bankroll_nom:.0f}) → trades={n_trades}  staked=£{kelly_staked:.2f}  profit=£{kelly_profit:.2f}  roi={kelly_roi:.3f}  avg_stake=£{kelly_avg:.2f}")
 
