@@ -4,7 +4,7 @@ Temporal trainer with two heads (value + price-move), CUDA default, and no-leak 
 - Validation window: [ASOF-1, ASOF]; Train: last --train-days ending at (ASOF-2)
 - Robust value backtest knobs: RAW/CAL, (no) sum-to-one, overround comparator, per-market topK,
   flat/Kelly stakes, LTP range filter, ROI-by-odds table, Back/Lay/Both recommendations CSV,
-  and PM threshold sweep (precision/recall/F1/N/avg future ticks).
+  PM threshold sweep, side summary, and staking comparison (Flat £10 vs Kelly nominal £1000).
 """
 from __future__ import annotations
 
@@ -194,7 +194,7 @@ def backtest_value(
     finite = np.isfinite(p_model) & np.isfinite(pim) & np.isfinite(ltp)
     if finite.sum() == 0:
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"),
-                "roi_by_odds": [], "recos": []}
+                "roi_by_odds": [], "recos": [], "sel_arrays": {}}
 
     # base slice
     p = p_model[finite].copy()
@@ -207,7 +207,7 @@ def backtest_value(
     price_ok = (l >= ltp_min) & (l <= ltp_max)
     if not price_ok.any():
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan"),
-                "roi_by_odds": [], "recos": []}
+                "roi_by_odds": [], "recos": [], "sel_arrays": {}}
     p, pm, m, y, l = p[price_ok], pm[price_ok], m[price_ok], y[price_ok], l[price_ok]
 
     # Comparator probability
@@ -250,7 +250,7 @@ def backtest_value(
 
     if take_mask.sum() == 0:
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan),
-                "roi_by_odds": [], "recos": []}
+                "roi_by_odds": [], "recos": [], "sel_arrays": {}}
 
     # Stakes
     stake = np.ones(int(take_mask.sum()), dtype=float)
@@ -275,33 +275,33 @@ def backtest_value(
             else:
                 stake[i] = 1.0
 
-    # Profit per bet
-    profit = np.zeros_like(stake, dtype=float)
+    # Profit per bet (per-unit stake)
+    unit_ret = np.zeros_like(stake, dtype=float)
     for i in range(len(stake)):
         dec = sel_l[i]
         if sel_side[i] == "back":
-            profit[i] = (dec - 1.0) * (1.0 - commission) * stake[i] if sel_y[i] == 1 else -1.0 * stake[i]
+            unit_ret[i] = (dec - 1.0) * (1.0 - commission) if sel_y[i] == 1 else -1.0
         else:  # lay
-            profit[i] = (1.0 - commission) * stake[i] if sel_y[i] == 0 else -(dec - 1.0) * stake[i]
+            unit_ret[i] = (1.0 - commission) if sel_y[i] == 0 else -(dec - 1.0)
+
+    # Applied stakes profit (matches ROI printed here)
+    profit = unit_ret * stake
 
     n = len(stake)
     roi = float(profit.sum() / (n if stake_mode == "flat" else max(1.0, stake.sum())))
     hit_rate = float((sel_y == 1).mean())
     avg_edge = float(np.mean(sel_edge_back[sel_side == "back"])) if np.any(sel_side == "back") else float("nan")
 
-    # ROI-by-odds table
+    # ROI-by-odds table (use decimal odds = sel_l)
     roi_tbl = _roi_by_odds_table(sel_l, sel_y, profit)
 
     # Build recommendation rows (absolute indices back to df)
     # Map chosen indices back to original df indices
     base_mask = np.zeros_like(p_model, dtype=bool); base_mask[finite] = True
     base_idx = np.where(base_mask)[0]
-    price_mask = np.zeros_like(base_idx, dtype=bool); price_mask[:] = True  # we rebuilt arrays; reconstruct mapping:
-    # reconstruct price_ok mapping in finite space
-    finite_idx = base_idx
     l_finite = ltp[finite]
     price_ok_all = (l_finite >= ltp_min) & (l_finite <= ltp_max)
-    price_idx = finite_idx[price_ok_all]
+    price_idx = base_idx[price_ok_all]
     abs_idx = price_idx[sel_idx]
 
     recos = []
@@ -320,6 +320,16 @@ def backtest_value(
             "edge_back": float(sel_edge_back[i]),  # positive means model>market
         })
 
+    # Also return the selected arrays so the caller can compute alternate staking
+    sel_arrays = {
+        "odds": sel_l,
+        "y": sel_y.astype(int),
+        "side": np.array(sel_side, dtype=object),
+        "p": sel_p,
+        "unit_return": unit_ret,     # per £1 stake outcome (+/-)
+        "commission": float(commission),
+    }
+
     return {
         "n_trades": n,
         "roi": roi,
@@ -327,6 +337,7 @@ def backtest_value(
         "avg_edge": avg_edge,
         "roi_by_odds": roi_tbl,
         "recos": recos,
+        "sel_arrays": sel_arrays,
     }
 
 # ----------------------------- metrics & PM sweep -----------------------------
@@ -500,36 +511,21 @@ def train_temporal(
     print(f"\n[Value head: winLabel] logloss={metrics_val['logloss']:.4f} auc={metrics_val['auc']:.3f}  n={len(yva)}")
 
     pnl = backtest_value(
-        df_valid, p_cal_val,
+        df=df_valid,
+        p_model=use_p,
         commission=commission,
         edge_thresh=edge_thresh,
+        do_sum_to_one=(not no_sum_to_one),
+        market_prob_mode=market_prob_mode,
+        per_market_topk=per_market_topk,
+        stake_mode=stake_mode,
+        kelly_cap=kelly_cap,
+        ltp_min=ltp_min,
+        ltp_max=ltp_max,
+        side=side,
     )
     print("[Backtest @ validation — value]")
-    print(
-        f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
-
-    # --- new: side summary if recos present ---
-    recs = pnl.get("recos", [])
-    if recs:
-        rec_df = pl.DataFrame(recs)
-        by_side = rec_df.group_by("side").agg([
-            pl.count().alias("n"),
-            pl.mean("edge_back").alias("avg_edge"),
-            pl.mean("stake").alias("avg_stake"),
-        ])
-        print("\n[Backtest — side summary]")
-        for row in by_side.iter_rows(named=True):
-            print(
-                f"  side={row['side']:>4}  n={row['n']:>5}  avg_edge={row['avg_edge']:.4f}  avg_stake={row['avg_stake']:.3f}")
-
-        # Save recos CSV as before
-        rec_df = rec_df.select([
-            "marketId", "selectionId", "ltp", "side", "stake",
-            "p_model", "p_market", "edge_back"
-        ])
-        rec_file = OUTPUT_DIR / f"edge_recos_valid_{asof_date}_T{train_days}.csv"
-        rec_df.write_csv(str(rec_file))
-        print(f"\nSaved recommendations → {rec_file}")
+    print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
 
     # ROI-by-odds table
     roi_tbl = pnl.get("roi_by_odds", [])
@@ -540,8 +536,20 @@ def train_temporal(
             lo, hi, n, hit, roi = row["lo"], row["hi"], row["n"], row["hit"], row["roi"]
             print(f"  [{lo:4.2f},{hi:6.2f})  {n:5d}  {hit:5.3f}  {roi:6.3f}")
 
-    # Save recommendations from validation as a CSV (action plan)
+    # --- new: side summary if recos present ---
     recs = pnl.get("recos", [])
+    if recs:
+        rec_df_all = pl.DataFrame(recs)
+        by_side = rec_df_all.group_by("side").agg([
+            pl.count().alias("n"),
+            pl.mean("edge_back").alias("avg_edge"),
+            pl.mean("stake").alias("avg_stake"),
+        ])
+        print("\n[Backtest — side summary]")
+        for row in by_side.iter_rows(named=True):
+            print(f"  side={row['side']:>4}  n={row['n']:>5}  avg_edge={row['avg_edge']:.4f}  avg_stake={row['avg_stake']:.3f}")
+
+    # Save recommendations from validation as a CSV (action plan)
     if recs:
         rec_df = pl.DataFrame(recs).select([
             "marketId","selectionId","ltp","side","stake","p_model","p_market","edge_back"
@@ -549,6 +557,53 @@ def train_temporal(
         rec_file = OUTPUT_DIR / f"edge_recos_valid_{asof_date}_T{train_days}.csv"
         rec_df.write_csv(str(rec_file))
         print(f"\nSaved recommendations → {rec_file}")
+
+    # --- Staking comparison: Flat £10 vs Kelly (nominal £1000, backs only) ---
+    sel = pnl.get("sel_arrays", {})
+    if sel:
+        odds = np.asarray(sel["odds"])
+        ywin = np.asarray(sel["y"]).astype(int)
+        sides = np.asarray(sel["side"], dtype=object)
+        pmod = np.asarray(sel["p"])
+        comm = float(sel.get("commission", 0.0))
+
+        # per-unit outcomes (already computed as sel['unit_return'], but recompute for clarity)
+        unit_ret = np.zeros_like(odds, dtype=float)
+        for i in range(len(odds)):
+            dec = odds[i]
+            if sides[i] == "back":
+                unit_ret[i] = (dec - 1.0) * (1.0 - comm) if ywin[i] == 1 else -1.0
+            else:
+                unit_ret[i] = (1.0 - comm) if ywin[i] == 0 else -(dec - 1.0)
+
+        # Flat £10 stake
+        flat_stake = 10.0
+        flat_profit = float(np.sum(unit_ret * flat_stake))
+        flat_n = len(unit_ret)
+        flat_roi = flat_profit / (flat_n * flat_stake) if flat_n > 0 else float("nan")
+
+        # Kelly with nominal bankroll (backs only Kelly; lays kept flat £10 for safety)
+        bankroll_nom = 1000.0
+        kelly_stakes = np.zeros_like(unit_ret)
+        for i in range(len(odds)):
+            dec = odds[i]
+            if sides[i] == "back":
+                b = (dec - 1.0) * (1.0 - comm)
+                q = 1.0 - pmod[i]
+                f = (b * pmod[i] - q) / (b if b != 0 else 1e-12)
+                f = np.clip(np.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 0.05)  # cap 5%
+                kelly_stakes[i] = f * bankroll_nom
+            else:
+                # lay: keep flat stake to avoid liability explosion in comparison
+                kelly_stakes[i] = flat_stake
+
+        kelly_profit = float(np.sum(unit_ret * kelly_stakes))
+        kelly_avg_stake = float(np.mean(kelly_stakes)) if len(kelly_stakes) else 0.0
+        kelly_roi = kelly_profit / (np.sum(kelly_stakes) if np.sum(kelly_stakes) > 0 else np.nan)
+
+        print("\n[Staking comparison]")
+        print(f"  Flat £10 stake    → trades={flat_n}  profit=£{flat_profit:.2f}  roi={flat_roi:.3f}")
+        print(f"  Kelly (nom £1000) → trades={flat_n}  profit=£{kelly_profit:.2f}  roi={kelly_roi:.3f}  avg_stake=£{kelly_avg_stake:.2f}")
 
     # -------- price-move head (short horizon) --------
     ytr_pm = df_train["pm_up"].to_numpy().astype(np.float32)
@@ -616,7 +671,7 @@ def train_temporal(
 def main():
     ap = argparse.ArgumentParser(description=(
         "Temporal split with 2-day validation, value+price heads, calibration, robust value backtest, "
-        "LTP filtering, PM threshold sweep, ROI-by-odds, and recos CSV."
+        "LTP filtering, PM threshold sweep, ROI-by-odds, side summary, staking comparison, and recos CSV."
     ))
     # Data
     ap.add_argument("--curated", required=True, help="/mnt/nvme/betfair-curated or s3://bucket")
