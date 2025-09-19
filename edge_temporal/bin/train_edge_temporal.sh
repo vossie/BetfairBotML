@@ -26,23 +26,29 @@ set -euo pipefail
 ML_ROOT="/opt/BetfairBotML/edge_temporal"
 ML_PY="${ML_ROOT}/ml/train_edge_temporal.py"
 
+# Data
 CURATED_ROOT="${CURATED_ROOT:-/mnt/nvme/betfair-curated}"
 SPORT="${2:-horse-racing}"
 PREOFF_MINS="${3:-30}"
 DOWNSAMPLE_SECS="${4:-5}"
 
+# Trading & model
 COMMISSION="${COMMISSION:-0.02}"
-EDGE_THRESH="${EDGE_THRESH:-0.005}"
-PM_HORIZON_SECS="${PM_HORIZON_SECS:-60}"
+EDGE_THRESH="${EDGE_THRESH:-0.0075}"        # compromise: enough trades, better ROI than 0.005
+EDGE_PROB="${EDGE_PROB:-cal}"               # calibration improved ROI stability
+NO_SUM_TO_ONE="${NO_SUM_TO_ONE:-0}"         # keep normalization enabled
+MARKET_PROB="${MARKET_PROB:-overround}"     # fair comparator
+
+# Price-move labelling (best overall in tests)
+PM_HORIZON_SECS="${PM_HORIZON_SECS:-300}"
 PM_TICK_THRESHOLD="${PM_TICK_THRESHOLD:-1}"
 PM_SLACK_SECS="${PM_SLACK_SECS:-3}"
 
-EDGE_PROB="${EDGE_PROB:-raw}"
-NO_SUM_TO_ONE="${NO_SUM_TO_ONE:-0}"
-MARKET_PROB="${MARKET_PROB:-overround}"
-PER_MARKET_TOPK="${PER_MARKET_TOPK:-1}"
-STAKE="${STAKE:-flat}"
-KELLY_CAP="${KELLY_CAP:-0.05}"
+# Selection/staking
+PER_MARKET_TOPK="${PER_MARKET_TOPK:-2}"     # good balance of N and quality
+STAKE="${STAKE:-flat}"                      # keep flat until we confirm stability
+KELLY_CAP="${KELLY_CAP:-0.05}"              # ignored unless STAKE=kelly
+
 
 # ---- args ----
 if [[ $# -lt 1 ]]; then
