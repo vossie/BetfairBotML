@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Usage:
-#   run-simulator2-0-30.sh 2025-09-17               # single-model, default
-#   run-simulator2-0-30.sh 2025-09-17 --model       # single-model, default path
-#   run-simulator2-0-30.sh 2025-09-17 --model ./output/custom.json
+#   train_edge_temporal.sh 2025-09-17               # single-model, default
+#   train_edge_temporal.sh 2025-09-17 --model       # single-model, default path
+#   train_edge_temporal.sh 2025-09-17 --model ./output/custom.json
 
 DATE_ARG="${1:-}"
 if [[ -z "$DATE_ARG" ]]; then

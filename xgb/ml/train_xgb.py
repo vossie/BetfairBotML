@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,8 +11,7 @@ import numpy as np
 import polars as pl
 import xgboost as xgb
 
-from . import features
-
+from xgb.ml import features
 
 # ----------------------------- output helpers -----------------------------
 

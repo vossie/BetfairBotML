@@ -1,9 +1,9 @@
 from __future__ import annotations
-import argparse, itertools, os, time, io
+import argparse, itertools, time, io
 from contextlib import redirect_stdout
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 import polars as pl
 import re
 
@@ -15,7 +15,7 @@ from .sim2 import (
     _load_booster,
     _daterange,
 )
-from . import features
+from xgb.ml import features
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

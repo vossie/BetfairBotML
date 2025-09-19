@@ -27,7 +27,7 @@ git pull
 
 echo "▶ Training for date=$TARGET_DATE covering $DAYS days from $BASE_DATE"
 
-.venv/bin/python -m ml.train_xgb \
+.venv/bin/python -m ml.xgb.train_xgb \
   --curated /mnt/nvme/betfair-curated \
   --sport horse-racing \
   --date "$TARGET_DATE" \

@@ -11,7 +11,7 @@ import polars as pl
 import xgboost as xgb
 from sklearn.metrics import log_loss, roc_auc_score
 
-from . import features
+from xgb.ml import features
 
 
 # --------------------------- date helpers ---------------------------
