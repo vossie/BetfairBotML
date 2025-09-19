@@ -3,6 +3,8 @@ set -euo pipefail
 
 # ------------------------------------------------------------
 # train_edge_temporal.sh (LOCAL FS, CUDA default)
+# Excludes *today* from validation by passing yesterday as --asof.
+#
 # Usage:
 #   train_edge_temporal.sh START_DATE [SPORT] [PREOFF_MINS] [DOWNSAMPLE_SECS]
 #
@@ -57,17 +59,18 @@ fi
 
 # ---- date math (Europe/London) ----
 export TZ="Europe/London"
-ASOF="$(date +%F)"                 # today's date
-TRAIN_END="$(date -d "${ASOF} -2 day" +%F)"
-VALID0="$(date -d "${ASOF} -1 day" +%F)"
-VALID1="${ASOF}"
+TODAY="$(date +%F)"
+ASOF_ARG="$(date -d "${TODAY} -1 day" +%F)"   # pass *yesterday* to trainer (exclude today)
+TRAIN_END="$(date -d "${ASOF_ARG} -2 day" +%F)"
+VALID0="$(date -d "${ASOF_ARG} -1 day" +%F)"
+VALID1="${ASOF_ARG}"
 
 if [[ "$(date -d "${START_DATE}" +%s)" -gt "$(date -d "${TRAIN_END}" +%s)" ]]; then
   echo "ERROR: START_DATE (${START_DATE}) must be on or before TRAIN_END (${TRAIN_END})." >&2
   exit 3
 fi
 
-# inclusive train-days
+# inclusive train-days (based on ASOF_ARG)
 epoch_s() { date -d "$1" +%s; }
 SECS_START="$(epoch_s "${START_DATE}")"
 SECS_END="$(epoch_s "${TRAIN_END}")"
@@ -76,7 +79,8 @@ TRAIN_DAYS=$(( (SECS_END - SECS_START) / 86400 + 1 ))
 # ---- info banner ----
 echo "=== Edge Temporal Training (LOCAL) ==="
 echo "Curated root:         ${CURATED_ROOT}"
-echo "ASOF (today):         ${ASOF}"
+echo "Today:                ${TODAY}"
+echo "ASOF (arg to trainer):${ASOF_ARG}   # validation excludes today"
 echo "Validation window:    ${VALID0} .. ${VALID1}"
 echo "Training window:      ${START_DATE} .. ${TRAIN_END}"
 echo "Computed TRAIN_DAYS:  ${TRAIN_DAYS}"
@@ -101,7 +105,7 @@ export PYTHONPATH="${ML_ROOT}/ml:${PYTHONPATH:-}"
 python3 "${ML_PY}" \
   --curated "${CURATED_ROOT}" \
   --sport "${SPORT}" \
-  --asof "${ASOF}" \
+  --asof "${ASOF_ARG}" \
   --train-days "${TRAIN_DAYS}" \
   --preoff-mins "${PREOFF_MINS}" \
   --downsample-secs "${DOWNSAMPLE_SECS}" \
