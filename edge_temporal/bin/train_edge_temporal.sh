@@ -32,9 +32,12 @@ SPORT="${2:-horse-racing}"
 PREOFF_MINS="${3:-30}"
 DOWNSAMPLE_SECS="${4:-5}"
 
+LTP_MIN="${LTP_MIN:-1.5}"
+LTP_MAX="${LTP_MAX:-5.0}"
+
 # Trading & model
 COMMISSION="${COMMISSION:-0.02}"
-EDGE_THRESH="${EDGE_THRESH:-0.0075}"        # compromise: enough trades, better ROI than 0.005
+EDGE_THRESH="${EDGE_THRESH:-0.015}"        # compromise: enough trades, better ROI than 0.005
 EDGE_PROB="${EDGE_PROB:-cal}"               # calibration improved ROI stability
 NO_SUM_TO_ONE="${NO_SUM_TO_ONE:-0}"         # keep normalization enabled
 MARKET_PROB="${MARKET_PROB:-overround}"     # fair comparator
@@ -45,10 +48,10 @@ PM_TICK_THRESHOLD="${PM_TICK_THRESHOLD:-1}"
 PM_SLACK_SECS="${PM_SLACK_SECS:-3}"
 
 # Selection/staking
-PER_MARKET_TOPK="${PER_MARKET_TOPK:-2}"     # good balance of N and quality
+PER_MARKET_TOPK="${PER_MARKET_TOPK:-1}"     # good balance of N and quality
 STAKE="${STAKE:-flat}"                      # keep flat until we confirm stability
 KELLY_CAP="${KELLY_CAP:-0.05}"              # ignored unless STAKE=kelly
-SIDE="${SIDE:-back}"
+SIDE="${SIDE:-back}"                        # default back-only, safer
 
 # ---- args ----
 if [[ $# -lt 1 ]]; then

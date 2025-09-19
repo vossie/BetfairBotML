@@ -500,21 +500,36 @@ def train_temporal(
     print(f"\n[Value head: winLabel] logloss={metrics_val['logloss']:.4f} auc={metrics_val['auc']:.3f}  n={len(yva)}")
 
     pnl = backtest_value(
-        df=df_valid,
-        p_model=use_p,
+        df_valid, p_cal_val,
         commission=commission,
         edge_thresh=edge_thresh,
-        do_sum_to_one=(not no_sum_to_one),
-        market_prob_mode=market_prob_mode,
-        per_market_topk=per_market_topk,
-        stake_mode=stake_mode,
-        kelly_cap=kelly_cap,
-        ltp_min=ltp_min,
-        ltp_max=ltp_max,
-        side=side,
     )
     print("[Backtest @ validation — value]")
-    print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
+    print(
+        f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
+
+    # --- new: side summary if recos present ---
+    recs = pnl.get("recos", [])
+    if recs:
+        rec_df = pl.DataFrame(recs)
+        by_side = rec_df.group_by("side").agg([
+            pl.count().alias("n"),
+            pl.mean("edge_back").alias("avg_edge"),
+            pl.mean("stake").alias("avg_stake"),
+        ])
+        print("\n[Backtest — side summary]")
+        for row in by_side.iter_rows(named=True):
+            print(
+                f"  side={row['side']:>4}  n={row['n']:>5}  avg_edge={row['avg_edge']:.4f}  avg_stake={row['avg_stake']:.3f}")
+
+        # Save recos CSV as before
+        rec_df = rec_df.select([
+            "marketId", "selectionId", "ltp", "side", "stake",
+            "p_model", "p_market", "edge_back"
+        ])
+        rec_file = OUTPUT_DIR / f"edge_recos_valid_{asof_date}_T{train_days}.csv"
+        rec_df.write_csv(str(rec_file))
+        print(f"\nSaved recommendations → {rec_file}")
 
     # ROI-by-odds table
     roi_tbl = pnl.get("roi_by_odds", [])
