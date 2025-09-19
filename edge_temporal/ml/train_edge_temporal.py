@@ -6,20 +6,6 @@ Clean temporal trainer with two heads (value + price-move), CUDA default, and no
 - Uses pm_labels.add_price_move_labels (BACKWARD as-of at t+h with tight tolerance)
 - Skips missing dates gracefully
 - Saves models + a validation CSV to project-level output/
-
-Example:
-  python train_edge_temporal.py \
-    --curated /mnt/nvme/betfair-curated \
-    --sport horse-racing \
-    --asof 2025-09-18 \
-    --train-days 13 \
-    --preoff-mins 30 \
-    --downsample-secs 5 \
-    --commission 0.02 \
-    --edge-thresh 0.02 \
-    --pm-horizon-secs 60 \
-    --pm-tick-threshold 1 \
-    --pm-slack-secs 3
 """
 from __future__ import annotations
 
@@ -40,21 +26,18 @@ except Exception:
     IsotonicRegression = None
 
 # Local modules
-import features  # your feature builder
-from pm_labels import add_price_move_labels  # no-leak price-move labels
+import features
+from pm_labels import add_price_move_labels
 
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------------------- utils -----------------------------
-
 def _parse_date(s: str) -> _date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
-
 def _fmt(d: _date) -> str:
     return d.strftime("%Y-%m-%d")
-
 
 def _daterange_inclusive(start: _date, end: _date) -> List[str]:
     if end < start:
@@ -66,12 +49,10 @@ def _daterange_inclusive(start: _date, end: _date) -> List[str]:
         d += timedelta(days=1)
     return out
 
-
 @dataclass
 class SplitPlan:
     train_dates: List[str]
     valid_dates: List[str]
-
 
 def build_split(asof: _date, train_days: int) -> SplitPlan:
     val1 = asof
@@ -83,7 +64,6 @@ def build_split(asof: _date, train_days: int) -> SplitPlan:
         valid_dates=[_fmt(val0), _fmt(val1)],
     )
 
-
 # Polars dtype helper (robust across versions)
 try:
     from polars.datatypes import is_numeric as _isnum
@@ -94,7 +74,6 @@ except Exception:
             pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
             pl.Float32, pl.Float64,
         }
-
 
 def _select_feature_cols(df: pl.DataFrame, label_cols: List[str]) -> List[str]:
     exclude = {
@@ -116,18 +95,14 @@ def _select_feature_cols(df: pl.DataFrame, label_cols: List[str]) -> List[str]:
             or "future" in lname
         ):
             continue
-        if dtype in {pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-                     pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
-                     pl.Float32, pl.Float64}:
+        if _isnum(dtype):
             cols.append(name)
     if not cols:
         raise RuntimeError("No numeric feature columns found after exclusions.")
     return cols
 
-
 def _to_numpy(df: pl.DataFrame, cols: List[str]) -> np.ndarray:
     return df.select(cols).fill_null(strategy="mean").to_numpy().astype(np.float32, copy=False)
-
 
 def _device_params(device: str) -> Tuple[Dict, str]:
     if device == "auto":
@@ -141,19 +116,7 @@ def _device_params(device: str) -> Tuple[Dict, str]:
     else:
         return {"device": "cpu", "tree_method": "hist"}, "Using CPU"
 
-
 # ----------------------------- value backtest -----------------------------
-
-def _sum_to_one_by_market(probs: np.ndarray, market_ids: np.ndarray) -> np.ndarray:
-    probs = probs.copy()
-    for m in np.unique(market_ids):
-        mask = market_ids == m
-        s = probs[mask].sum()
-        if s > 0:
-            probs[mask] = probs[mask] / s
-    return probs
-
-
 def backtest_value(
     df: pl.DataFrame,
     p_model: np.ndarray,
@@ -161,7 +124,7 @@ def backtest_value(
     edge_thresh: float,
     do_sum_to_one: bool,
 ) -> Dict[str, float]:
-    # align and mask finite rows
+    # Align and mask finite rows
     pim = df["implied_prob"].to_numpy()
     finite = np.isfinite(p_model) & np.isfinite(pim)
 
@@ -174,7 +137,6 @@ def backtest_value(
     y = df["winLabel"].to_numpy().astype(int)[finite]
     ltp = df["ltp"].to_numpy()[finite]
 
-    # optional sum-to-one normalization (can compress edges)
     if do_sum_to_one:
         for m in np.unique(market_ids):
             mask = (market_ids == m)
@@ -199,14 +161,10 @@ def backtest_value(
         "avg_edge": float(edge[sel].mean()),
     }
 
-
-
 # ----------------------------- FS guards -----------------------------
-
 def _has_snapshot_day(curated_root: str, sport: str, day: str) -> bool:
     p = Path(curated_root) / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={day}"
     return p.exists()
-
 
 def _filter_dates_with_data(curated_root: str, sport: str, dates: List[str]) -> List[str]:
     ok, missing = [], []
@@ -216,9 +174,7 @@ def _filter_dates_with_data(curated_root: str, sport: str, dates: List[str]) -> 
         print(f"WARN: Skipping {len(missing)} day(s) with no snapshots: {', '.join(missing)}")
     return ok
 
-
 # ----------------------------- metrics -----------------------------
-
 def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     eps = 1e-12
     p_clip = np.clip(p, eps, 1 - eps)
@@ -228,17 +184,13 @@ def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
         auc = float(roc_auc_score(y_true, p))
     except Exception:
         order = np.argsort(p)
-        ranks = np.empty_like(order)
-        ranks[order] = np.arange(len(p))
+        ranks = np.empty_like(order); ranks[order] = np.arange(len(p))
         pos = y_true == 1
-        n_pos = int(pos.sum())
-        n_neg = len(p) - n_pos
+        n_pos = int(pos.sum()); n_neg = len(p) - n_pos
         auc = 0.5 if (n_pos == 0 or n_neg == 0) else (float(ranks[pos].sum()) - n_pos * (n_pos - 1) / 2) / (n_pos * n_neg)
     return {"logloss": float(logloss), "auc": float(auc)}
 
-
 # ----------------------------- training -----------------------------
-
 def train_temporal(
     curated_root: str,
     sport: str,
@@ -257,6 +209,8 @@ def train_temporal(
     pm_horizon_secs: int,
     pm_tick_threshold: int,
     pm_slack_secs: int,
+    edge_prob: str,
+    no_sum_to_one: bool,
 ) -> None:
     asof = _parse_date(asof_date)
     plan = build_split(asof, train_days)
@@ -284,7 +238,12 @@ def train_temporal(
         )
         print(f"Built features for {dates_ok[0]}..{dates_ok[-1]} → rows={df.height} (~{raw} scanned)")
         df = df.filter(pl.col(label_col).is_not_null())
-        df = add_price_move_labels(df, horizon_secs=pm_horizon_secs, tick_threshold=pm_tick_threshold, slack_secs=pm_slack_secs)
+        df = add_price_move_labels(
+            df,
+            horizon_secs=pm_horizon_secs,
+            tick_threshold=pm_tick_threshold,
+            slack_secs=pm_slack_secs,
+        )
         return df
 
     df_train = _build(plan.train_dates)
@@ -331,10 +290,26 @@ def train_temporal(
         except Exception as e:
             print(f"WARN: Isotonic calibration failed (value head): {e}; using raw.")
 
+    # choose RAW/CAL for edges
+    use_p = p_cal_val if edge_prob == "cal" else p_valid_val
+
+    # Debug: edge distribution on finite rows
+    pim = df_valid["implied_prob"].to_numpy()
+    mask = np.isfinite(use_p) & np.isfinite(pim)
+    edge_dbg = use_p[mask] - pim[mask]
+    for thr in [0.0, 0.0025, 0.005, 0.01, 0.02]:
+        print(f"edge>{thr:.3f}: n={(edge_dbg > thr).sum()} (of {mask.sum()} finite)")
+
     metrics_val = _metrics_binary(yva, p_valid_val)
     print(f"\n[Value head: winLabel] logloss={metrics_val['logloss']:.4f} auc={metrics_val['auc']:.3f}  n={len(yva)}")
 
-    pnl = backtest_value(df_valid, p_cal_val, commission=commission, edge_thresh=edge_thresh)
+    pnl = backtest_value(
+        df=df_valid,
+        p_model=use_p,
+        commission=commission,
+        edge_thresh=edge_thresh,
+        do_sum_to_one=(not no_sum_to_one),
+    )
     print("[Backtest @ validation — value]")
     print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
 
@@ -393,9 +368,7 @@ def train_temporal(
     rep.write_csv(str(rep_file))
     print(f"Saved validation detail → {rep_file}")
 
-
 # ----------------------------- CLI -----------------------------
-
 def main():
     ap = argparse.ArgumentParser(description=(
         "Temporal split with 2-day validation, value+price heads, calibration, value backtest. "
@@ -408,24 +381,21 @@ def main():
     ap.add_argument("--train-days", type=int, default=5, help="Number of training days ending at asof-2")
     ap.add_argument("--preoff-mins", type=int, default=30)
     ap.add_argument("--downsample-secs", type=int, default=5)
-
     # Model
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="cuda")
     ap.add_argument("--label-col", default="winLabel")
     ap.add_argument("--n-estimators", type=int, default=2000)
     ap.add_argument("--learning-rate", type=float, default=0.03)
     ap.add_argument("--early-stopping-rounds", type=int, default=100)
-
     # Trading eval (value)
     ap.add_argument("--commission", type=float, default=0.02)
     ap.add_argument("--edge-thresh", type=float, default=0.02, help="Back if p_model - p_market > thresh")
     ap.add_argument("--no-calibrate", action="store_true", help="Disable isotonic calibration for value head")
-
     # Price-move head
     ap.add_argument("--pm-horizon-secs", type=int, default=60, help="Short-horizon seconds for price-move label")
     ap.add_argument("--pm-tick-threshold", type=int, default=1, help="Minimum future move in ticks to label as 1")
     ap.add_argument("--pm-slack-secs", type=int, default=3, help="Tolerance slack around horizon for asof join")
-
+    # Backtest controls
     ap.add_argument("--edge-prob", choices=["raw", "cal"], default="cal", help="Use raw or calibrated probabilities for edge calc")
     ap.add_argument("--no-sum-to-one", action="store_true", help="Disable per-market sum-to-one normalization in backtest")
 
@@ -449,8 +419,9 @@ def main():
         pm_horizon_secs=args.pm_horizon_secs,
         pm_tick_threshold=args.pm_tick_threshold,
         pm_slack_secs=args.pm_slack_secs,
+        edge_prob=args.edge_prob,
+        no_sum_to_one=args.no_sum_to_one,
     )
-
 
 if __name__ == "__main__":
     main()
