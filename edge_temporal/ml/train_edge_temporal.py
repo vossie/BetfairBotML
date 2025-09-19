@@ -3,7 +3,7 @@
 """
 Temporal-split training with two heads in one run:
   1) Value head: p(win) with optional isotonic calibration + PnL-style backtest.
-  2) Price-move head: short-horizon label (pm_up) built from the stream.
+  2) Price-move head: short-horizon price-move label built from the stream.
 
 Split logic (dates are inclusive):
   - Validation: [ASOF-1, ASOF]
@@ -15,7 +15,7 @@ Example: ASOF=2025-09-18, TRAIN_DAYS=13 →
 
 Run:
   python train_edge_temporal.py \
-    --curated s3://betfair-curated \
+    --curated /mnt/nvme/betfair-curated \
     --sport horse-racing \
     --asof 2025-09-18 \
     --train-days 13 \
@@ -32,7 +32,7 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, date as _date
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import polars as pl
@@ -56,18 +56,21 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 def _parse_date(s: str) -> _date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
+
 def _fmt(d: _date) -> str:
     return d.strftime("%Y-%m-%d")
+
 
 def _daterange_inclusive(start: _date, end: _date) -> List[str]:
     if end < start:
         start, end = end, start
-    out = []
+    out: List[str] = []
     d = start
     while d <= end:
         out.append(_fmt(d))
         d += timedelta(days=1)
     return out
+
 
 @dataclass
 class SplitPlan:
@@ -87,7 +90,15 @@ def build_split(asof: _date, train_days: int) -> SplitPlan:
 
 
 def _select_feature_cols(df: pl.DataFrame, label_cols: List[str]) -> List[str]:
-    exclude = {"marketId", "selectionId", "ts", "ts_ms", "publishTimeMs", *label_cols, "runnerStatus"}
+    exclude = {
+        "marketId",
+        "selectionId",
+        "ts",
+        "ts_ms",
+        "publishTimeMs",
+        *label_cols,
+        "runnerStatus",
+    }
     cols: List[str] = []
     schema = df.collect_schema()
     for name, dtype in zip(schema.names(), schema.dtypes()):
@@ -114,9 +125,9 @@ def _device_params(device: str) -> Tuple[Dict, str]:
         except Exception:
             device = "cpu"
     if device == "cuda":
-        return {"device": "cuda", "tree_method": "hist"}, "🚀 XGBoost CUDA (hist)"
+        return {"device": "cuda", "tree_method": "hist"}, "Using GPU (CUDA)"
     else:
-        return {"device": "cpu", "tree_method": "hist"}, "🚀 XGBoost CPU (hist)"
+        return {"device": "cpu", "tree_method": "hist"}, "Using CPU"
 
 
 # ----------------------------- price-move labels -----------------------------
@@ -161,7 +172,9 @@ def add_price_move_labels(
         pl.col("ltpTick").alias("ltpTick_fut") if "ltpTick" in base.columns else pl.col("ltp").alias("ltp_fut"),
     ]).sort(["marketId", "selectionId", "ts_s_right"])  # required by asof join
 
-    left = base.with_columns((pl.col("ts_s") + horizon_secs).alias("ts_s_join")).sort(["marketId", "selectionId", "ts_s_join"])
+    left = base.with_columns((pl.col("ts_s") + horizon_secs).alias("ts_s_join")).sort(
+        ["marketId", "selectionId", "ts_s_join"]
+    )
 
     joined = left.join_asof(
         right,
@@ -169,14 +182,16 @@ def add_price_move_labels(
         right_on="ts_s_right",
         strategy="backward",
         by=["marketId", "selectionId"],
-        tolerance=2 * horizon_secs,  # allow some drift
+        tolerance=2 * horizon_secs,
     )
 
     if "ltpTick" in base.columns:
         delta_ticks = (pl.col("ltpTick_fut") - pl.col("ltpTick"))
     else:
         # approximate ticks from price difference (coarse mapping)
-        delta_ticks = (pl.col("ltp_fut") - pl.col("ltp")) / pl.when(pl.col("ltp") <= 2).then(0.01).when(pl.col("ltp") <= 3).then(0.02).otherwise(0.1)
+        delta_ticks = (pl.col("ltp_fut") - pl.col("ltp")) / pl.when(pl.col("ltp") <= 2).then(0.01).when(
+            pl.col("ltp") <= 3
+        ).then(0.02).otherwise(0.1)
 
     out = joined.with_columns([
         delta_ticks.alias("pm_delta_ticks"),
@@ -224,6 +239,27 @@ def backtest_value(df: pl.DataFrame, p_raw: np.ndarray, commission: float, edge_
     }
 
 
+# ----------------------------- FS guards -----------------------------
+
+def _has_snapshot_day(curated_root: str, sport: str, day: str) -> bool:
+    base = Path(curated_root)
+    p = base / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={day}"
+    return p.exists()
+
+
+def _filter_dates_with_data(curated_root: str, sport: str, dates: List[str]) -> List[str]:
+    ok: List[str] = []
+    missing: List[str] = []
+    for d in dates:
+        if _has_snapshot_day(curated_root, sport, d):
+            ok.append(d)
+        else:
+            missing.append(d)
+    if missing:
+        print(f"WARN: Skipping {len(missing)} day(s) with no snapshots: {', '.join(missing)}")
+    return ok
+
+
 # ----------------------------- training -----------------------------
 
 def train_temporal(
@@ -251,16 +287,24 @@ def train_temporal(
     print(f"  Train: {plan.train_dates[0]} .. {plan.train_dates[-1]}  ({len(plan.train_dates)} days)")
     print(f"  Valid: {plan.valid_dates[0]} .. {plan.valid_dates[-1]}  (2 days)\n")
 
+    dev_params, banner = _device_params(device)
+    print(banner)
+
     def _build(dates: List[str]) -> pl.DataFrame:
+        dates_ok = _filter_dates_with_data(curated_root, sport, dates)
+        if not dates_ok:
+            raise FileNotFoundError(
+                f"No available data days among: {', '.join(dates)} under {curated_root}/orderbook_snapshots_5s/sport={sport}"
+            )
         df, raw = features.build_features_streaming(
             curated_root=curated_root,
             sport=sport,
-            dates=dates,
+            dates=dates_ok,
             preoff_minutes=preoff_minutes,
             batch_markets=100,
             downsample_secs=downsample_secs,
         )
-        print(f"Built features for {dates[0]}..{dates[-1]} → rows={df.height} (~{raw} scanned)")
+        print(f"Built features for {dates_ok[0]}..{dates_ok[-1]} → rows={df.height} (~{raw} scanned)")
         df = df.filter(pl.col(label_col).is_not_null())
         df = add_price_move_labels(df, horizon_secs=pm_horizon_secs, tick_threshold=pm_tick_threshold)
         return df
@@ -275,7 +319,6 @@ def train_temporal(
     Xva = _to_numpy(df_valid, feat_cols)
     yva = df_valid[label_col].to_numpy().astype(np.float32)
 
-    dev_params, banner = _device_params(device)
     params_bin = {
         **dev_params,
         "objective": "binary:logistic",
@@ -288,7 +331,6 @@ def train_temporal(
         "reg_lambda": 1.0,
         "reg_alpha": 0.0,
     }
-    print(banner)
 
     dtr = xgb.DMatrix(Xtr, label=ytr)
     dva = xgb.DMatrix(Xva, label=yva)
@@ -317,7 +359,9 @@ def train_temporal(
 
     pnl = backtest_value(df_valid, p_cal_val, commission=commission, edge_thresh=edge_thresh)
     print("[Backtest @ validation — value]")
-    print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']:.4f}")
+    print(
+        f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']:.4f}"
+    )
 
     # -------- price-move head (short horizon) --------
     ytr_pm = df_train["pm_up"].to_numpy().astype(np.float32)
@@ -357,26 +401,28 @@ def train_temporal(
     # Save artifacts
     value_name = f"edge_value_xgb_{preoff_minutes}m_{asof_date}_T{train_days}.json"
     pm_name = f"edge_price_xgb_{pm_horizon_secs}s_{preoff_minutes}m_{asof_date}_T{train_days}.json"
-    OUT_value = OUTPUT_DIR / value_name
-    OUT_pm = OUTPUT_DIR / pm_name
-    booster_value.save_model(str(OUT_value))
-    booster_pm.save_model(str(OUT_pm))
-    print(f"Saved models →\n  {OUT_value}\n  {OUT_pm}")
+    out_value = OUTPUT_DIR / value_name
+    out_pm = OUTPUT_DIR / pm_name
+    booster_value.save_model(str(out_value))
+    booster_pm.save_model(str(out_pm))
+    print(f"Saved models →\n  {out_value}\n  {out_pm}")
 
     # Save a compact validation report (both heads)
-    rep = pl.DataFrame({
-        "marketId": df_valid["marketId"],
-        "selectionId": df_valid["selectionId"],
-        "tto_minutes": df_valid["tto_minutes"],
-        "ltp": df_valid["ltp"],
-        "implied_prob": df_valid["implied_prob"],
-        "y_win": yva,
-        "p_win_raw": p_valid_val,
-        "p_win_cal": p_cal_val,
-        "y_pm_up": yva_pm,
-        "p_pm_up": p_valid_pm,
-        "pm_delta_ticks": df_valid["pm_delta_ticks"],
-    })
+    rep = pl.DataFrame(
+        {
+            "marketId": df_valid["marketId"],
+            "selectionId": df_valid["selectionId"],
+            "tto_minutes": df_valid["tto_minutes"],
+            "ltp": df_valid["ltp"],
+            "implied_prob": df_valid["implied_prob"],
+            "y_win": yva,
+            "p_win_raw": p_valid_val,
+            "p_win_cal": p_cal_val,
+            "y_pm_up": yva_pm,
+            "p_pm_up": p_valid_pm,
+            "pm_delta_ticks": df_valid["pm_delta_ticks"],
+        }
+    )
     rep_file = OUTPUT_DIR / f"edge_valid_both_{asof_date}_T{train_days}.csv"
     rep.write_csv(str(rep_file))
     print(f"Saved validation detail → {rep_file}")
@@ -413,7 +459,7 @@ def main():
         )
     )
     # Data
-    ap.add_argument("--curated", required=True, help="s3://bucket or /local/path")
+    ap.add_argument("--curated", required=True, help="/mnt/nvme/betfair-curated or s3://bucket")
     ap.add_argument("--sport", required=True)
     ap.add_argument("--asof", required=True, help="Validation end date (YYYY-MM-DD)")
     ap.add_argument("--train-days", type=int, default=5, help="Number of training days ending at asof-2")
@@ -429,7 +475,12 @@ def main():
 
     # Trading eval (value)
     ap.add_argument("--commission", type=float, default=0.02)
-    ap.add_argument("--edge-thresh", type=float, default=0.02, help="Back if p_model - p_market > thresh")
+    ap.add_argument(
+        "--edge-thresh",
+        type=float,
+        default=0.02,
+        help="Back if p_model - p_market > thresh",
+    )
     ap.add_argument("--no-calibrate", action="store_true", help="Disable isotonic calibration for value head")
 
     # Price-move head
