@@ -6,21 +6,19 @@ set -euo pipefail
 # Usage:
 #   train_edge_temporal.sh START_DATE [SPORT] [PREOFF_MINS] [DOWNSAMPLE_SECS]
 #
-# Example:
-#   train_edge_temporal.sh 2025-09-05 horse-racing 30 5
-#
 # Env overrides:
-#   CURATED_ROOT   (default /mnt/nvme/betfair-curated)
-#   COMMISSION     (default 0.02)
-#   EDGE_THRESH    (default 0.005)
-#   PM_HORIZON_SECS (default 60)
-#   PM_TICK_THRESHOLD (default 1)
-#   EDGE_PROB      (raw|cal, default raw)
-#   NO_SUM_TO_ONE  (1 to disable sum-to-one; default 1)
-#   PM_SLACK_SECS  (default 3)
-#
-# Relies on:
-#   /opt/BetfairBotML/edge_temporal/ml/train_edge_temporal.py
+#   CURATED_ROOT         (default /mnt/nvme/betfair-curated)
+#   COMMISSION           (default 0.02)
+#   EDGE_THRESH          (default 0.005)
+#   PM_HORIZON_SECS      (default 60)
+#   PM_TICK_THRESHOLD    (default 1)
+#   PM_SLACK_SECS        (default 3)
+#   EDGE_PROB            (raw|cal, default raw)
+#   NO_SUM_TO_ONE        (1 disables sum-to-one; default 0 enables)
+#   MARKET_PROB          (ltp|overround, default overround)
+#   PER_MARKET_TOPK      (default 1)
+#   STAKE                (flat|kelly, default flat)
+#   KELLY_CAP            (default 0.05)
 # ------------------------------------------------------------
 
 ML_ROOT="/opt/BetfairBotML/edge_temporal"
@@ -38,7 +36,11 @@ PM_TICK_THRESHOLD="${PM_TICK_THRESHOLD:-1}"
 PM_SLACK_SECS="${PM_SLACK_SECS:-3}"
 
 EDGE_PROB="${EDGE_PROB:-raw}"
-NO_SUM_TO_ONE="${NO_SUM_TO_ONE:-1}"   # 1 disables sum-to-one in backtest
+NO_SUM_TO_ONE="${NO_SUM_TO_ONE:-0}"
+MARKET_PROB="${MARKET_PROB:-overround}"
+PER_MARKET_TOPK="${PER_MARKET_TOPK:-1}"
+STAKE="${STAKE:-flat}"
+KELLY_CAP="${KELLY_CAP:-0.05}"
 
 # ---- args ----
 if [[ $# -lt 1 ]]; then
@@ -60,7 +62,6 @@ TRAIN_END="$(date -d "${ASOF} -2 day" +%F)"
 VALID0="$(date -d "${ASOF} -1 day" +%F)"
 VALID1="${ASOF}"
 
-# sanity check
 if [[ "$(date -d "${START_DATE}" +%s)" -gt "$(date -d "${TRAIN_END}" +%s)" ]]; then
   echo "ERROR: START_DATE (${START_DATE}) must be on or before TRAIN_END (${TRAIN_END})." >&2
   exit 3
@@ -89,6 +90,9 @@ echo "PM tick threshold:    ${PM_TICK_THRESHOLD}"
 echo "PM slack (secs):      ${PM_SLACK_SECS}"
 echo "Edge prob:            ${EDGE_PROB}"
 echo "Sum-to-one:           $([[ "${NO_SUM_TO_ONE}" == "1" ]] && echo "disabled" || echo "enabled")"
+echo "Market prob:          ${MARKET_PROB}"
+echo "Per-market topK:      ${PER_MARKET_TOPK}"
+echo "Stake mode:           ${STAKE} (kelly_cap=${KELLY_CAP})"
 echo
 
 # ---- run Python ----
@@ -108,4 +112,8 @@ python3 "${ML_PY}" \
   --pm-slack-secs "${PM_SLACK_SECS}" \
   --edge-prob "${EDGE_PROB}" \
   $([[ "${NO_SUM_TO_ONE}" == "1" ]] && echo "--no-sum-to-one") \
+  --market-prob "${MARKET_PROB}" \
+  --per-market-topk "${PER_MARKET_TOPK}" \
+  --stake "${STAKE}" \
+  --kelly-cap "${KELLY_CAP}" \
   --device cuda

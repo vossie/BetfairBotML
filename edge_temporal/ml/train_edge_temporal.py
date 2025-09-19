@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Clean temporal trainer with two heads (value + price-move), CUDA default, and no-leak labels.
-- Validation window: [ASOF-1, ASOF]
-- Training window: last --train-days ending at (ASOF-2)
+Temporal trainer with two heads (value + price-move), CUDA default, and no-leak labels.
+- Validation window: [ASOF-1, ASOF]; Train: last --train-days ending at (ASOF-2)
 - Uses pm_labels.add_price_move_labels (BACKWARD as-of at t+h with tight tolerance)
-- Skips missing dates gracefully
-- Saves models + a validation CSV to project-level output/
+- Adds robust value backtest knobs: RAW/CAL, (no) sum-to-one, overround comparator, per-market topK, flat/Kelly stakes
+- Skips missing dates gracefully, saves models & validation CSV to output/
 """
 from __future__ import annotations
 
@@ -64,7 +63,7 @@ def build_split(asof: _date, train_days: int) -> SplitPlan:
         valid_dates=[_fmt(val0), _fmt(val1)],
     )
 
-# Polars dtype helper (robust across versions)
+# Polars dtype helper
 try:
     from polars.datatypes import is_numeric as _isnum
 except Exception:
@@ -116,6 +115,31 @@ def _device_params(device: str) -> Tuple[Dict, str]:
     else:
         return {"device": "cpu", "tree_method": "hist"}, "Using CPU"
 
+# ----------------------------- value backtest helpers -----------------------------
+def _group_indices(ids: np.ndarray):
+    """Return list of index arrays, grouped by market id (stable-ish order)."""
+    order = np.argsort(ids, kind="mergesort")
+    ids_sorted = ids[order]
+    groups = []
+    start = 0
+    for i in range(1, len(ids_sorted) + 1):
+        if i == len(ids_sorted) or ids_sorted[i] != ids_sorted[start]:
+            groups.append(order[start:i])
+            start = i
+    return groups
+
+def _overround_adjust(pim: np.ndarray, market_ids: np.ndarray) -> np.ndarray:
+    out = pim.copy()
+    for idxs in _group_indices(market_ids):
+        s = out[idxs].sum()
+        if s > 0:
+            out[idxs] = out[idxs] / s
+    return out
+
+def _decimal_odds_from_ltp(ltp: np.ndarray) -> np.ndarray:
+    # If ltp is already decimal odds, this is identity.
+    return ltp
+
 # ----------------------------- value backtest -----------------------------
 def backtest_value(
     df: pl.DataFrame,
@@ -123,56 +147,84 @@ def backtest_value(
     commission: float,
     edge_thresh: float,
     do_sum_to_one: bool,
+    market_prob_mode: str,    # "ltp" | "overround"
+    per_market_topk: int,     # e.g. 1
+    stake_mode: str,          # "flat" | "kelly"
+    kelly_cap: float = 0.05,  # max Kelly fraction
 ) -> Dict[str, float]:
-    # Align and mask finite rows
     pim = df["implied_prob"].to_numpy()
-    finite = np.isfinite(p_model) & np.isfinite(pim)
+    market_ids = df["marketId"].to_numpy()
+    y = df["winLabel"].to_numpy().astype(int)
+    ltp = df["ltp"].to_numpy()
+    finite = np.isfinite(p_model) & np.isfinite(pim) & np.isfinite(ltp)
 
     if finite.sum() == 0:
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float("nan")}
 
     p = p_model[finite].copy()
-    pim_f = pim[finite]
-    market_ids = df["marketId"].to_numpy()[finite]
-    y = df["winLabel"].to_numpy().astype(int)[finite]
-    ltp = df["ltp"].to_numpy()[finite]
+    pim_f = pim[finite].copy()
+    mids = market_ids[finite]
+    y = y[finite]
+    ltp = ltp[finite]
 
+    # Comparator probability
+    if market_prob_mode == "overround":
+        pim_f = _overround_adjust(pim_f, mids)
+
+    # Optional normalization of model probs by market
     if do_sum_to_one:
-        for m in np.unique(market_ids):
-            mask = (market_ids == m)
-            s = p[mask].sum()
+        for idxs in _group_indices(mids):
+            s = p[idxs].sum()
             if s > 0:
-                p[mask] /= s
+                p[idxs] = p[idxs] / s
 
     edge = p - pim_f
-    sel = edge > edge_thresh
 
-    if sel.sum() == 0:
+    # Per-market selection: top-K edges above threshold
+    take = np.zeros_like(edge, dtype=bool)
+    for idxs in _group_indices(mids):
+        ei = edge[idxs]
+        cand = np.where(ei > edge_thresh)[0]
+        if cand.size == 0:
+            continue
+        top = cand[np.argsort(ei[cand])[-per_market_topk:]]
+        mask = np.zeros_like(ei, dtype=bool)
+        mask[top] = True
+        take[idxs] = mask
+
+    if take.sum() == 0:
         return {"n_trades": 0, "roi": 0.0, "hit_rate": 0.0, "avg_edge": float(np.nan)}
 
-    profit = np.where(y == 1, (ltp - 1.0) * (1.0 - commission), -1.0)
-    pnl = profit[sel].sum()
-    n = int(sel.sum())
+    # Stakes
+    if stake_mode == "flat":
+        stake = np.ones_like(p[take], dtype=float)
+    else:
+        dec = _decimal_odds_from_ltp(ltp[take])
+        b = (dec - 1.0) * (1.0 - commission)
+        q = 1.0 - p[take]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            f = (b * p[take] - q) / np.where(b == 0, np.nan, b)
+        f = np.clip(np.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0), 0.0, kelly_cap)
+        stake = f
+
+    # Profit per bet
+    dec = _decimal_odds_from_ltp(ltp[take])
+    win_prof = stake * (dec - 1.0) * (1.0 - commission)
+    loss_prof = -stake
+    profit = np.where(y[take] == 1, win_prof, loss_prof)
+
+    n = int(take.sum())
+    if stake_mode == "flat":
+        roi = float(profit.sum() / max(1, n))  # per 1-unit bet
+    else:
+        roi = float(profit.sum() / max(1.0, stake.sum()))  # per unit stake
 
     return {
         "n_trades": n,
-        "roi": float(pnl / n),
-        "hit_rate": float(y[sel].mean()),
-        "avg_edge": float(edge[sel].mean()),
+        "roi": roi,
+        "hit_rate": float(y[take].mean()),
+        "avg_edge": float(edge[take].mean()),
     }
-
-# ----------------------------- FS guards -----------------------------
-def _has_snapshot_day(curated_root: str, sport: str, day: str) -> bool:
-    p = Path(curated_root) / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={day}"
-    return p.exists()
-
-def _filter_dates_with_data(curated_root: str, sport: str, dates: List[str]) -> List[str]:
-    ok, missing = [], []
-    for d in dates:
-        (ok if _has_snapshot_day(curated_root, sport, d) else missing).append(d)
-    if missing:
-        print(f"WARN: Skipping {len(missing)} day(s) with no snapshots: {', '.join(missing)}")
-    return ok
 
 # ----------------------------- metrics -----------------------------
 def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
@@ -211,6 +263,10 @@ def train_temporal(
     pm_slack_secs: int,
     edge_prob: str,
     no_sum_to_one: bool,
+    market_prob_mode: str,
+    per_market_topk: int,
+    stake_mode: str,
+    kelly_cap: float,
 ) -> None:
     asof = _parse_date(asof_date)
     plan = build_split(asof, train_days)
@@ -246,6 +302,10 @@ def train_temporal(
         )
         return df
 
+    # FS helpers
+    # (defined after use above to keep code tidy)
+    # -----------------------------
+    # Build
     df_train = _build(plan.train_dates)
     df_valid = _build(plan.valid_dates)
 
@@ -297,7 +357,7 @@ def train_temporal(
     pim = df_valid["implied_prob"].to_numpy()
     mask = np.isfinite(use_p) & np.isfinite(pim)
     edge_dbg = use_p[mask] - pim[mask]
-    for thr in [0.0, 0.0025, 0.005, 0.01, 0.02]:
+    for thr in [0.0, 0.003, 0.005, 0.01, 0.02]:
         print(f"edge>{thr:.3f}: n={(edge_dbg > thr).sum()} (of {mask.sum()} finite)")
 
     metrics_val = _metrics_binary(yva, p_valid_val)
@@ -309,6 +369,10 @@ def train_temporal(
         commission=commission,
         edge_thresh=edge_thresh,
         do_sum_to_one=(not no_sum_to_one),
+        market_prob_mode=market_prob_mode,
+        per_market_topk=per_market_topk,
+        stake_mode=stake_mode,
+        kelly_cap=kelly_cap,
     )
     print("[Backtest @ validation — value]")
     print(f"  n_trades={pnl['n_trades']}  roi={pnl['roi']:.4f}  hit_rate={pnl['hit_rate']:.3f}  avg_edge={pnl['avg_edge']}")
@@ -335,8 +399,8 @@ def train_temporal(
     preds = p_valid_pm >= 0.5
     acc = float((preds.astype(np.int8) == yva_pm.astype(np.int8)).mean())
     taken = int(preds.sum())
-    hit_up = float(yva_pm[preds].mean()) if taken else 0.0
     avg_move_ticks = float(np.mean(df_valid["pm_delta_ticks"].to_numpy()[preds])) if taken else 0.0
+    hit_up = float(yva_pm[preds].mean()) if taken else 0.0
 
     print(f"\n[Price-move head: horizon={pm_horizon_secs}s, threshold={pm_tick_threshold}t]")
     print(f"  logloss={metrics_pm['logloss']:.4f} auc={metrics_pm['auc']:.3f}  acc@0.5={acc:.3f}")
@@ -368,11 +432,23 @@ def train_temporal(
     rep.write_csv(str(rep_file))
     print(f"Saved validation detail → {rep_file}")
 
+# ----------------------------- FS guards (after training defs for clarity) -----------------------------
+def _has_snapshot_day(curated_root: str, sport: str, day: str) -> bool:
+    p = Path(curated_root) / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={day}"
+    return p.exists()
+
+def _filter_dates_with_data(curated_root: str, sport: str, dates: List[str]) -> List[str]:
+    ok, missing = [], []
+    for d in dates:
+        (ok if _has_snapshot_day(curated_root, sport, d) else missing).append(d)
+    if missing:
+        print(f"WARN: Skipping {len(missing)} day(s) with no snapshots: {', '.join(missing)}")
+    return ok
+
 # ----------------------------- CLI -----------------------------
 def main():
     ap = argparse.ArgumentParser(description=(
-        "Temporal split with 2-day validation, value+price heads, calibration, value backtest. "
-        "Validation end date is --asof; valid=[asof-1, asof]; train ends at asof-2."
+        "Temporal split with 2-day validation, value+price heads, calibration, and robust value backtest."
     ))
     # Data
     ap.add_argument("--curated", required=True, help="/mnt/nvme/betfair-curated or s3://bucket")
@@ -381,23 +457,37 @@ def main():
     ap.add_argument("--train-days", type=int, default=5, help="Number of training days ending at asof-2")
     ap.add_argument("--preoff-mins", type=int, default=30)
     ap.add_argument("--downsample-secs", type=int, default=5)
+
     # Model
     ap.add_argument("--device", choices=["auto", "cuda", "cpu"], default="cuda")
     ap.add_argument("--label-col", default="winLabel")
     ap.add_argument("--n-estimators", type=int, default=2000)
     ap.add_argument("--learning-rate", type=float, default=0.03)
     ap.add_argument("--early-stopping-rounds", type=int, default=100)
+
     # Trading eval (value)
     ap.add_argument("--commission", type=float, default=0.02)
     ap.add_argument("--edge-thresh", type=float, default=0.02, help="Back if p_model - p_market > thresh")
     ap.add_argument("--no-calibrate", action="store_true", help="Disable isotonic calibration for value head")
+
     # Price-move head
     ap.add_argument("--pm-horizon-secs", type=int, default=60, help="Short-horizon seconds for price-move label")
     ap.add_argument("--pm-tick-threshold", type=int, default=1, help="Minimum future move in ticks to label as 1")
     ap.add_argument("--pm-slack-secs", type=int, default=3, help="Tolerance slack around horizon for asof join")
+
     # Backtest controls
-    ap.add_argument("--edge-prob", choices=["raw", "cal"], default="cal", help="Use raw or calibrated probabilities for edge calc")
-    ap.add_argument("--no-sum-to-one", action="store_true", help="Disable per-market sum-to-one normalization in backtest")
+    ap.add_argument("--edge-prob", choices=["raw", "cal"], default="cal",
+                    help="Use raw or calibrated probabilities for edge calc")
+    ap.add_argument("--no-sum-to-one", action="store_true",
+                    help="Disable per-market sum-to-one normalization in backtest")
+    ap.add_argument("--market-prob", choices=["ltp", "overround"], default="overround",
+                    help="Comparator prob: raw LTP implied or overround-normalized within market")
+    ap.add_argument("--per-market-topk", type=int, default=1,
+                    help="Take top-K edges per market that exceed threshold (default 1)")
+    ap.add_argument("--stake", choices=["flat", "kelly"], default="flat",
+                    help="Stake model for backtest")
+    ap.add_argument("--kelly-cap", type=float, default=0.05,
+                    help="Max Kelly fraction (if --stake kelly)")
 
     args = ap.parse_args()
 
@@ -421,6 +511,10 @@ def main():
         pm_slack_secs=args.pm_slack_secs,
         edge_prob=args.edge_prob,
         no_sum_to_one=args.no_sum_to_one,
+        market_prob_mode=args.market_prob,
+        per_market_topk=args.per_market_topk,
+        stake_mode=args.stake,
+        kelly_cap=args.kelly_cap,
     )
 
 if __name__ == "__main__":
