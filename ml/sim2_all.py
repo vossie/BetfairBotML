@@ -18,7 +18,7 @@ from . import features
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ------------------ Global Worker Caches (loaded once per worker) ------------------
+# ------------------ Global Worker Caches ------------------
 _DF_IPC_CACHE: Optional[pl.DataFrame] = None
 _BOOSTER_SINGLE = None
 _BOOSTER_30 = None
@@ -26,11 +26,10 @@ _BOOSTER_180 = None
 _MODEL_PATHS: Dict[str, Optional[str]] = {"single": True, "model": None, "model_30": None, "model_180": None}
 
 def _ensure_worker_init(ipc_path: Optional[str], model_paths: Dict[str, Optional[str]]):
-    """Load heavy assets once per worker process."""
+    """Load heavy assets once per worker."""
     global _DF_IPC_CACHE, _BOOSTER_SINGLE, _BOOSTER_30, _BOOSTER_180, _MODEL_PATHS
     if _DF_IPC_CACHE is None and ipc_path:
         _DF_IPC_CACHE = pl.read_ipc(ipc_path)
-    # cache model paths for later
     _MODEL_PATHS = model_paths
     if _MODEL_PATHS.get("single"):
         if _BOOSTER_SINGLE is None and _MODEL_PATHS.get("model"):
@@ -49,18 +48,17 @@ def _run_combo(task):
     class A: pass
     a = A(); a.__dict__.update(args_dict); a.__dict__.update({k: v for k, v in zip(keys, vals)})
 
-    # Use cached assets
+    # Choose cached boosters
     if _MODEL_PATHS.get("single"):
         bs = _BOOSTER_SINGLE; b30 = b180 = None
     else:
         bs = None; b30 = _BOOSTER_30; b180 = _BOOSTER_180
 
-    # simulate (don’t write per-combo artifacts for speed)
     summary = simulate_once(a, _DF_IPC_CACHE, bs, b30, b180,
                             out_prefix=f"combo_{idx}", write_bets=False)
     return {"combo": idx, **{k: v for k, v in zip(keys, vals)}, **summary}
 
-# ------------------ Helpers: grid parsing ------------------
+# ------------------ Grid parsing helpers ------------------
 def _coerce_like(example: Any, s: str) -> Any:
     if isinstance(example, bool): return str(s).strip().lower() in ("1","true","yes","y","on")
     if isinstance(example, int):
@@ -112,17 +110,10 @@ def _parse_grid_spec(grid_str: str, args_ns: argparse.Namespace) -> Dict[str, Li
 
 # ------------------ Main ------------------
 def main():
-    # Let Polars use all cores unless pinned by env
-    # (prevents silent single-thread execution)
-    try:
-        n = int(os.environ.get("POLARS_MAX_THREADS", "0")) or os.cpu_count() or 1
-        pl.Config.set_global_string_cache(True)
-        pl.Config.set_tbl_rows(100)
-        pl.Config.set_fmt_str_lengths(120)
-        pl.Config.set_streaming_chunk_size(200000)
-        # not a public API for threads, but envs are set in launcher; this is just formatting config
-    except Exception:
-        pass
+    # let Polars format nicely; threads set via env in launcher
+    pl.Config.set_global_string_cache(True)
+    pl.Config.set_tbl_rows(100)
+    pl.Config.set_fmt_str_lengths(120)
 
     ap = argparse.ArgumentParser(description="Load-once, score-once parameter sweep to find best combo (by ROI).")
     # models
@@ -190,17 +181,17 @@ def main():
             raise SystemExit("No model supplied and ./output/xgb_model.json not found.")
         args.model = str(default); single = True
 
-    # Load model(s) once in parent — workers will lazy-load on first use
+    # Load model(s) once in parent — we KEEP references and also pass paths to workers
     model_paths = {"single": single, "model": None, "model_30": None, "model_180": None}
+    booster_single = booster_30 = booster_180 = None
     if single:
         model_paths["model"] = args.model
-        # parent load (helps OS page cache, avoids repeated disk IO)
-        _ = _load_booster(args.model)
+        booster_single = _load_booster(args.model)
     else:
         model_paths["model_30"] = args.model_30
         model_paths["model_180"] = args.model_180
-        _ = _load_booster(args.model_30)
-        _ = _load_booster(args.model_180)
+        booster_30 = _load_booster(args.model_30)
+        booster_180 = _load_booster(args.model_180)
 
     # Build & concat features once
     t0 = time.time()
@@ -225,22 +216,25 @@ def main():
     df_feat = pl.concat(parts, how="vertical", rechunk=True)
     t1 = time.time()
 
-    # Score once
+    # Score once (using in-memory boosters)
     if single:
         fcols = _select_feature_cols(df_feat, args.label_col)
-        df_feat = df_feat.with_columns(pl.lit(_predict_proba(df_feat, None, fcols, booster_override=args.model)).alias("p_hat"))
+        df_feat = df_feat.with_columns(
+            pl.lit(_predict_proba(df_feat, booster_single, fcols)).alias("p_hat")
+        )
     else:
         early = df_feat.filter(pl.col("tto_minutes") > args.gate_mins)
         late  = df_feat.filter(pl.col("tto_minutes") <= args.gate_mins)
         chunks = []
         if not early.is_empty():
             f180 = _select_feature_cols(early, args.label_col)
-            chunks.append(early.with_columns(pl.lit(_predict_proba(early, None, f180, booster_override=args.model_180)).alias("p_hat")))
+            chunks.append(early.with_columns(pl.lit(_predict_proba(early, booster_180, f180)).alias("p_hat")))
         if not late.is_empty():
             f30 = _select_feature_cols(late, args.label_col)
-            chunks.append(late.with_columns(pl.lit(_predict_proba(late, None, f30, booster_override=args.model_30)).alias("p_hat")))
+            chunks.append(late.with_columns(pl.lit(_predict_proba(late, booster_30, f30)).alias("p_hat")))
         if chunks:
             df_feat = pl.concat(chunks, how="vertical", rechunk=True)
+
     # Trim to needed columns
     keep = [
         "sport","marketId","selectionId","publishTimeMs","tto_minutes",
