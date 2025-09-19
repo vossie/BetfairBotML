@@ -28,7 +28,7 @@ except Exception:
 import features
 from pm_labels import add_price_move_labels
 
-OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+OUTPUT_DIR = (Path(__file__).resolve().parent.parent / "output")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------------------- utils -----------------------------
@@ -136,10 +136,6 @@ def _overround_adjust(pim: np.ndarray, market_ids: np.ndarray) -> np.ndarray:
             out[idxs] = out[idxs] / s
     return out
 
-def _decimal_odds_from_ltp(ltp: np.ndarray) -> np.ndarray:
-    # If ltp is already decimal odds, this is identity.
-    return ltp
-
 def _roi_by_odds_table(ltp: np.ndarray, y: np.ndarray, profit: np.ndarray) -> List[Dict[str, float]]:
     """
     Compute tiny ROI-by-odds table over taken trades.
@@ -155,7 +151,7 @@ def _roi_by_odds_table(ltp: np.ndarray, y: np.ndarray, profit: np.ndarray) -> Li
             hit = float("nan"); roi = float("nan")
         else:
             hit = float(y[m].mean())
-            roi = float(profit[m].sum() / n)
+            roi = float(profit[m].sum() / max(1, n))
         out.append({"lo": lo, "hi": hi, "n": n, "hit": hit, "roi": roi})
     return out
 
@@ -296,7 +292,6 @@ def backtest_value(
     roi_tbl = _roi_by_odds_table(sel_l, sel_y, profit)
 
     # Build recommendation rows (absolute indices back to df)
-    # Map chosen indices back to original df indices
     base_mask = np.zeros_like(p_model, dtype=bool); base_mask[finite] = True
     base_idx = np.where(base_mask)[0]
     l_finite = ltp[finite]
@@ -320,7 +315,6 @@ def backtest_value(
             "edge_back": float(sel_edge_back[i]),  # positive means model>market
         })
 
-    # Also return the selected arrays so the caller can compute alternate staking
     sel_arrays = {
         "odds": sel_l,
         "y": sel_y.astype(int),
@@ -357,8 +351,7 @@ def _metrics_binary(y_true: np.ndarray, p: np.ndarray) -> Dict[str, float]:
     return {"logloss": float(logloss), "auc": float(auc)}
 
 def _pm_threshold_sweep(p: np.ndarray, y: np.ndarray, fut_ticks: np.ndarray) -> None:
-    """Print precision/recall/F1/N/avg_future_move for p_pm_up at thresholds 0.50..0.90."""
-    ths = np.arange(0.50, 0.95, 0.05)  # 0.50, 0.55, ..., 0.90
+    ths = np.arange(0.50, 0.95, 0.05)
     pos = (y == 1)
     n_pos = int(pos.sum())
     print("\n[PM threshold sweep]")
@@ -510,6 +503,7 @@ def train_temporal(
     metrics_val = _metrics_binary(yva, p_valid_val)
     print(f"\n[Value head: winLabel] logloss={metrics_val['logloss']:.4f} auc={metrics_val['auc']:.3f}  n={len(yva)}")
 
+    # ---- Backtest value head ----
     pnl = backtest_value(
         df=df_valid,
         p_model=use_p,
@@ -536,12 +530,12 @@ def train_temporal(
             lo, hi, n, hit, roi = row["lo"], row["hi"], row["n"], row["hit"], row["roi"]
             print(f"  [{lo:4.2f},{hi:6.2f})  {n:5d}  {hit:5.3f}  {roi:6.3f}")
 
-    # --- new: side summary if recos present ---
+    # --- side summary & recos CSV ---
     recs = pnl.get("recos", [])
     if recs:
         rec_df_all = pl.DataFrame(recs)
         by_side = rec_df_all.group_by("side").agg([
-            pl.count().alias("n"),
+            pl.len().alias("n"),
             pl.mean("edge_back").alias("avg_edge"),
             pl.mean("stake").alias("avg_stake"),
         ])
@@ -549,16 +543,14 @@ def train_temporal(
         for row in by_side.iter_rows(named=True):
             print(f"  side={row['side']:>4}  n={row['n']:>5}  avg_edge={row['avg_edge']:.4f}  avg_stake={row['avg_stake']:.3f}")
 
-    # Save recommendations from validation as a CSV (action plan)
-    if recs:
-        rec_df = pl.DataFrame(recs).select([
+        rec_df = rec_df_all.select([
             "marketId","selectionId","ltp","side","stake","p_model","p_market","edge_back"
         ])
         rec_file = OUTPUT_DIR / f"edge_recos_valid_{asof_date}_T{train_days}.csv"
         rec_df.write_csv(str(rec_file))
         print(f"\nSaved recommendations → {rec_file}")
 
-    # --- Staking comparison: Flat £10 vs Kelly (nominal £1000, backs only) ---
+    # --- Staking comparison: Flat £10 vs Kelly (nominal £1000, use same cap as backtest) ---
     sel = pnl.get("sel_arrays", {})
     if sel:
         odds = np.asarray(sel["odds"])
@@ -567,7 +559,6 @@ def train_temporal(
         pmod = np.asarray(sel["p"])
         comm = float(sel.get("commission", 0.0))
 
-        # per-unit outcomes (already computed as sel['unit_return'], but recompute for clarity)
         unit_ret = np.zeros_like(odds, dtype=float)
         for i in range(len(odds)):
             dec = odds[i]
@@ -576,34 +567,40 @@ def train_temporal(
             else:
                 unit_ret[i] = (1.0 - comm) if ywin[i] == 0 else -(dec - 1.0)
 
-        # Flat £10 stake
+        # Flat £10
         flat_stake = 10.0
         flat_profit = float(np.sum(unit_ret * flat_stake))
         flat_n = len(unit_ret)
-        flat_roi = flat_profit / (flat_n * flat_stake) if flat_n > 0 else float("nan")
+        flat_gross = flat_n * flat_stake
+        flat_roi = flat_profit / flat_gross if flat_gross > 0 else float("nan")
 
-        # Kelly with nominal bankroll (backs only Kelly; lays kept flat £10 for safety)
+        # Kelly (nominal £1000), same cap as backtest
         bankroll_nom = 1000.0
+        kelly_fraction = 1.0   # set <1 for fractional Kelly
+        stake_floor = 0.0      # e.g. 5.0 to avoid tiny stakes
+        cap = float(kelly_cap)
+
         kelly_stakes = np.zeros_like(unit_ret)
         for i in range(len(odds)):
             dec = odds[i]
             if sides[i] == "back":
                 b = (dec - 1.0) * (1.0 - comm)
                 q = 1.0 - pmod[i]
-                f = (b * pmod[i] - q) / (b if b != 0 else 1e-12)
-                f = np.clip(np.nan_to_num(f, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 0.05)  # cap 5%
-                kelly_stakes[i] = f * bankroll_nom
+                f_raw = (b * pmod[i] - q) / (b if b != 0 else 1e-12)
+                f = np.clip(np.nan_to_num(f_raw, nan=0.0, posinf=0.0, neginf=0.0), 0.0, cap)
+                f *= kelly_fraction
+                kelly_stakes[i] = max(stake_floor, f * bankroll_nom)
             else:
-                # lay: keep flat stake to avoid liability explosion in comparison
-                kelly_stakes[i] = flat_stake
+                kelly_stakes[i] = flat_stake  # simple comparison for lays
 
         kelly_profit = float(np.sum(unit_ret * kelly_stakes))
+        kelly_gross = float(np.sum(kelly_stakes))
         kelly_avg_stake = float(np.mean(kelly_stakes)) if len(kelly_stakes) else 0.0
-        kelly_roi = kelly_profit / (np.sum(kelly_stakes) if np.sum(kelly_stakes) > 0 else np.nan)
+        kelly_roi = kelly_profit / kelly_gross if kelly_gross > 0 else float("nan")
 
         print("\n[Staking comparison]")
-        print(f"  Flat £10 stake    → trades={flat_n}  profit=£{flat_profit:.2f}  roi={flat_roi:.3f}")
-        print(f"  Kelly (nom £1000) → trades={flat_n}  profit=£{kelly_profit:.2f}  roi={kelly_roi:.3f}  avg_stake=£{kelly_avg_stake:.2f}")
+        print(f"  Flat £10 stake    → trades={flat_n}  staked=£{flat_gross:.2f}  profit=£{flat_profit:.2f}  roi={flat_roi:.3f}")
+        print(f"  Kelly (nom £1000) → trades={flat_n}  staked=£{kelly_gross:.2f}  profit=£{kelly_profit:.2f}  roi={kelly_roi:.3f}  avg_stake=£{kelly_avg_stake:.2f}")
 
     # -------- price-move head (short horizon) --------
     ytr_pm = df_train["pm_up"].to_numpy().astype(np.float32)
@@ -634,7 +631,6 @@ def train_temporal(
     print(f"  logloss={metrics_pm['logloss']:.4f} auc={metrics_pm['auc']:.3f}  acc@0.5={acc:.3f}")
     print(f"  taken_signals={taken}  hit_rate={hit_up:.3f}  avg_future_move_ticks={avg_move_ticks:.2f}")
 
-    # PM threshold sweep for quick operating-point selection
     _pm_threshold_sweep(
         p=p_valid_pm,
         y=yva_pm.astype(int),
