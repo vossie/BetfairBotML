@@ -608,6 +608,21 @@ def train_temporal(
         print("\n[Staking comparison]")
         print(f"  Flat £10 stake    → trades={flat_n}  staked=£{flat_gross:.2f}  profit=£{flat_profit:.2f}  roi={flat_roi:.3f}")
         print(f"  Kelly (nom £1000) → trades={flat_n}  staked=£{kelly_gross:.2f}  profit=£{kelly_profit:.2f}  roi={kelly_roi:.3f}  avg_stake=£{kelly_avg_stake:.2f}")
+        print("\n[Staking comparison]")
+        print(
+            f"  Flat £10 stake    → trades={n_trades}  staked=£{flat_staked:.2f}  profit=£{flat_profit:.2f}  roi={flat_roi:.3f}")
+        print(
+            f"  Kelly (nom £{BANKROLL_NOM}) → trades={n_trades}  staked=£{kelly_staked:.2f}  profit=£{kelly_profit:.2f}  roi={kelly_roi:.3f}  avg_stake=£{kelly_avg:.2f}")
+
+        # ⬇️ ADD THIS RIGHT HERE
+        import numpy as np
+        if args.stake == "kelly" and len(pnl.get("stakes", [])) > 0:
+            stakes = np.array(pnl["stakes"])
+            if stakes.size > 0:
+                hist = np.percentile(stakes, [0, 25, 50, 75, 100])
+                print("\n[Kelly stake distribution]")
+                print(f"  min=£{hist[0]:.2f}  p25=£{hist[1]:.2f}  median=£{hist[2]:.2f}  "
+                      f"p75=£{hist[3]:.2f}  max=£{hist[4]:.2f}")
 
     # -------- price-move head (short horizon) --------
     ytr_pm = df_train["pm_up"].to_numpy().astype(np.float32)
