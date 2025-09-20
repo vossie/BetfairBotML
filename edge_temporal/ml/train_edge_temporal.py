@@ -178,48 +178,88 @@ def evaluate(df_valid,odds,y,p_model,p_market,edge_t,pm_c,topk,lo,hi,stake_mode,
     return dict(n_trades=int(outcomes.size),roi=roi,profit=pnl)
 
 def main():
-    args=parse_args()
-    OUTPUT_DIR=Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
-    OUTPUT_DIR.mkdir(parents=True,exist_ok=True)
-    asof_dt=parse_date(args.asof)
-    train_end=asof_dt-timedelta(days=args.valid-days)
-    train_start=train_end-timedelta(days=args.train_days-1)
-    valid_start=asof_dt-timedelta(days=args.valid_days-1)
-    valid_end=asof_dt
-    files=glob_files(args.curated,train_start,valid_end)
-    files=filter_files(files,REQUIRED_COLS)
-    schema=infer_schema(files)
-    date_col=pick_date(schema)
-    feats=select_feats(schema)
-    needed=list(REQUIRED_COLS|set(feats))
-    if date_col: needed.append(date_col)
-    casts=set(feats)|{"winLabel","ltp"}
-    df_all=scan_collect(files,needed,casts,date_col)
-    if date_col: df_all=df_all.with_columns(pl.col(date_col).cast(pl.Datetime))
-    else: date_col="__fileDate"
-    df_train=df_all.filter((pl.col(date_col)>=train_start)&(pl.col(date_col)<=train_end))
-    df_valid=df_all.filter((pl.col(date_col)>=valid_start)&(pl.col(date_col)<=valid_end))
-    dtrain=xgb.DMatrix(df_train.select(feats).to_arrow(),label=df_train["winLabel"].to_numpy(np.float32))
-    dvalid=xgb.DMatrix(df_valid.select(feats).to_arrow(),label=df_valid["winLabel"].to_numpy(np.float32))
-    booster=train(make_params(args.device),dtrain,dvalid,must_gpu=(args.device=="cuda"))
-    preds=booster.predict(dvalid)
-    y=df_valid["winLabel"].to_numpy(np.float32)
-    odds=df_valid["ltp"].to_numpy(np.float32)
-    p_model=preds.astype(np.float32)
-    p_market=(1.0/np.clip(odds,1e-12,None)).astype(np.float32)
-    print(f"[Value] logloss={safe_logloss(y,preds):.4f} auc={roc_auc_score(y,preds):.3f}")
-    EDGE_T=[0.010,0.012,0.015]; PM_C=[0.60,0.65]; TOPK=[1,2]; LTP_W=[(1.5,5.0)]
-    STAKE=[("flat",None,None,args.bankroll_nom),("kelly",args.kelly_cap,args.kelly_floor,args.bankroll_nom)]
-    recs=[]
-    for e,pm,t,(lo,hi),(sm,cap,floor_,bank) in itertools.product(EDGE_T,PM_C,TOPK,LTP_W,STAKE):
-        m=evaluate(df_valid,odds,y,p_model,p_market,e,pm,t,lo,hi,sm,cap or 0.0,floor_ or 0.0,bank or 1000.0,args.commission)
-        m.update(dict(edge_thresh=e,pm_cutoff=pm,topk=t,ltp_min=lo,ltp_max=hi,stake_mode=sm))
+    args = parse_args()
+
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/opt/BetfairBotML/edge_temporal/output"))
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    asof_dt = parse_date(args.asof)
+
+    # date windows
+    train_end   = asof_dt - timedelta(days=args.valid_days)
+    train_start = train_end - timedelta(days=args.train_days - 1)
+    valid_start = asof_dt - timedelta(days=args.valid_days - 1)
+    valid_end   = asof_dt
+
+    # gather files
+    files = glob_files(args.curated, train_start, valid_end)
+    files = filter_files(files, REQUIRED_COLS)
+
+    # schema / features
+    schema = infer_schema(files)
+    date_col = pick_date(schema)
+    feats = select_feats(schema)
+
+    needed = list(REQUIRED_COLS | set(feats))
+    if date_col:
+        needed.append(date_col)
+    casts = set(feats) | {"winLabel", "ltp"}
+
+    # load frame
+    df_all = scan_collect(files, needed, casts, date_col)
+    if date_col:
+        df_all = df_all.with_columns(pl.col(date_col).cast(pl.Datetime))
+    else:
+        date_col = "__fileDate"
+
+    # split train/valid
+    df_train = df_all.filter((pl.col(date_col) >= train_start) & (pl.col(date_col) <= train_end))
+    df_valid = df_all.filter((pl.col(date_col) >= valid_start) & (pl.col(date_col) <= valid_end))
+
+    # DMatrix
+    dtrain = xgb.DMatrix(df_train.select(feats).to_arrow(),
+                         label=df_train["winLabel"].to_numpy(np.float32))
+    dvalid = xgb.DMatrix(df_valid.select(feats).to_arrow(),
+                         label=df_valid["winLabel"].to_numpy(np.float32))
+
+    # train
+    booster = train(make_params(args.device), dtrain, dvalid, must_gpu=(args.device == "cuda"))
+
+    # predict
+    preds = booster.predict(dvalid)
+    y = df_valid["winLabel"].to_numpy(np.float32)
+    odds = df_valid["ltp"].to_numpy(np.float32)
+    p_model = preds.astype(np.float32)
+    p_market = (1.0 / np.clip(odds, 1e-12, None)).astype(np.float32)
+
+    print(f"[Value] logloss={safe_logloss(y, preds):.4f} auc={roc_auc_score(y, preds):.3f}")
+
+    # sweep
+    EDGE_T = [0.010, 0.012, 0.015]
+    PM_C = [0.60, 0.65]
+    TOPK = [1, 2]
+    LTP_W = [(1.5, 5.0)]
+    STAKE = [("flat", None, None, args.bankroll_nom),
+             ("kelly", args.kelly_cap, args.kelly_floor, args.bankroll_nom)]
+
+    recs = []
+    for e, pm, t, (lo, hi), (sm, cap, floor_, bank) in itertools.product(EDGE_T, PM_C, TOPK, LTP_W, STAKE):
+        m = evaluate(df_valid, odds, y, p_model, p_market,
+                     e, pm, t, lo, hi,
+                     sm, cap or 0.0, floor_ or 0.0, bank or 1000.0,
+                     args.commission)
+        m.update(dict(edge_thresh=e, pm_cutoff=pm, topk=t,
+                      ltp_min=lo, ltp_max=hi, stake_mode=sm))
         recs.append(m)
-    sweep=pl.DataFrame(recs).sort(["roi","n_trades"],descending=[True,True])
-    out=OUTPUT_DIR/f"edge_sweep_{args.asof}.csv"
+
+    sweep = pl.DataFrame(recs).sort(["roi", "n_trades"], descending=[True, True])
+    out = OUTPUT_DIR / f"edge_sweep_{args.asof}.csv"
     sweep.write_csv(str(out))
+
     print(f"sweep saved → {out}")
-    print(sweep.select(["roi","profit","n_trades","edge_thresh","pm_cutoff","stake_mode"]).head(10))
+    print(sweep.select(["roi", "profit", "n_trades", "edge_thresh",
+                        "pm_cutoff", "stake_mode"]).head(10))
+
 
 if __name__=="__main__":
     main()
