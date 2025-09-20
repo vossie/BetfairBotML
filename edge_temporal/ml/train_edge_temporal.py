@@ -67,7 +67,7 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str):
     lf=lf.explode("runners")
     lf=lf.select([
         "sport","marketId",
-        pl.col("runners")["selectionId"].alias("selectionId"),
+        pl.col("runners").struct.field("selectionId").alias("selectionId"),
         pl.col("marketStartMs").alias("marketStartMs"),
         pl.col("marketType").alias("marketType"),
         pl.col("countryCode").alias("countryCode"),
@@ -180,6 +180,7 @@ def main():
 
     if "marketStartMs" in df_all.columns:
         df_all=df_all.with_columns((pl.col("marketStartMs")-pl.col("publishTimeMs")).alias("secs_to_start"))
+        df_all=df_all.filter((pl.col("secs_to_start")>=0)&(pl.col("secs_to_start")<=args.preoff_mins*60))
 
     df_all=encode_categoricals(df_all)
 
