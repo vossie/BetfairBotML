@@ -196,8 +196,7 @@ def main():
     print(f"Edge threshold:       {args.edge_thresh}")
     print(f"Edge prob:            {args.edge_prob}")
     print(f"Sum-to-one:           {'disabled' if args.no_sum_to_one else 'enabled'}")
-    print(f"Market prob:          {args.market_pro}
-") if False else None
+    print(f"Market prob:          {args.market_pro}") if False else None
     print(f"Market prob:          {args.market_pro}")
     print(f"Per-market topK:      {args.per_market_topk}")
     print(f"Side:                 {args.side}")
