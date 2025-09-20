@@ -5,8 +5,11 @@ Edge Temporal — trainer (snapshots + results + market definitions)
 
 - Reads orderbook_snapshots_5s, results, and market_definitions
 - Joins on (sport, marketId, selectionId)
+- Filters strictly to the pre-off window (0 .. --preoff-mins minutes before off)
+- Includes runner-level features from market definitions (handicap, sortPriority, reductionFactor)
+- Keeps secs_to_start as a feature
 - GPU-first XGBoost training
-- Sweep loop with ROI + P&L (flat + kelly)
+- Expanded sweep with ROI + P&L (flat + multiple Kelly variants)
 """
 
 import argparse, os, sys
@@ -40,6 +43,8 @@ def files_for_range(root: Path, sub: str, start: datetime, end: datetime):
     return files
 
 # ---------------------------------------------------------------------
+# Loaders
+# ---------------------------------------------------------------------
 
 def load_snapshots(curated: Path, start: datetime, end: datetime, sport: str):
     files = files_for_range(curated, f"orderbook_snapshots_5s/sport={sport}", start, end)
@@ -55,7 +60,7 @@ def load_results(curated: Path, start: datetime, end: datetime, sport: str):
     if not files: die("no result files found")
     lfs=[pl.scan_parquet(f) for f in files]
     lf=pl.concat(lfs)
-    keep=["sport","marketId","selectionId","winLabel"]
+    keep=["sport","marketId","selectionId","winLabel","settledTimeMs","eventId","runnerStatus","marketType"]
     lf=lf.select([c for c in keep if c in lf.collect_schema().names()])
     return lf
 
@@ -69,7 +74,7 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str):
         "sport","marketId",
         pl.col("runners").struct.field("selectionId").alias("selectionId"),
         pl.col("marketStartMs").alias("marketStartMs"),
-        pl.col("marketType").alias("marketType"),
+        pl.col("marketType").alias("marketType_def"),
         pl.col("countryCode").alias("countryCode"),
         pl.col("runners").struct.field("handicap").alias("handicap"),
         pl.col("runners").struct.field("sortPriority").alias("sortPriority"),
@@ -83,6 +88,8 @@ def join_all(snap_lf, res_lf, defs_lf):
         df = df.join(defs_lf, on=["sport","marketId","selectionId"], how="left")
     return df.collect()
 
+# ---------------------------------------------------------------------
+# XGBoost helpers
 # ---------------------------------------------------------------------
 
 def make_params(device):
@@ -103,6 +110,8 @@ def train(params,dtrain,dvalid,must_gpu=False):
         if must_gpu: die(f"gpu training failed: {e}")
         raise
 
+# ---------------------------------------------------------------------
+# CLI
 # ---------------------------------------------------------------------
 
 def parse_args():
@@ -135,94 +144,195 @@ def parse_args():
     return ap.parse_args()
 
 # ---------------------------------------------------------------------
+# Feature engineering & evaluation
+# ---------------------------------------------------------------------
 
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
-    for col in ["marketType","countryCode"]:
+    # encode both marketType from results (if present) and marketType_def from defs (no collision)
+    for col in ["marketType","marketType_def","countryCode"]:
         if col in df.columns:
-            df=df.with_columns(pl.col(col).fill_null("UNK"))
-            df=df.to_dummies(columns=[col])
+            df = df.with_columns(pl.col(col).fill_null("UNK"))
+            df = df.to_dummies(columns=[col])
     return df
 
-def evaluate(df,odds,y,p_model,p_market,edge_t,topk,lo,hi,stake_mode,cap,floor_,bank,commission):
-    edge=p_model-p_market
-    mask=(odds>=lo)&(odds<=hi)&np.isfinite(edge)&(edge>=edge_t)
-    if not mask.any(): return dict(n_trades=0,roi=0.0,profit=0.0)
-    outcomes=y[mask]; odds_sel=odds[mask]; p_model_sel=p_model[mask]
-    if stake_mode=="kelly":
-        def kf(p,o): b=o-1; q=1-p; return max(0,(b*p-q)/b) if b>0 else 0
-        f=np.array([max(floor_,min(cap,kf(pi,oi))) for pi,oi in zip(p_model_sel,odds_sel)],dtype=np.float32)
-        stakes=f*bank
-    else:
-        stakes=np.full_like(odds_sel,10.0,dtype=np.float32)
-    gross=outcomes*(odds_sel-1.0)*stakes
-    net=gross*(1.0-commission)
-    losses=(1-outcomes)*stakes
-    profit=net-losses
-    pnl=float(profit.sum()); staked=float(stakes.sum())
-    roi=pnl/staked if staked>0 else 0.0
-    return dict(n_trades=int(outcomes.size),roi=roi,profit=pnl)
+def evaluate_per_market_topk(df_valid: pl.DataFrame,
+                             odds: np.ndarray, y: np.ndarray,
+                             p_model: np.ndarray, p_market: np.ndarray,
+                             edge_thresh: float, topk: int,
+                             lo: float, hi: float,
+                             stake_mode: str, kelly_cap: float, kelly_floor: float, bankroll: float,
+                             commission: float):
+    """
+    Apply odds window + edge threshold, then keep top-K edges per marketId, and compute ROI/P&L.
+    """
+    edge = p_model - p_market
+    base = (odds >= lo) & (odds <= hi) & np.isfinite(edge)
+    if not base.any():
+        return dict(n_trades=0, roi=0.0, profit=0.0)
 
+    df = pl.DataFrame({
+        "marketId": df_valid["marketId"].to_numpy()[base],
+        "selectionId": df_valid["selectionId"].to_numpy()[base],
+        "ltp": odds[base],
+        "edge_back": edge[base],
+        "y": y[base],
+        "p_model": p_model[base],
+    })
+
+    df = df.filter(pl.col("edge_back") >= edge_thresh)
+
+    if df.height == 0:
+        return dict(n_trades=0, roi=0.0, profit=0.0)
+
+    df = (
+        df.with_columns(pl.rank("dense", descending=True).over("marketId").alias("rk"))
+          .filter(pl.col("rk") <= topk)
+          .drop("rk")
+    )
+
+    outcomes = df["y"].to_numpy().astype(np.float32)
+    odds_sel = df["ltp"].to_numpy().astype(np.float32)
+    p_model_sel = df["p_model"].to_numpy().astype(np.float32)
+
+    if stake_mode == "kelly":
+        def kf(p, o):
+            b = o - 1.0
+            if b <= 0: return 0.0
+            q = 1.0 - p
+            return max(0.0, (b*p - q) / b)
+        f = np.array([max(kelly_floor, min(kelly_cap, kf(pi, oi))) for pi, oi in zip(p_model_sel, odds_sel)],
+                     dtype=np.float32)
+        stakes = f * bankroll
+    else:
+        stakes = np.full_like(odds_sel, 10.0, dtype=np.float32)
+
+    gross = outcomes * (odds_sel - 1.0) * stakes
+    net_wins = gross * (1.0 - commission)
+    losses = (1.0 - outcomes) * stakes
+    profit = net_wins - losses
+    pnl = float(profit.sum())
+    staked = float(stakes.sum())
+    roi = pnl / staked if staked > 0 else 0.0
+
+    return dict(n_trades=int(outcomes.size), roi=roi, profit=pnl)
+
+# ---------------------------------------------------------------------
+# Main
 # ---------------------------------------------------------------------
 
 def main():
-    args=parse_args()
-    OUTPUT_DIR=Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
-    OUTPUT_DIR.mkdir(parents=True,exist_ok=True)
+    args = parse_args()
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    asof_dt=parse_date(args.asof)
+    asof_dt = parse_date(args.asof)
     train_end   = asof_dt - timedelta(days=args.valid_days)
     train_start = train_end - timedelta(days=args.train_days - 1)
     valid_start = asof_dt - timedelta(days=args.valid_days - 1)
     valid_end   = asof_dt
 
-    curated=Path(args.curated)
-    snap_lf=load_snapshots(curated,train_start,valid_end,args.sport)
-    res_lf=load_results(curated,train_start,valid_end,args.sport)
-    defs_lf=load_defs(curated,train_start,valid_end,args.sport)
-    df_all=join_all(snap_lf,res_lf,defs_lf)
+    curated = Path(args.curated)
 
+    # Load and join datasets
+    snap_lf = load_snapshots(curated, train_start, valid_end, args.sport)
+    res_lf  = load_results(curated, train_start, valid_end, args.sport)
+    defs_lf = load_defs(curated,  train_start, valid_end, args.sport)
+    df_all  = join_all(snap_lf, res_lf, defs_lf)
+
+    # Compute secs_to_start and filter strictly to pre-off window
     if "marketStartMs" in df_all.columns:
-        df_all=df_all.with_columns((pl.col("marketStartMs")-pl.col("publishTimeMs")).alias("secs_to_start"))
-        df_all=df_all.filter((pl.col("secs_to_start")>=0)&(pl.col("secs_to_start")<=args.preoff_mins*60))
+        df_all = df_all.with_columns(
+            (pl.col("marketStartMs") - pl.col("publishTimeMs")).alias("secs_to_start")
+        )
+        df_all = df_all.filter(
+            (pl.col("secs_to_start") >= 0) &
+            (pl.col("secs_to_start") <= args.preoff_mins * 60)
+        )
 
-    df_all=encode_categoricals(df_all)
+    # Clean labels: drop missing; enforce 0/1 integer
+    if "winLabel" not in df_all.columns:
+        die("winLabel column missing after join (check results load/join)")
 
-    df_train=df_all.filter((pl.col("publishTimeMs")>=int(train_start.timestamp()*1000)) &
-                           (pl.col("publishTimeMs")<=int(train_end.timestamp()*1000)))
-    df_valid=df_all.filter((pl.col("publishTimeMs")>=int(valid_start.timestamp()*1000)) &
-                           (pl.col("publishTimeMs")<=int(valid_end.timestamp()*1000)))
+    df_all = df_all.filter(pl.col("winLabel").is_not_null())
+    # Some datasets may have - or strings; coerce safely to 0/1
+    df_all = df_all.with_columns(
+        pl.when(pl.col("winLabel") > 0).then(1).otherwise(0).alias("winLabel")
+    )
 
-    feats=[c for c in df_all.columns if c not in ("winLabel","sport","marketId","selectionId","marketStartMs")]
+    # Optional: drop rows with missing odds
+    if "ltp" in df_all.columns:
+        df_all = df_all.filter(pl.col("ltp").is_not_null())
 
-    dtrain = xgb.DMatrix(df_train.select(feats).to_arrow(),
-                         label=df_train["winLabel"].to_numpy().astype(np.float32))
-    dvalid = xgb.DMatrix(df_valid.select(feats).to_arrow(),
-                         label=df_valid["winLabel"].to_numpy().astype(np.float32))
+    # One-hot categoricals (marketType from results, marketType_def from defs, countryCode)
+    df_all = encode_categoricals(df_all)
 
-    booster=train(make_params(args.device),dtrain,dvalid,must_gpu=(args.device=="cuda"))
+    # Split train / valid by publishTimeMs
+    df_train = df_all.filter(
+        (pl.col("publishTimeMs") >= int(train_start.timestamp() * 1000)) &
+        (pl.col("publishTimeMs") <= int(train_end.timestamp()   * 1000))
+    )
+    df_valid = df_all.filter(
+        (pl.col("publishTimeMs") >= int(valid_start.timestamp() * 1000)) &
+        (pl.col("publishTimeMs") <= int(valid_end.timestamp()   * 1000))
+    )
 
-    preds=booster.predict(dvalid)
-    y=df_valid["winLabel"].to_numpy().astype(np.float32)
-    odds=df_valid["ltp"].to_numpy().astype(np.float32)
-    p_model=preds.astype(np.float32)
-    p_market=(1.0/np.clip(odds,1e-12,None)).astype(np.float32)
+    if df_train.height == 0 or df_valid.height == 0:
+        die("empty train/valid after time filtering")
 
-    print(f"[Value] logloss={safe_logloss(y,preds):.4f} auc={roc_auc_score(y,preds):.3f}")
+    # Feature set: exclude identifiers and raw marketStartMs
+    exclude_cols = {"winLabel","sport","marketId","selectionId","marketStartMs"}
+    feats = [c for c in df_all.columns if c not in exclude_cols]
 
-    EDGE_T=[0.010,0.012,0.015]; TOPK=[1,2]; LTP_W=[(1.5,5.0)]
-    STAKE=[("flat",None,None,args.bankroll_nom),("kelly",args.kelly_cap,args.kelly_floor,args.bankroll_nom)]
-    recs=[]
-    for e,t,(lo,hi),(sm,cap,floor_,bank) in itertools.product(EDGE_T,TOPK,LTP_W,STAKE):
-        m=evaluate(df_valid,odds,y,p_model,p_market,e,t,lo,hi,sm,cap or 0.0,floor_ or 0.0,bank or 1000.0,args.commission)
-        m.update(dict(edge_thresh=e,topk=t,ltp_min=lo,ltp_max=hi,stake_mode=sm))
+    # Build DMatrices (labels must be clean float32)
+    dtrain = xgb.DMatrix(
+        df_train.select(feats).to_arrow(),
+        label=df_train["winLabel"].to_numpy().astype(np.float32)
+    )
+    dvalid = xgb.DMatrix(
+        df_valid.select(feats).to_arrow(),
+        label=df_valid["winLabel"].to_numpy().astype(np.float32)
+    )
+
+    booster = train(make_params(args.device), dtrain, dvalid, must_gpu=(args.device=="cuda"))
+
+    # Predictions
+    preds = booster.predict(dvalid)
+    y     = df_valid["winLabel"].to_numpy().astype(np.float32)
+    odds  = df_valid["ltp"].to_numpy().astype(np.float32)
+
+    p_model  = preds.astype(np.float32)
+    # simple market probability from odds; can be replaced with a calibrated market model if available
+    p_market = (1.0 / np.clip(odds, 1e-12, None)).astype(np.float32)
+
+    print(f"[Value] logloss={safe_logloss(y, preds):.4f}  auc={roc_auc_score(y, preds):.3f}")
+
+    # -----------------------------------------------------------------
+    # Expanded sweep ranges
+    # -----------------------------------------------------------------
+    EDGE_T = [0.010, 0.012, 0.015, 0.020, 0.025]
+    TOPK   = [1, 2, 3]
+    LTP_W  = [(1.5, 5.0), (1.5, 10.0), (2.0, 6.0)]
+    STAKE  = [("flat", None, None, args.bankroll_nom)]
+    for cap, floor_ in [(0.05, 0.001), (0.05, 0.002), (0.10, 0.001), (0.10, 0.003)]:
+        STAKE.append(("kelly", cap, floor_, args.bankroll_nom))
+
+    recs = []
+    for e, t, (lo, hi), (sm, cap, floor_, bank) in itertools.product(EDGE_T, TOPK, LTP_W, STAKE):
+        m = evaluate_per_market_topk(
+            df_valid, odds, y, p_model, p_market,
+            edge_thresh=e, topk=t, lo=lo, hi=hi,
+            stake_mode=sm, kelly_cap=(cap or 0.0), kelly_floor=(floor_ or 0.0),
+            bankroll=(bank or 1000.0), commission=float(args.commission)
+        )
+        m.update(dict(edge_thresh=e, topk=t, ltp_min=lo, ltp_max=hi, stake_mode=sm))
         recs.append(m)
 
-    sweep=pl.DataFrame(recs).sort(["roi","n_trades"],descending=[True,True])
-    out=OUTPUT_DIR/f"edge_sweep_{args.asof}.csv"
+    sweep = pl.DataFrame(recs).sort(["roi","n_trades"], descending=[True, True])
+    out   = OUTPUT_DIR / f"edge_sweep_{args.asof}.csv"
     sweep.write_csv(str(out))
 
     print(f"sweep saved → {out}")
-    print(sweep.select(["roi","profit","n_trades","edge_thresh","stake_mode"]).head(10))
+    print(sweep.select(["roi","profit","n_trades","edge_thresh","topk","ltp_min","ltp_max","stake_mode"]).head(15))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
