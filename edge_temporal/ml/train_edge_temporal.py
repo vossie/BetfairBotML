@@ -35,7 +35,8 @@ def safe_logloss(y_true, p):
 
 def files_for_range(root: Path, sub: str, start: datetime, end: datetime):
     files=[]
-    for d in (start + timedelta(days=i) for i in range((end-start).days+1)):
+    for i in range((end - start).days + 1):
+        d = start + timedelta(days=i)
         dd = d.strftime("%Y-%m-%d")
         ddir = root / sub / f"date={dd}"
         if ddir.exists():
@@ -162,9 +163,6 @@ def evaluate_per_market_topk(df_valid: pl.DataFrame,
                              lo: float, hi: float,
                              stake_mode: str, kelly_cap: float, kelly_floor: float, bankroll: float,
                              commission: float):
-    """
-    Apply odds window + edge threshold, then keep top-K edges per marketId, and compute ROI/P&L.
-    """
     edge = p_model - p_market
     base = (odds >= lo) & (odds <= hi) & np.isfinite(edge)
     if not base.any():
@@ -180,7 +178,6 @@ def evaluate_per_market_topk(df_valid: pl.DataFrame,
     })
 
     df = df.filter(pl.col("edge_back") >= edge_thresh)
-
     if df.height == 0:
         return dict(n_trades=0, roi=0.0, profit=0.0)
 
@@ -254,7 +251,6 @@ def main():
         die("winLabel column missing after join (check results load/join)")
 
     df_all = df_all.filter(pl.col("winLabel").is_not_null())
-    # Some datasets may have - or strings; coerce safely to 0/1
     df_all = df_all.with_columns(
         pl.when(pl.col("winLabel") > 0).then(1).otherwise(0).alias("winLabel")
     )
@@ -283,13 +279,18 @@ def main():
     exclude_cols = {"winLabel","sport","marketId","selectionId","marketStartMs"}
     feats = [c for c in df_all.columns if c not in exclude_cols]
 
+    # --- Final feature prep: ensure numeric-only for XGBoost ---
+    # Drop any lingering Utf8/Categorical dtypes
+    numeric_df_train = df_train.select(feats).select(pl.all().exclude(pl.Utf8, pl.Categorical))
+    numeric_df_valid = df_valid.select(feats).select(pl.all().exclude(pl.Utf8, pl.Categorical))
+
     # Build DMatrices (labels must be clean float32)
     dtrain = xgb.DMatrix(
-        df_train.select(feats).to_arrow(),
+        numeric_df_train.to_arrow(),
         label=df_train["winLabel"].to_numpy().astype(np.float32)
     )
     dvalid = xgb.DMatrix(
-        df_valid.select(feats).to_arrow(),
+        numeric_df_valid.to_arrow(),
         label=df_valid["winLabel"].to_numpy().astype(np.float32)
     )
 
@@ -301,7 +302,6 @@ def main():
     odds  = df_valid["ltp"].to_numpy().astype(np.float32)
 
     p_model  = preds.astype(np.float32)
-    # simple market probability from odds; can be replaced with a calibrated market model if available
     p_market = (1.0 / np.clip(odds, 1e-12, None)).astype(np.float32)
 
     print(f"[Value] logloss={safe_logloss(y, preds):.4f}  auc={roc_auc_score(y, preds):.3f}")
