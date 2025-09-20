@@ -1,186 +1,162 @@
 #!/usr/bin/env python3
-import os
-import sys
-import json
-import argparse
-import numpy as np
-import pandas as pd
-import xgboost as xgb
-from datetime import datetime, timedelta
+import argparse, os, sys, time, json
 from pathlib import Path
-from sklearn.metrics import roc_auc_score, log_loss
+import numpy as np
+import polars as pl
+import xgboost as xgb
+from sklearn.metrics import log_loss, roc_auc_score
 
-# ----------------------------
+# -------------------
 # Helpers
-# ----------------------------
-
-def parse_args():
-    p = argparse.ArgumentParser("train_edge_temporal.py")
-    p.add_argument("train_start")
-    p.add_argument("train_end")
-    p.add_argument("valid_start")
-    p.add_argument("valid_end")
-    p.add_argument("--preoff-mins", type=int, default=30)
-    p.add_argument("--downsample-secs", type=int, default=5)
-    p.add_argument("--commission", type=float, default=0.02)
-    p.add_argument("--edge-thresh", type=float, default=0.01)
-    p.add_argument("--edge-prob", choices=["cal", "raw"], default="cal")
-    p.add_argument("--no-sum-to-one", action="store_true")
-    p.add_argument("--market-prob", choices=["overround"], default="overround")
-    p.add_argument("--per-market-topk", type=int, default=1)
-    p.add_argument("--side", choices=["back", "lay"], default="back")
-    p.add_argument("--ltp-min", type=float, default=1.01)
-    p.add_argument("--ltp-max", type=float, default=1000.0)
-    p.add_argument("--stake", choices=["flat", "kelly"], default="flat")
-    p.add_argument("--kelly-cap", type=float, default=0.05)
-    p.add_argument("--kelly-floor", type=float, default=0.0)
-    p.add_argument("--bankroll-nom", type=float, default=1000.0)
-    p.add_argument("--pm-horizon-secs", type=int, default=300)
-    p.add_argument("--pm-tick-threshold", type=int, default=1)
-    p.add_argument("--pm-slack-secs", type=int, default=3)
-    p.add_argument("--pm-cutoff", type=float, default=0.55)
-    p.add_argument("--one-trade-per-market", action="store_true")
-    return p.parse_args()
-
-
-def safe_logloss(y_true, y_prob):
-    p_clip = np.clip(y_prob, 1e-12, 1 - 1e-12)
-    return -np.mean(y_true * np.log(p_clip) + (1 - y_true) * np.log(1 - p_clip))
-
-
+# -------------------
 def odds_to_prob(odds):
-    odds = np.asarray(odds, dtype=float)
-    return np.where(np.isfinite(odds) & (odds > 0), 1.0 / odds, np.nan)
+    inv = np.where(np.isfinite(odds) & (odds > 0), 1.0 / odds, np.nan)
+    return inv
 
+def bucketize_odds(odds, buckets=[1.01,1.5,2.0,3.0,5.0,10.0,50.0,1000.0]):
+    out = []
+    for i in range(len(buckets)-1):
+        lo,hi = buckets[i], buckets[i+1]
+        mask = (odds >= lo) & (odds < hi)
+        out.append(((lo,hi),mask))
+    return out
 
-def load_curated(train_start, train_end, valid_start, valid_end, preoff, downsample):
-    # Placeholder: swap with your curated feature loader
-    # Must return dict {split: DataFrame} with columns:
-    #   sport, marketId, selectionId, publishTimeMs, features..., winLabel, odds
-    rng = pd.date_range(train_start, valid_end, freq="5min")
-    df = pd.DataFrame({
-        "sport": "horse-racing",
-        "marketId": np.random.choice(["m1", "m2"], size=len(rng)),
-        "selectionId": np.random.choice([11, 22, 33], size=len(rng)),
-        "publishTimeMs": rng.view(np.int64) // 1_000_000,
-        "feature1": np.random.randn(len(rng)),
-        "feature2": np.random.randn(len(rng)),
-        "winLabel": np.random.binomial(1, 0.5, size=len(rng)),
-        "odds": np.random.uniform(1.5, 8.0, size=len(rng)),
-    })
-    df_train = df[(df.index >= train_start) & (df.index <= train_end)]
-    df_valid = df[(df.index >= valid_start) & (df.index <= valid_end)]
-    return {"train": df_train, "valid": df_valid}
+def kelly_fraction(p, q, odds):
+    b = odds - 1.0
+    frac = (b*p - q)/b
+    return max(0.0, frac)
 
+# -------------------
+# Argparse
+# -------------------
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--curated", required=True)
+    ap.add_argument("--sport", default="horse-racing")
+    ap.add_argument("--asof", required=True)
+    ap.add_argument("--train-days", type=int, default=10)
+    ap.add_argument("--preoff-mins", type=int, default=30)
+    ap.add_argument("--downsample-secs", type=int, default=5)
+    ap.add_argument("--commission", type=float, default=0.02)
+    ap.add_argument("--edge-thresh", type=float, default=0.01)
+    ap.add_argument("--pm-horizon-secs", type=int, default=300)
+    ap.add_argument("--pm-tick-threshold", type=int, default=1)
+    ap.add_argument("--pm-slack-secs", type=int, default=3)
+    ap.add_argument("--edge-prob", default="raw")
+    ap.add_argument("--no-sum-to-one", action="store_true")
+    ap.add_argument("--market-prob", default="overround")
+    ap.add_argument("--per-market-topk", type=int, default=1)
+    ap.add_argument("--stake", choices=["flat","kelly"], default="flat")
+    ap.add_argument("--kelly-cap", type=float, default=0.05)
+    ap.add_argument("--ltp-min", type=float, default=1.01)
+    ap.add_argument("--ltp-max", type=float, default=1000.0)
+    ap.add_argument("--side", choices=["back","lay","both"], default="back")
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--bankroll-nom", type=float, default=1000.0)
+    ap.add_argument("--pm-cutoff", type=float, default=0.55)
+    return ap.parse_args()
 
-def train_xgb(X, y, evals):
-    dtrain = xgb.DMatrix(X, label=y)
-    params = dict(
-        objective="binary:logistic",
-        eval_metric="logloss",
-        tree_method="hist",
-        device="cuda" if xgb.context().gpu_id is not None else "cpu",
-    )
-    evals_result = {}
-    bst = xgb.train(
-        params,
-        dtrain,
-        num_boost_round=500,
-        evals=evals,
-        evals_result=evals_result,
-        early_stopping_rounds=50,
-        verbose_eval=10,
-    )
-    return bst
-
-
-def backtest(df, args, probs):
-    # compute edges
-    inv_odds = odds_to_prob(df["odds"].values)
-    edge = probs - inv_odds
-    sel = (edge > args.edge_thresh) & (df["odds"] >= args.ltp_min) & (df["odds"] <= args.ltp_max)
-
-    if args.one_trade_per_market:
-        df_sel = df.loc[sel].copy()
-        df_sel["edge"] = edge[sel]
-        df_sel = df_sel.sort_values("edge", ascending=False).groupby("marketId").head(1)
-        sel = df.index.isin(df_sel.index)
-
-    trades = df.loc[sel].copy()
-    trades["edge"] = edge[sel]
-    trades["stake"] = 10.0
-    if args.stake == "kelly":
-        f = trades["edge"] / (trades["odds"] - 1.0)
-        f = np.clip(f, args.kelly_floor, args.kelly_cap)
-        trades["stake"] = f * args.bankroll_nom
-    trades["profit"] = trades["stake"] * (trades["winLabel"] * (trades["odds"] - 1) - (1 - trades["winLabel"]))
-
-    roi = trades["profit"].sum() / trades["stake"].sum() if len(trades) > 0 else 0.0
-
-    # bucket ROI
-    bins = [1.01, 1.5, 2.0, 3.0, 5.0, 10.0, 50.0, 1000.0]
-    trades["bucket"] = pd.cut(trades["odds"], bins)
-    bucket_roi = trades.groupby("bucket").apply(
-        lambda g: pd.Series(dict(
-            n=len(g),
-            hit=g["winLabel"].mean() if len(g) > 0 else np.nan,
-            roi=g["profit"].sum() / g["stake"].sum() if g["stake"].sum() > 0 else np.nan,
-        ))
-    )
-
-    return trades, roi, bucket_roi
-
-
+# -------------------
+# Main
+# -------------------
 def main():
     args = parse_args()
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # load
-    data = load_curated(args.train_start, args.train_end,
-                        args.valid_start, args.valid_end,
-                        args.preoff_mins, args.downsample_secs)
-    df_train, df_valid = data["train"], data["valid"]
+    print("=== Config ===")
+    for k,v in vars(args).items():
+        print(f"{k}: {v}")
 
-    X_train = df_train[["feature1", "feature2"]].values
-    y_train = df_train["winLabel"].values
-    X_valid = df_valid[["feature1", "feature2"]].values
-    y_valid = df_valid["winLabel"].values
+    # -------------------
+    # Dummy data load
+    # (replace with real parquet/feature build)
+    # -------------------
+    n_train, n_valid = 10000, 2000
+    X_train = np.random.randn(n_train,20)
+    y_train = np.random.binomial(1,0.5,size=n_train)
+    X_valid = np.random.randn(n_valid,20)
+    y_valid = np.random.binomial(1,0.5,size=n_valid)
 
-    bst = train_xgb(X_train, y_train,
-                    [(xgb.DMatrix(X_train, label=y_train), "train"),
-                     (xgb.DMatrix(X_valid, label=y_valid), "valid")])
+    # -------------------
+    # Train value model
+    # -------------------
+    dtrain = xgb.DMatrix(X_train,label=y_train)
+    dvalid = xgb.DMatrix(X_valid,label=y_valid)
+    params = dict(objective="binary:logistic", eval_metric="logloss", tree_method="hist")
+    evallist = [(dtrain,"train"),(dvalid,"valid")]
+    bst = xgb.train(params, dtrain, num_boost_round=200, evals=evallist, verbose_eval=False)
 
-    # predict
-    prob_valid = bst.predict(xgb.DMatrix(X_valid))
-    logloss = safe_logloss(y_valid, prob_valid)
-    auc = roc_auc_score(y_valid, prob_valid)
-    print(f"[Value head] logloss={logloss:.4f} auc={auc:.3f} n={len(y_valid)}")
+    preds = bst.predict(dvalid)
+    logloss = log_loss(y_valid, preds)
+    auc = roc_auc_score(y_valid, preds)
+    print(f"\n[Value head] logloss={logloss:.4f} auc={auc:.3f} n={len(y_valid)}")
 
-    # backtest
-    trades, roi, bucket_roi = backtest(df_valid, args, prob_valid)
-    print(f"[Backtest @ validation] n_trades={len(trades)} roi={roi:.4f} hit_rate={trades['winLabel'].mean():.3f}")
+    # -------------------
+    # Backtest
+    # -------------------
+    odds = np.random.uniform(args.ltp_min, args.ltp_max, size=n_valid)
+    sel = (preds > 0.5)
+    stake_flat = 10.0
+    bankroll_nom = args.bankroll_nom
+    pnl_flat, pnl_kelly = 0.0, 0.0
+    stakes_kelly = []
 
-    print("\n[Value head — ROI by decimal odds bucket]")
-    print(bucket_roi)
+    for i in range(n_valid):
+        if not sel[i]: continue
+        implied = odds_to_prob(odds[i])
+        edge = preds[i] - implied
+        if edge < args.edge_thresh: continue
+        # outcome
+        outcome = y_valid[i]
+        # flat £10
+        win = (odds[i]-1.0)*stake_flat if outcome==1 else -stake_flat
+        pnl_flat += win
+        # kelly
+        if args.stake=="kelly":
+            f = kelly_fraction(preds[i], 1-preds[i], odds[i])
+            f = min(args.kelly_cap, f)
+            stake = max(0.0, f*bankroll_nom)
+            stakes_kelly.append(stake)
+            win_k = (odds[i]-1.0)*stake if outcome==1 else -stake
+            pnl_kelly += win_k
 
-    # staking summary
-    if len(trades) > 0:
-        print("\n[Backtest — side summary]")
-        print(f" side={args.side} n={len(trades)} avg_edge={trades['edge'].mean():.4f} avg_stake_gbp=£{trades['stake'].mean():.2f}")
+    print("\n[Backtest]")
+    print(f" Flat £10 → profit={pnl_flat:.2f}")
+    if args.stake=="kelly":
+        print(f" Kelly    → profit={pnl_kelly:.2f} avg_stake={np.mean(stakes_kelly):.2f}")
 
-        print("\n[Staking comparison]")
-        flat_profit = trades.assign(stake=10.0).eval("stake * (winLabel*(odds-1)-(1-winLabel))").sum()
-        print(f" Flat £10 stake → trades={len(trades)} staked=£{len(trades)*10:.2f} profit=£{flat_profit:.2f} roi={flat_profit/(len(trades)*10):.3f}")
-        if args.stake == "kelly":
-            print(f" Kelly (nom £{args.bankroll_nom}) → trades={len(trades)} staked=£{trades['stake'].sum():.2f} profit=£{trades['profit'].sum():.2f} roi={roi:.3f} avg_stake=£{trades['stake'].mean():.2f}")
+    # -------------------
+    # ROI by odds bucket
+    # -------------------
+    print("\n[ROI by odds bucket]")
+    for (lo,hi),mask in bucketize_odds(odds):
+        if mask.sum()==0: continue
+        wins = y_valid[mask].sum()
+        n = mask.sum()
+        roi = (wins*(np.mean(odds[mask])-1) - (n-wins)) / n
+        print(f"  [{lo:.2f},{hi:.2f})  n={n:4d}  win_rate={wins/n:.3f}  roi={roi:.3f}")
 
-    # save
-    outdir = Path(os.environ.get("OUTPUT_DIR", "./output"))
-    outdir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    recos_path = outdir / f"edge_recos_valid_{args.valid_end}_{ts}.csv"
-    trades.to_csv(recos_path, index=False)
-    print(f"Saved recommendations → {recos_path}")
+    # -------------------
+    # Save recos
+    # -------------------
+    recs = []
+    for i in range(n_valid):
+        if sel[i]:
+            recs.append(dict(
+                marketId="M"+str(i),
+                selectionId=i,
+                ltp=odds[i],
+                side=args.side,
+                stake=stake_flat if args.stake=="flat" else stakes_kelly[i] if i<len(stakes_kelly) else 0.0,
+                p_model=float(preds[i]),
+                p_market=float(odds_to_prob(odds[i])),
+                edge_back=float(preds[i]-odds_to_prob(odds[i]))
+            ))
+    rec_df = pl.DataFrame(recs)
+    rec_file = OUTPUT_DIR / f"edge_recos_valid_{args.asof}_T{args.train_days}.csv"
+    rec_df.write_csv(str(rec_file))
+    print(f"\nSaved recommendations → {rec_file}")
 
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
