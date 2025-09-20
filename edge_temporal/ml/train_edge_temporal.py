@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Edge Temporal Trainer (stable, normalized time units)
+Edge Temporal Trainer (UTC day-window, pre-off, runner features, flat+kelly sweep)
 
 - Reads snapshots, results, market definitions
 - Joins on (sport, marketId, selectionId)
-- Normalizes publishTimeMs/marketStartMs to milliseconds
+- Uses UTC day windows with inclusive [start, end) bounds in ms
 - Filters strictly to 0..preoff-mins before off
 - Adds runner features (handicap, sortPriority, reductionFactor)
-- Adds secs_to_start/mins_to_start as features
-- Cleans labels (0/1 floats only) and drops missing odds
-- Encodes categoricals then drops any leftover non-numeric cols before XGBoost
-- GPU XGBoost training (CUDA forced via shell script)
+- Keeps secs_to_start/mins_to_start as features
+- Cleans labels (0/1) and drops missing odds
+- One-hot encodes categoricals; passes numeric-only to XGBoost
+- GPU-first XGBoost training
 - Expanded sweep: flat + multiple Kelly variants; saves ROI/PnL
 """
 
 import argparse, os, sys, itertools
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import polars as pl
 import xgboost as xgb
@@ -29,38 +29,28 @@ def die(msg, code=2):
     print(f"[ERROR] {msg}", file=sys.stderr); sys.exit(code)
 
 def parse_date(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%d")
+    # treat as UTC midnight
+    return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+def to_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
 
 def safe_logloss(y_true, p):
     p = np.clip(p, 1e-12, 1-1e-12)
     return float(-(y_true*np.log(p) + (1-y_true)*np.log(1-p)).mean())
 
 def files_for_range(root: Path, sub: str, start: datetime, end: datetime):
+    # Use partition dates [start.date(), end.date()] inclusive
+    start_d = start.date()
+    end_d   = end.date()
+    span = (end_d - start_d).days
     files=[]
-    for i in range((end - start).days + 1):
-        d = start + timedelta(days=i)
-        dd = d.strftime("%Y-%m-%d")
-        ddir = root / sub / f"date={dd}"
+    for i in range(span + 1):
+        d = start_d + timedelta(days=i)
+        ddir = root / sub / f"date={d.isoformat()}"
         if ddir.exists():
             files.extend(ddir.glob("*.parquet"))
     return files
-
-def normalize_ms_expr(expr: pl.Expr) -> pl.Expr:
-    """
-    Normalize timestamp-like integers to milliseconds since epoch.
-    Heuristic:
-      - >1e17  : assume nanoseconds -> //1_000_000
-      - >1e14  : assume microseconds -> //1_000
-      - <=1e14 : assume already ms (or s); if <1e12 assume seconds -> *1000
-    All cast to Int64.
-    """
-    return (
-        pl.when(expr.is_null()).then(None)
-        .when(expr > 1_000_000_000_000_000_00).then((expr // 1_000_000).cast(pl.Int64))  # ns -> ms
-        .when(expr > 100_000_000_000_000).then((expr // 1_000).cast(pl.Int64))           # µs -> ms
-        .when(expr < 1_000_000_000_000).then((expr * 1_000).cast(pl.Int64))              # s -> ms
-        .otherwise(expr.cast(pl.Int64))                                                  # assume ms
-    )
 
 # ------------------------------ loaders -------------------------------
 
@@ -218,65 +208,64 @@ def main():
     OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    asof_dt = parse_date(args.asof)
-    train_end   = asof_dt - timedelta(days=args.valid_days)
-    train_start = train_end - timedelta(days=args.train_days - 1)
-    valid_start = asof_dt - timedelta(days=args.valid_days - 1)
-    valid_end   = asof_dt
+    asof_dt = parse_date(args.asof)  # UTC midnight
+    # define windows in UTC calendar days
+    train_end   = asof_dt - timedelta(days=args.valid_days)              # inclusive end day for train
+    train_start = train_end - timedelta(days=args.train_days - 1)        # inclusive start day for train
+    valid_start = asof_dt - timedelta(days=args.valid_days - 1)          # inclusive start day for valid
+    valid_end   = asof_dt                                                # inclusive end day for valid
 
     curated = Path(args.curated)
 
     # Load and join
     snap_lf = load_snapshots(curated, train_start, valid_end, args.sport)
-    res_lf  = load_results(curated, train_start, valid_end, args.sport)
-    defs_lf = load_defs(curated,  train_start, valid_end, args.sport)
+    res_lf  = load_results(curated,  train_start, valid_end, args.sport)
+    defs_lf = load_defs(curated,     train_start, valid_end, args.sport)
     df_all  = join_all(snap_lf, res_lf, defs_lf)
 
-    # Normalize time columns to ms and compute secs/mins to start
-    cols_to_norm = []
-    if "publishTimeMs" in df_all.columns: cols_to_norm.append("publishTimeMs")
-    if "marketStartMs" in df_all.columns: cols_to_norm.append("marketStartMs")
-    if "settledTimeMs" in df_all.columns: cols_to_norm.append("settledTimeMs")
+    # Require marketStartMs for pre-off filter; drop nulls
+    if "marketStartMs" not in df_all.columns:
+        die("marketStartMs missing after join (check market_definitions load/join)")
 
-    if cols_to_norm:
-        df_all = df_all.with_columns([normalize_ms_expr(pl.col(c)).alias(c) for c in cols_to_norm])
+    df_all = df_all.filter(pl.col("marketStartMs").is_not_null())
 
-    if "marketStartMs" in df_all.columns:
-        df_all = df_all.filter(pl.col("marketStartMs").is_not_null())
-        df_all = df_all.with_columns([
-            (pl.col("marketStartMs") - pl.col("publishTimeMs")).alias("secs_to_start"),
-            ((pl.col("marketStartMs") - pl.col("publishTimeMs"))/60000).alias("mins_to_start"),
-        ])
-        df_all = df_all.filter(
-            (pl.col("mins_to_start") >= 0) &
-            (pl.col("mins_to_start") <= args.preoff_mins)
-        )
+    # Pre-off features + filter (assumes ms)
+    df_all = df_all.with_columns([
+        (pl.col("marketStartMs") - pl.col("publishTimeMs")).alias("secs_to_start"),
+        ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000).alias("mins_to_start"),
+    ]).filter(
+        (pl.col("mins_to_start") >= 0) &
+        (pl.col("mins_to_start") <= args.preoff_mins)
+    )
 
     # Clean labels and odds
     if "winLabel" not in df_all.columns:
-        die("winLabel column missing after join (check results load/join)")
+        die("winLabel missing after join (check results load/join)")
     df_all = df_all.filter(pl.col("winLabel").is_not_null())
     df_all = df_all.with_columns(pl.when(pl.col("winLabel") > 0).then(1).otherwise(0).alias("winLabel"))
     if "ltp" not in df_all.columns:
-        die("ltp column missing after join (check snapshots load/join)")
+        die("ltp missing after join (check snapshots load/join)")
     df_all = df_all.filter(pl.col("ltp").is_not_null())
 
-    # Encode categoricals
+    # One-hot categoricals
     for col in ["marketType","marketType_def","countryCode"]:
         if col in df_all.columns:
             df_all = df_all.with_columns(pl.col(col).fill_null("UNK"))
             df_all = df_all.to_dummies(columns=[col])
 
-    # Time split
-    ms = lambda dt: int(dt.timestamp() * 1000)
+    # Correct UTC [start, end) day windows in ms
+    train_end_excl = to_ms(train_end + timedelta(days=1))
+    valid_end_excl = to_ms(valid_end + timedelta(days=1))
+
     df_train = df_all.filter(
-        (pl.col("publishTimeMs") >= ms(train_start)) &
-        (pl.col("publishTimeMs") <= ms(train_end))
+        (pl.col("publishTimeMs") >= to_ms(train_start)) &
+        (pl.col("publishTimeMs") <  train_end_excl)
     )
     df_valid = df_all.filter(
-        (pl.col("publishTimeMs") >= ms(valid_start)) &
-        (pl.col("publishTimeMs") <= ms(valid_end))
+        (pl.col("publishTimeMs") >= to_ms(valid_start)) &
+        (pl.col("publishTimeMs") <  valid_end_excl)
     )
+
     if df_train.height == 0 or df_valid.height == 0:
         die("empty train/valid")
 
@@ -285,12 +274,17 @@ def main():
     feats = [c for c in df_all.columns if c not in exclude]
 
     # Numeric-only for XGBoost
-    df_train_num = df_train.select(feats).select(pl.all().exclude(pl.Utf8, pl.Categorical))
-    df_valid_num = df_valid.select(feats).select(pl.all().exclude(pl.Utf8, pl.Categorical))
+    try:
+        numeric_df_train = df_train.select(feats).select(pl.all().exclude(pl.Utf8, pl.Categorical))
+        numeric_df_valid = df_valid.select(feats).select(pl.all().exclude(pl.Utf8, pl.Categorical))
+    except Exception:
+        # fallback for very old polars (exclude only Utf8)
+        numeric_df_train = df_train.select(feats).select(pl.all().exclude(pl.Utf8))
+        numeric_df_valid = df_valid.select(feats).select(pl.all().exclude(pl.Utf8))
 
     # Build DMatrix
-    dtrain = xgb.DMatrix(df_train_num.to_arrow(), label=df_train["winLabel"].to_numpy().astype(np.float32))
-    dvalid = xgb.DMatrix(df_valid_num.to_arrow(), label=df_valid["winLabel"].to_numpy().astype(np.float32))
+    dtrain = xgb.DMatrix(numeric_df_train.to_arrow(), label=df_train["winLabel"].to_numpy().astype(np.float32))
+    dvalid = xgb.DMatrix(numeric_df_valid.to_arrow(), label=df_valid["winLabel"].to_numpy().astype(np.float32))
 
     # Train
     booster = train(make_params(args.device), dtrain, dvalid, must_gpu=(args.device=="cuda"))
