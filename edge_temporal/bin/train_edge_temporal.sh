@@ -139,7 +139,6 @@ python3 "${ML_PY}" \
   --sport "${SPORT}" \
   --asof "${ASOF}" \
   --train-days "${TRAIN_DAYS}" \
-  --valid-days "${VALID_DAYS}" \
   --preoff-mins "${PREOFF_MINS}" \
   --downsample-secs "${DOWNSAMPLE_SECS}" \
   --commission "${COMMISSION}" \
@@ -154,7 +153,6 @@ python3 "${ML_PY}" \
   --per-market-topk "${PER_MARKET_TOPK}" \
   --stake "${STAKE}" \
   --kelly-cap "${KELLY_CAP}" \
-  --kelly-floor "${KELLY_FLOOR}" \
   --ltp-min "${LTP_MIN}" \
   --ltp-max "${LTP_MAX}" \
   --side "${SIDE}" \
