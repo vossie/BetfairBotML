@@ -7,9 +7,10 @@ STRICT real-data trainer for Edge Temporal — rolling window only.
 - Exits if required cols are missing.
 - Uses GPU when --device=cuda, errors if not available.
 - Forces float32 everywhere to bound memory.
+- Accepts extra CLI args (sport, side, etc.) for compatibility with .sh wrapper.
 """
 
-import argparse, os, sys, time, json, re, glob
+import argparse, os, sys, re, glob
 from pathlib import Path
 from datetime import datetime, timedelta
 import numpy as np
@@ -43,13 +44,6 @@ def odds_to_prob(odds):
 def safe_logloss(y_true, p):
     p = np.clip(p, 1e-12, 1 - 1e-12)
     return float(-(y_true * np.log(p) + (1 - y_true) * np.log(1 - p)).mean())
-
-def kelly_fraction(p, odds):
-    b = float(odds) - 1.0
-    if b <= 0.0: return 0.0
-    q = 1.0 - float(p)
-    f = (b * float(p) - q) / b
-    return max(0.0, float(f))
 
 def make_xgb_params(device: str):
     if device.lower() == "cuda":
@@ -94,7 +88,7 @@ def train_xgb(params, dtrain, dvalid, num_boost_round=500, early_stopping_rounds
         raise
 
 # ----------------------------------
-# Data loading (patched for rolling window)
+# Data loading (rolling window)
 # ----------------------------------
 def glob_files(curated_root: str, start: datetime, end: datetime) -> list[Path]:
     root = Path(curated_root)
@@ -143,13 +137,11 @@ def select_feature_cols(df: pl.DataFrame):
     for c, dt in df.schema.items():
         if c in exclude:
             continue
-        # works across Polars versions
         if dt in pl.NUMERIC_DTYPES:
             feats.append(c)
     if not feats:
         die("No numeric feature cols found.")
     return feats
-
 
 # ----------------------------------
 # Args
@@ -170,6 +162,19 @@ def parse_args():
     ap.add_argument("--ltp-min", type=float, default=1.5)
     ap.add_argument("--ltp-max", type=float, default=5.0)
     ap.add_argument("--device", default="cuda")
+
+    # extra CLI args for .sh compatibility (not used in training)
+    ap.add_argument("--sport", default="horse-racing")
+    ap.add_argument("--preoff-mins", type=int, default=30)
+    ap.add_argument("--downsample-secs", type=int, default=5)
+    ap.add_argument("--commission", type=float, default=0.02)
+    ap.add_argument("--pm-horizon-secs", type=int, default=300)
+    ap.add_argument("--pm-tick-threshold", type=int, default=1)
+    ap.add_argument("--pm-slack-secs", type=int, default=3)
+    ap.add_argument("--edge-prob", default="cal")
+    ap.add_argument("--market-prob", default="overround")
+    ap.add_argument("--side", choices=["back","lay"], default="back")
+
     return ap.parse_args()
 
 # ----------------------------------
@@ -186,7 +191,6 @@ def main():
     valid_start = asof_dt - timedelta(days=args.valid_days - 1)
     valid_end = asof_dt
 
-    # Only glob the files we need for [train_start, valid_end]
     files = glob_files(args.curated, train_start, valid_end)
     dfs = [read_frame(p) for p in files]
     df_all = pl.concat(dfs, how="diagonal_relaxed")
@@ -194,13 +198,11 @@ def main():
     ensure_required_cols(df_all)
     df_all, date_col = pick_date_col(df_all)
 
-    # Partition
     df_train = df_all.filter((pl.col(date_col) >= train_start) & (pl.col(date_col) <= train_end))
     df_valid = df_all.filter((pl.col(date_col) >= valid_start) & (pl.col(date_col) <= valid_end))
 
     feat_cols = select_feature_cols(df_all)
 
-    # Force float32
     X_train = df_train.select(feat_cols).to_numpy().astype(np.float32)
     y_train = df_train.get_column("winLabel").to_numpy().astype(np.float32)
     X_valid = df_valid.select(feat_cols).to_numpy().astype(np.float32)
@@ -213,6 +215,11 @@ def main():
     booster = train_xgb(params, dtrain, dvalid, must_use_gpu=(args.device=="cuda"))
     preds = booster.predict(dvalid)
 
+    print("\n=== Training run complete ===")
+    print(f"Asof: {args.asof}")
+    print(f"Train window: {train_start.date()} → {train_end.date()}  (days={args.train_days})")
+    print(f"Valid window: {valid_start.date()} → {valid_end.date()}  (days={args.valid_days})")
+    print(f"Sport: {args.sport}  Side: {args.side}")
     print(f"[Value head] logloss={safe_logloss(y_valid,preds):.4f} auc={roc_auc_score(y_valid,preds):.3f}")
 
 if __name__ == "__main__":
