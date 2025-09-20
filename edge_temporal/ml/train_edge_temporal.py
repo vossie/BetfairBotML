@@ -71,6 +71,9 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str):
         pl.col("marketStartMs").alias("marketStartMs"),
         pl.col("marketType").alias("marketType"),
         pl.col("countryCode").alias("countryCode"),
+        pl.col("runners").struct.field("handicap").alias("handicap"),
+        pl.col("runners").struct.field("sortPriority").alias("sortPriority"),
+        pl.col("runners").struct.field("reductionFactor").alias("reductionFactor"),
     ])
     return lf
 
@@ -162,90 +165,64 @@ def evaluate(df,odds,y,p_model,p_market,edge_t,topk,lo,hi,stake_mode,cap,floor_,
 # ---------------------------------------------------------------------
 
 def main():
-    args = parse_args()
-    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/opt/BetfairBotML/edge_temporal/output"))
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    args=parse_args()
+    OUTPUT_DIR=Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
+    OUTPUT_DIR.mkdir(parents=True,exist_ok=True)
 
-    asof_dt = parse_date(args.asof)
+    asof_dt=parse_date(args.asof)
     train_end   = asof_dt - timedelta(days=args.valid_days)
     train_start = train_end - timedelta(days=args.train_days - 1)
     valid_start = asof_dt - timedelta(days=args.valid_days - 1)
     valid_end   = asof_dt
 
-    curated = Path(args.curated)
-    snap_lf = load_snapshots(curated, train_start, valid_end, args.sport)
-    res_lf  = load_results(curated, train_start, valid_end, args.sport)
-    defs_lf = load_defs(curated, train_start, valid_end, args.sport)
-    df_all  = join_all(snap_lf, res_lf, defs_lf)
+    curated=Path(args.curated)
+    snap_lf=load_snapshots(curated,train_start,valid_end,args.sport)
+    res_lf=load_results(curated,train_start,valid_end,args.sport)
+    defs_lf=load_defs(curated,train_start,valid_end,args.sport)
+    df_all=join_all(snap_lf,res_lf,defs_lf)
 
-    # add relative time-to-start and filter to pre-off window
     if "marketStartMs" in df_all.columns:
-        df_all = df_all.with_columns(
-            (pl.col("marketStartMs") - pl.col("publishTimeMs")).alias("secs_to_start")
-        )
-        df_all = df_all.filter(
-            (pl.col("secs_to_start") >= 0) & (pl.col("secs_to_start") <= args.preoff_mins * 60)
-        )
+        df_all=df_all.with_columns((pl.col("marketStartMs")-pl.col("publishTimeMs")).alias("secs_to_start"))
+        df_all=df_all.filter((pl.col("secs_to_start")>=0)&(pl.col("secs_to_start")<=args.preoff_mins*60))
 
-    # encode categorical defs like marketType, countryCode
-    df_all = encode_categoricals(df_all)
+    df_all=encode_categoricals(df_all)
 
-    # split into train / valid
-    df_train = df_all.filter(
-        (pl.col("publishTimeMs") >= int(train_start.timestamp() * 1000)) &
-        (pl.col("publishTimeMs") <= int(train_end.timestamp() * 1000))
-    )
-    df_valid = df_all.filter(
-        (pl.col("publishTimeMs") >= int(valid_start.timestamp() * 1000)) &
-        (pl.col("publishTimeMs") <= int(valid_end.timestamp() * 1000))
-    )
+    df_train=df_all.filter((pl.col("publishTimeMs")>=int(train_start.timestamp()*1000)) &
+                           (pl.col("publishTimeMs")<=int(train_end.timestamp()*1000)))
+    df_valid=df_all.filter((pl.col("publishTimeMs")>=int(valid_start.timestamp()*1000)) &
+                           (pl.col("publishTimeMs")<=int(valid_end.timestamp()*1000)))
 
-    # features: everything except identifiers + raw startMs
-    feats = [c for c in df_all.columns
-             if c not in ("winLabel", "sport", "marketId", "selectionId", "marketStartMs")]
+    feats=[c for c in df_all.columns if c not in ("winLabel","sport","marketId","selectionId","marketStartMs")]
 
-    # train model
     dtrain = xgb.DMatrix(df_train.select(feats).to_arrow(),
-                         label=df_train["winLabel"].to_numpy(np.float32))
+                         label=df_train["winLabel"].to_numpy().astype(np.float32))
     dvalid = xgb.DMatrix(df_valid.select(feats).to_arrow(),
-                         label=df_valid["winLabel"].to_numpy(np.float32))
+                         label=df_valid["winLabel"].to_numpy().astype(np.float32))
 
-    booster = train(make_params(args.device), dtrain, dvalid, must_gpu=(args.device == "cuda"))
+    booster=train(make_params(args.device),dtrain,dvalid,must_gpu=(args.device=="cuda"))
 
-    # predict
-    preds = booster.predict(dvalid)
-    y     = df_valid["winLabel"].to_numpy(np.float32)
-    odds  = df_valid["ltp"].to_numpy(np.float32)
-    p_model  = preds.astype(np.float32)
-    p_market = (1.0 / np.clip(odds, 1e-12, None)).astype(np.float32)
+    preds=booster.predict(dvalid)
+    y=df_valid["winLabel"].to_numpy().astype(np.float32)
+    odds=df_valid["ltp"].to_numpy().astype(np.float32)
+    p_model=preds.astype(np.float32)
+    p_market=(1.0/np.clip(odds,1e-12,None)).astype(np.float32)
 
-    print(f"[Value] logloss={safe_logloss(y, preds):.4f} auc={roc_auc_score(y, preds):.3f}")
+    print(f"[Value] logloss={safe_logloss(y,preds):.4f} auc={roc_auc_score(y,preds):.3f}")
 
-    # sweep configs
-    EDGE_T = [0.010, 0.012, 0.015]
-    TOPK   = [1, 2]
-    LTP_W  = [(1.5, 5.0)]
-    STAKE  = [
-        ("flat", None, None, args.bankroll_nom),
-        ("kelly", args.kelly_cap, args.kelly_floor, args.bankroll_nom),
-    ]
-
-    recs = []
-    for e, t, (lo, hi), (sm, cap, floor_, bank) in itertools.product(EDGE_T, TOPK, LTP_W, STAKE):
-        m = evaluate(df_valid, odds, y, p_model, p_market,
-                     e, t, lo, hi, sm,
-                     cap or 0.0, floor_ or 0.0, bank or 1000.0,
-                     args.commission)
-        m.update(dict(edge_thresh=e, topk=t, ltp_min=lo, ltp_max=hi, stake_mode=sm))
+    EDGE_T=[0.010,0.012,0.015]; TOPK=[1,2]; LTP_W=[(1.5,5.0)]
+    STAKE=[("flat",None,None,args.bankroll_nom),("kelly",args.kelly_cap,args.kelly_floor,args.bankroll_nom)]
+    recs=[]
+    for e,t,(lo,hi),(sm,cap,floor_,bank) in itertools.product(EDGE_T,TOPK,LTP_W,STAKE):
+        m=evaluate(df_valid,odds,y,p_model,p_market,e,t,lo,hi,sm,cap or 0.0,floor_ or 0.0,bank or 1000.0,args.commission)
+        m.update(dict(edge_thresh=e,topk=t,ltp_min=lo,ltp_max=hi,stake_mode=sm))
         recs.append(m)
 
-    sweep = pl.DataFrame(recs).sort(["roi", "n_trades"], descending=[True, True])
-    out   = OUTPUT_DIR / f"edge_sweep_{args.asof}.csv"
+    sweep=pl.DataFrame(recs).sort(["roi","n_trades"],descending=[True,True])
+    out=OUTPUT_DIR/f"edge_sweep_{args.asof}.csv"
     sweep.write_csv(str(out))
 
     print(f"sweep saved → {out}")
-    print(sweep.select(["roi", "profit", "n_trades", "edge_thresh", "stake_mode"]).head(10))
-
+    print(sweep.select(["roi","profit","n_trades","edge_thresh","stake_mode"]).head(10))
 
 if __name__=="__main__":
     main()
