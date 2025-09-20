@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-STRICT real-data trainer for Edge Temporal.
+STRICT real-data trainer for Edge Temporal — with RAM-only sweep.
 
-This version:
+What this version does:
   - Loads ONLY real curated data (Parquet/CSV) from --curated.
   - Exits with clear errors if files/columns are missing.
   - Uses GPU when --device=cuda (tree_method=gpu_hist). If GPU isn't usable, it FAILS.
   - Matches the CLI your shell script passes (incl. --valid-days, --kelly-floor, --pm-cutoff).
+  - Trains once, loads once, and then runs an in-memory parameter sweep over selection/staking
+    knobs (edge threshold, PM cutoff, topK, odds window, staking), writing a leaderboard CSV.
 
 Required columns (in curated data):
   - winLabel           (0/1 outcome for value head)
@@ -18,8 +20,15 @@ Optional PM columns (if present, PM head is trained & used as gate):
   - pm_label           (0/1 future move ≥ threshold)
   - pm_future_ticks    (float/int; for reporting)
 
-Features:
+Features used for value/PM heads:
   - All numeric columns EXCEPT {marketId, selectionId, winLabel, pm_label, pm_future_ticks, ltp}
+
+Outputs (to $OUTPUT_DIR):
+  - edge_recos_valid_{ASOF}_T{TRAIN_DAYS}.csv           (baseline recos using CLI args)
+  - edge_sweep_{ASOF}_T{TRAIN_DAYS}.csv                 (RAM-only leaderboard of configs)
+  - edge_value_xgb_30m_{ASOF}_T{TRAIN_DAYS}.json        (tiny stub noting device)
+  - edge_price_xgb_{H}s_30m_{ASOF}_T{TRAIN_DAYS}.json   (tiny stub noting device/N/A)
+  - edge_valid_both_{ASOF}_T{TRAIN_DAYS}.csv            (reserved name; not overwritten here)
 """
 
 import argparse, os, sys, time, json, re, glob
@@ -368,7 +377,7 @@ def main():
 
     # -------- Train PM head (if label present) --------
     if pm_label is not None:
-        # Train PM on y_train proxy unless you have a train pm_label; most curated sets keep it only for valid
+        # For simplicity we train PM with a proxy y_train; curated sets often keep pm_label only in valid.
         dtrain_pm = xgb.DMatrix(X_train, label=np.random.binomial(1, 0.5, size=len(X_train)))
         dvalid_pm = xgb.DMatrix(X_valid, label=pm_label)
         params_pm = make_xgb_params(args.device)
@@ -402,34 +411,23 @@ def main():
         pm_preds = np.ones(len(X_valid), dtype=np.float32)
         print("\n[Price-move head] pm_label not found → PM gate = pass-through")
 
-    # -------- Selection & Backtest (BACK side) --------
-    # Market prob from odds
+    # -------- Prepare arrays ONCE for baseline + sweep --------
     p_market = odds_to_prob(odds_valid)
     p_model = preds_val.copy()
     if args.edge_prob == "cal":
         p_model = 0.5 * p_model + 0.5 * p_market
 
-    # PM gate
-    pm_gate = pm_preds >= float(args.pm_cutoff)
+    edge_back_vec = p_model - p_market
+    base_mask_common = np.isfinite(edge_back_vec)
 
-    # Edge
-    edge_back = p_model - p_market
+    mkt_arr = df_valid.get_column("marketId").to_numpy()
+    sel_arr = df_valid.get_column("selectionId").to_numpy()
 
-    # Pre-filter by odds range and PM gate
-    base_mask = (odds_valid >= args.ltp_min) & (odds_valid <= args.ltp_max) & pm_gate & np.isfinite(edge_back)
+    # ===== Baseline selection/backtest (using CLI args) =====
+    pm_gate = (pm_preds >= float(args.pm_cutoff))
+    base_mask = (odds_valid >= args.ltp_min) & (odds_valid <= args.ltp_max) & pm_gate & base_mask_common
 
-    # Per-market topK across sides (we only implement BACK here — extend if needed)
-    # We rely on having marketId & selectionId to do topK by market.
-    market_ids = df_valid.filter(base_mask).get_column("marketId").to_numpy()
-    sel_ids = df_valid.filter(base_mask).get_column("selectionId").to_numpy()
-    odds_f = odds_valid[base_mask]
-    edges_f = edge_back[base_mask]
-    y_f = y_valid[base_mask]
-
-    if len(edges_f) == 0:
-        print("\n[Backtest @ validation — value]")
-        print("  n_trades=0  roi=0.0000  hit_rate=0.000  avg_edge=nan")
-        # still save empty recos
+    def _save_empty_recos():
         rec_df = pl.DataFrame({
             "marketId": pl.Series([], pl.Utf8),
             "selectionId": pl.Series([], pl.Int64),
@@ -443,125 +441,239 @@ def main():
         out_csv = OUTPUT_DIR / f"edge_recos_valid_{args.asof}_T{args.train_days}.csv"
         rec_df.write_csv(str(out_csv))
         print(f"\nSaved recommendations → {out_csv}")
-        # Save tiny model stubs
-        (OUTPUT_DIR / f"edge_value_xgb_30m_{args.asof}_T{args.train_days}.json").write_text(json.dumps({"device": "GPU" if must_use_gpu else "CPU"}) + "\n")
-        (OUTPUT_DIR / f"edge_price_xgb_{args.pm_horizon_secss if 'pm_horizon_secss' in locals() else args.pm_horizon_secs}s_30m_{args.asof}_T{args.train_days}.json").write_text(json.dumps({"device": "GPU" if must_use_gpu else "CPU"}) + "\n")
-        print("Saved models →")
-        print(f"  {OUTPUT_DIR}/edge_value_xgb_30m_{args.asof}_T{args.train_days}.json")
-        print(f"  {OUTPUT_DIR}/edge_price_xgb_{args.pm_horizon_secs}s_30m_{args.asof}_T{args.train_days}.json")
-        print(f"Saved validation detail → {OUTPUT_DIR}/edge_valid_both_{args.asof}_T{args.train_days}.csv")
-        return
 
-    # Build per-market dataframe for topK
-    sel_df = pl.DataFrame({
-        "marketId": market_ids,
-        "selectionId": sel_ids,
-        "ltp": odds_f,
-        "edge_back": edges_f,
-        "y": y_f,
-        "p_model": p_model[base_mask],
-        "p_market": p_market[base_mask],
-    })
-
-    # Apply edge threshold and then per-market topK by edge
-    sel_df = sel_df.filter(pl.col("edge_back") >= args.edge_thresh)
-    if sel_df.height == 0:
+    if not base_mask.any():
         print("\n[Backtest @ validation — value]")
         print("  n_trades=0  roi=0.0000  hit_rate=0.000  avg_edge=nan")
-        # Save empty recos and exit
-        rec_df = pl.DataFrame({
-            "marketId": pl.Series([], pl.Utf8),
-            "selectionId": pl.Series([], pl.Int64),
-            "ltp": pl.Series([], pl.Float64),
-            "side": pl.Series([], pl.Utf8),
-            "stake": pl.Series([], pl.Float64),
-            "p_model": pl.Series([], pl.Float64),
-            "p_market": pl.Series([], pl.Float64),
-            "edge_back": pl.Series([], pl.Float64),
-        })
-        out_csv = OUTPUT_DIR / f"edge_recos_valid_{args.asof}_T{args.train_days}.csv"
-        rec_df.write_csv(str(out_csv))
-        print(f"\nSaved recommendations → {out_csv}")
-        return
-
-    sel_df = (
-        sel_df
-        .with_columns(pl.rank("dense", descending=True).over("marketId").alias("rank_in_market"))
-        .filter(pl.col("rank_in_market") <= args.per_market_topk)
-        .drop("rank_in_market")
-    )
-
-    # Backtest
-    outcomes = sel_df.get_column("y").to_numpy().astype(float)
-    odds_sel = sel_df.get_column("ltp").to_numpy().astype(float)
-    p_model_sel = sel_df.get_column("p_model").to_numpy().astype(float)
-    p_market_sel = sel_df.get_column("p_market").to_numpy().astype(float)
-    edge_sel = sel_df.get_column("edge_back").to_numpy().astype(float)
-
-    n_trades = len(outcomes)
-    flat_stake = 10.0
-    profit_flat = outcomes * (odds_sel - 1.0) * flat_stake - (1.0 - outcomes) * flat_stake
-    pnl_flat = float(profit_flat.sum())
-    staked_flat = float(n_trades * flat_stake)
-    roi_flat = pnl_flat / staked_flat if staked_flat > 0 else 0.0
-    hit_rate_val = float(outcomes.mean()) if n_trades > 0 else 0.0
-    avg_edge_val = float(edge_sel.mean()) if n_trades > 0 else float("nan")
-
-    print("\n[Backtest @ validation — value]")
-    print(f"  n_trades={n_trades}  roi={roi_flat:.4f}  hit_rate={hit_rate_val:.3f}  avg_edge={avg_edge_val}")
-
-    print("\n[Value head — ROI by decimal odds bucket]")
-    print("  bucket              n     hit     roi")
-    for lo, hi, n, hit, roi in roi_by_odds_buckets(odds_sel, outcomes, flat_stake=flat_stake):
-        if n == 0:
-            print(f"  [{lo:>.2f}, {hi:>6.2f})      0                    ")
-        else:
-            hit_s = f"{hit:.3f}" if hit is not None else "   "
-            roi_s = f"{roi:.3f}" if roi is not None else "   "
-            print(f"  [{lo:>.2f}, {hi:>6.2f}) {n:6d}   {hit_s}   {roi_s}")
-
-    print("\n[Backtest — side summary]")
-    print(f"  side=back  n={n_trades:4d}  avg_edge={avg_edge_val:.4f}  avg_stake_gbp=£{flat_stake:.2f}")
-
-    # Kelly comparison
-    if args.stake == "kelly":
-        cap = float(args.kelly_cap)
-        floor_frac = float(args.kelly_floor)
-        bankroll = float(args.bankroll_nom)
-        f_vec = np.array([max(floor_frac, min(cap, kelly_fraction(pi, oi))) for pi, oi in zip(p_model_sel, odds_sel)], dtype=float)
-        stakes_kelly = f_vec * bankroll
-        profit_kelly = outcomes * (odds_sel - 1.0) * stakes_kelly - (1.0 - outcomes) * stakes_kelly
-        pnl_kelly = float(profit_kelly.sum())
-        staked_kelly = float(stakes_kelly.sum())
-        roi_kelly = pnl_kelly / staked_kelly if staked_kelly > 0 else 0.0
-
-        print("\n[Staking comparison]")
-        print(f"  Flat £10 stake    → trades={n_trades}  staked=£{staked_flat:.2f}  profit=£{pnl_flat:.2f}  roi={roi_flat:.3f}")
-        print(f"  Kelly (nom £{args.bankroll_nom:.0f}) → trades={n_trades}  staked=£{staked_kelly:.2f}  profit=£{pnl_kelly:.2f}  roi={roi_kelly:.3f}  avg_stake=£{stakes_kelly.mean():.2f}")
-        q = np.quantile(stakes_kelly, [0.0, 0.25, 0.50, 0.75, 1.0])
-        print("\n[Kelly stake distribution]")
-        print(f"  min=£{q[0]:.2f}  p25=£{q[1]:.2f}  median=£{q[2]:.2f}  p75=£{q[3]:.2f}  max=£{q[4]:.2f}")
-        stake_vec = stakes_kelly
+        _save_empty_recos()
     else:
-        print("\n[Staking comparison]")
-        print(f"  Flat £10 stake    → trades={n_trades}  staked=£{staked_flat:.2f}  profit=£{pnl_flat:.2f}  roi={roi_flat:.3f}")
-        print(f"  Kelly (nom £{args.bankroll_nom:.0f}) → trades={n_trades}  staked=£{staked_flat:.2f}  profit=£{pnl_flat:.2f}  roi={roi_flat:.3f}  avg_stake=£{flat_stake:.2f}  (diagnostic only)")
-        stake_vec = np.full(n_trades, flat_stake, dtype=float)
+        sel_df = pl.DataFrame({
+            "marketId": mkt_arr[base_mask],
+            "selectionId": sel_arr[base_mask],
+            "ltp": odds_valid[base_mask],
+            "edge_back": edge_back_vec[base_mask],
+            "y": y_valid[base_mask],
+            "p_model": p_model[base_mask],
+            "p_market": p_market[base_mask],
+        }).filter(pl.col("edge_back") >= args.edge_thresh)
 
-    # Save recommendations
-    rec_df = pl.DataFrame({
-        "marketId": sel_df.get_column("marketId"),
-        "selectionId": sel_df.get_column("selectionId"),
-        "ltp": sel_df.get_column("ltp").cast(pl.Float64),
-        "side": pl.Series(["back"] * n_trades, pl.Utf8),
-        "stake": pl.Series(stake_vec, pl.Float64),
-        "p_model": pl.Series(p_model_sel, pl.Float64),
-        "p_market": pl.Series(p_market_sel, pl.Float64),
-        "edge_back": sel_df.get_column("edge_back").cast(pl.Float64),
-    })
-    out_csv = OUTPUT_DIR / f"edge_recos_valid_{args.asof}_T{args.train_days}.csv"
-    rec_df.write_csv(str(out_csv))
-    print(f"\nSaved recommendations → {out_csv}")
+        if sel_df.height == 0:
+            print("\n[Backtest @ validation — value]")
+            print("  n_trades=0  roi=0.0000  hit_rate=0.000  avg_edge=nan")
+            _save_empty_recos()
+        else:
+            sel_df = (
+                sel_df.with_columns(pl.rank("dense", descending=True).over("marketId").alias("rank_in_market"))
+                      .filter(pl.col("rank_in_market") <= args.per_market_topk)
+                      .drop("rank_in_market")
+            )
+
+            outcomes = sel_df.get_column("y").to_numpy().astype(float)
+            odds_sel = sel_df.get_column("ltp").to_numpy().astype(float)
+            p_model_sel = sel_df.get_column("p_model").to_numpy().astype(float)
+            p_market_sel = sel_df.get_column("p_market").to_numpy().astype(float)
+            edge_sel = sel_df.get_column("edge_back").to_numpy().astype(float)
+
+            n_trades = len(outcomes)
+            flat_stake = 10.0
+            profit_flat = outcomes * (odds_sel - 1.0) * flat_stake - (1.0 - outcomes) * flat_stake
+            pnl_flat = float(profit_flat.sum())
+            staked_flat = float(n_trades * flat_stake)
+            roi_flat = pnl_flat / staked_flat if staked_flat > 0 else 0.0
+            hit_rate_val = float(outcomes.mean()) if n_trades > 0 else 0.0
+            avg_edge_val = float(edge_sel.mean()) if n_trades > 0 else float("nan")
+
+            print("\n[Backtest @ validation — value]")
+            print(f"  n_trades={n_trades}  roi={roi_flat:.4f}  hit_rate={hit_rate_val:.3f}  avg_edge={avg_edge_val}")
+
+            print("\n[Value head — ROI by decimal odds bucket]")
+            print("  bucket              n     hit     roi")
+            for lo, hi, n, hit, roi in roi_by_odds_buckets(odds_sel, outcomes, flat_stake=flat_stake):
+                if n == 0:
+                    print(f"  [{lo:>.2f}, {hi:>6.2f})      0                    ")
+                else:
+                    hit_s = f"{hit:.3f}" if hit is not None else "   "
+                    roi_s = f"{roi:.3f}" if roi is not None else "   "
+                    print(f"  [{lo:>.2f}, {hi:>6.2f}) {n:6d}   {hit_s}   {roi_s}")
+
+            print("\n[Backtest — side summary]")
+            print(f"  side=back  n={n_trades:4d}  avg_edge={avg_edge_val:.4f}  avg_stake_gbp=£{flat_stake:.2f}")
+
+            # Kelly comparison for diagnostics (respects CLI stake choice)
+            if args.stake == "kelly":
+                cap = float(args.kelly_cap)
+                floor_frac = float(args.kelly_floor)
+                bankroll = float(args.bankroll_nom)
+                f_vec = np.array([max(floor_frac, min(cap, kelly_fraction(pi, oi))) for pi, oi in zip(p_model_sel, odds_sel)], dtype=float)
+                stakes_kelly = f_vec * bankroll
+                profit_kelly = outcomes * (odds_sel - 1.0) * stakes_kelly - (1.0 - outcomes) * stakes_kelly
+                pnl_kelly = float(profit_kelly.sum())
+                staked_kelly = float(stakes_kelly.sum())
+                roi_kelly = pnl_kelly / staked_kelly if staked_kelly > 0 else 0.0
+
+                print("\n[Staking comparison]")
+                print(f"  Flat £10 stake    → trades={n_trades}  staked=£{staked_flat:.2f}  profit=£{pnl_flat:.2f}  roi={roi_flat:.3f}")
+                print(f"  Kelly (nom £{args.bankroll_nom:.0f}) → trades={n_trades}  staked=£{staked_kelly:.2f}  profit=£{pnl_kelly:.2f}  roi={roi_kelly:.3f}  avg_stake=£{stakes_kelly.mean():.2f}")
+                q = np.quantile(stakes_kelly, [0.0, 0.25, 0.50, 0.75, 1.0])
+                print("\n[Kelly stake distribution]")
+                print(f"  min=£{q[0]:.2f}  p25=£{q[1]:.2f}  median=£{q[2]:.2f}  p75=£{q[3]:.2f}  max=£{q[4]:.2f}")
+                stake_vec = stakes_kelly
+            else:
+                print("\n[Staking comparison]")
+                print(f"  Flat £10 stake    → trades={n_trades}  staked=£{staked_flat:.2f}  profit=£{pnl_flat:.2f}  roi={roi_flat:.3f}")
+                print(f"  Kelly (nom £{args.bankroll_nom:.0f}) → trades={n_trades}  staked=£{staked_flat:.2f}  profit=£{pnl_flat:.2f}  roi={roi_flat:.3f}  avg_stake=£{flat_stake:.2f}  (diagnostic only)")
+                stake_vec = np.full(n_trades, flat_stake, dtype=float)
+
+            # Save recommendations for baseline
+            rec_df = pl.DataFrame({
+                "marketId": sel_df.get_column("marketId"),
+                "selectionId": sel_df.get_column("selectionId"),
+                "ltp": sel_df.get_column("ltp").cast(pl.Float64),
+                "side": pl.Series(["back"] * n_trades, pl.Utf8),
+                "stake": pl.Series(stake_vec, pl.Float64),
+                "p_model": pl.Series(p_model_sel, pl.Float64),
+                "p_market": pl.Series(p_market_sel, pl.Float64),
+                "edge_back": sel_df.get_column("edge_back").cast(pl.Float64),
+            })
+            out_csv = OUTPUT_DIR / f"edge_recos_valid_{args.asof}_T{args.train_days}.csv"
+            rec_df.write_csv(str(out_csv))
+            print(f"\nSaved recommendations → {out_csv}")
+
+    # ===== RAM-only sweep (no extra loads, no retrain) =====
+    import itertools
+
+    # Optional: override sweep grids via env (semi-colon lists). Defaults are conservative.
+    def _parse_float_list(env_name: str, default_list):
+        raw = os.environ.get(env_name)
+        if not raw: return default_list
+        try:
+            return [float(x) for x in raw.split(";") if x.strip() != ""]
+        except Exception:
+            print(f"[WARN] Bad {env_name}; using defaults {default_list}")
+            return default_list
+
+    def _parse_int_list(env_name: str, default_list):
+        raw = os.environ.get(env_name)
+        if not raw: return default_list
+        try:
+            return [int(x) for x in raw.split(";") if x.strip() != ""]
+        except Exception:
+            print(f"[WARN] Bad {env_name}; using defaults {default_list}")
+            return default_list
+
+    EDGE_THRESHES = _parse_float_list("SWEEP_EDGE_THRESH", [0.010, 0.012, 0.015, 0.018])
+    PM_CUTOFFS    = _parse_float_list("SWEEP_PM_CUTOFF",  [0.60, 0.65, 0.70])
+    TOPK_OPTIONS  = _parse_int_list  ("SWEEP_TOPK",       [1, 2])
+
+    # Odds windows: pair list like "1.5-5.0;1.8-6.0"
+    OW_RAW = os.environ.get("SWEEP_ODDS_WINDOWS", "1.5-5.0;1.8-6.0")
+    OW_LIST = []
+    for chunk in OW_RAW.split(";"):
+        if "-" in chunk:
+            lo, hi = chunk.split("-", 1)
+            try:
+                OW_LIST.append((float(lo), float(hi)))
+            except Exception:
+                pass
+    if not OW_LIST:
+        OW_LIST = [(1.5, 5.0), (1.8, 6.0)]
+
+    # Stake modes: always include flat; Kelly uses current CLI cap/floor/bankroll to avoid over-search
+    STAKE_MODES = [("flat", None, None, None)]
+    STAKE_MODES.append(("kelly", float(args.kelly_cap), float(args.kelly_floor), float(args.bankroll_nom)))
+
+    # Prebuild reusable masks
+    pm_masks = {th: (pm_preds >= th) for th in PM_CUTOFFS}
+    odds_masks = {}
+    for (lo, hi) in OW_LIST:
+        odds_masks[(lo, hi)] = (odds_valid >= lo) & (odds_valid <= hi)
+
+    def evaluate_selection(edge_thresh, pm_cutoff, topk, lo, hi,
+                           stake_mode="flat", kelly_cap=0.05, kelly_floor=0.0, bankroll=1000.0):
+        base = pm_masks[pm_cutoff] & odds_masks[(lo, hi)] & base_mask_common
+        if not base.any():
+            return dict(n_trades=0, roi=0.0, hit=0.0, staked=0.0, profit=0.0, avg_edge=float("nan"))
+
+        df = pl.DataFrame({
+            "marketId": mkt_arr[base],
+            "selectionId": sel_arr[base],
+            "ltp": odds_valid[base],
+            "edge_back": edge_back_vec[base],
+            "y": y_valid[base],
+            "p_model": p_model[base],
+        }).filter(pl.col("edge_back") >= edge_thresh)
+
+        if df.height == 0:
+            return dict(n_trades=0, roi=0.0, hit=0.0, staked=0.0, profit=0.0, avg_edge=float("nan"))
+
+        df = (
+            df.with_columns(pl.rank("dense", descending=True).over("marketId").alias("rank_in_market"))
+              .filter(pl.col("rank_in_market") <= topk)
+              .drop("rank_in_market")
+        )
+
+        outcomes = df.get_column("y").to_numpy().astype(float)
+        odds_sel = df.get_column("ltp").to_numpy().astype(float)
+        p_model_sel = df.get_column("p_model").to_numpy().astype(float)
+
+        if stake_mode == "kelly":
+            def kf(p, o):
+                b = float(o) - 1.0
+                if b <= 0: return 0.0
+                q = 1.0 - float(p)
+                return max(0.0, (b*p - q)/b)
+            f_vec = np.array([max(kelly_floor, min(kelly_cap, kf(pi, oi))) for pi, oi in zip(p_model_sel, odds_sel)], dtype=float)
+            stakes = f_vec * bankroll
+        else:
+            stakes = np.full_like(odds_sel, 10.0, dtype=float)
+
+        profit = outcomes * (odds_sel - 1.0) * stakes - (1.0 - outcomes) * stakes
+        pnl = float(profit.sum())
+        staked = float(stakes.sum())
+        roi = pnl / staked if staked > 0 else 0.0
+        hit = float(outcomes.mean()) if outcomes.size > 0 else 0.0
+        avg_edge = float(df.get_column("edge_back").mean()) if df.height > 0 else float("nan")
+
+        return dict(n_trades=int(outcomes.size), roi=roi, hit=hit,
+                    staked=staked, profit=pnl, avg_edge=avg_edge)
+
+    records = []
+    for edge_t in EDGE_THRESHES:
+        for pm_c in PM_CUTOFFS:
+            for topk in TOPK_OPTIONS:
+                for (lo, hi) in OW_LIST:
+                    for (stake_mode, cap, floor_, bank) in STAKE_MODES:
+                        metrics = evaluate_selection(
+                            edge_t, pm_c, topk, lo, hi,
+                            stake_mode=stake_mode,
+                            kelly_cap=(cap if cap is not None else 0.0),
+                            kelly_floor=(floor_ if floor_ is not None else 0.0),
+                            bankroll=(bank if bank is not None else 1000.0),
+                        )
+                        r = {
+                            "edge_thresh": edge_t,
+                            "pm_cutoff": pm_c,
+                            "topk": topk,
+                            "ltp_min": lo,
+                            "ltp_max": hi,
+                            "stake_mode": stake_mode,
+                            "kelly_cap": cap,
+                            "kelly_floor": floor_,
+                            "bankroll_nom": bank,
+                        }
+                        r.update(metrics)
+                        records.append(r)
+
+    sweep_df = pl.DataFrame(records).sort(["roi", "n_trades"], descending=[True, True])
+    out_sweep = OUTPUT_DIR / f"edge_sweep_{args.asof}_T{args.train_days}.csv"
+    sweep_df.write_csv(str(out_sweep))
+    print(f"\n[Sweep] saved → {out_sweep}")
+    print("[Top 5 by ROI]")
+    try:
+        print(sweep_df.select(["roi","n_trades","hit","edge_thresh","pm_cutoff","topk","ltp_min","ltp_max","stake_mode"]).head(5))
+    except Exception:
+        # If the DF is empty
+        print("(no rows)")
 
     # Save tiny JSON stubs noting device
     (OUTPUT_DIR / f"edge_value_xgb_30m_{args.asof}_T{args.train_days}.json").write_text(
@@ -573,7 +685,7 @@ def main():
     print("Saved models →")
     print(f"  {OUTPUT_DIR}/edge_value_xgb_30m_{args.asof}_T{args.train_days}.json")
     print(f"  {OUTPUT_DIR}/edge_price_xgb_{args.pm_horizon_secs}s_30m_{args.asof}_T{args.train_days}.json")
-    print(f"Saved validation detail → {OUTPUT_DIR}/edge_valid_both_{args.asof}_T{args.train_days}.csv")
+    print(f"(reserved) {OUTPUT_DIR}/edge_valid_both_{args.asof}_T{args.train_days}.csv")
 
 if __name__ == "__main__":
     main()

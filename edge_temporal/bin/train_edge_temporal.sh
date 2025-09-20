@@ -17,6 +17,8 @@ set -euo pipefail
 # - START_DATE is the first training day.
 # - We exclude today from validation. ASOF = today - 1 day.
 #   So: valid = [ASOF-(VALID_DAYS-1), ASOF], train ends at ASOF-VALID_DAYS.
+# - The Python trainer loads data ONCE, trains ONCE, then runs a RAM-only sweep.
+#   You can narrow/widen the sweep via env vars (see SWEEP_* below).
 # ------------------------------------------------------------
 
 # Project paths
@@ -64,6 +66,12 @@ VALID_DAYS="${VALID_DAYS:-3}"
 
 # Optional: output dir passthrough for Python
 OUTPUT_DIR="${OUTPUT_DIR:-${ML_ROOT}/output}"
+
+# Optional RAM-only sweep grids (semicolon-separated); defaults are conservative
+#   SWEEP_EDGE_THRESH="0.010;0.012;0.015;0.018"
+#   SWEEP_PM_CUTOFF="0.60;0.65;0.70"
+#   SWEEP_TOPK="1;2"
+#   SWEEP_ODDS_WINDOWS="1.5-5.0;1.8-6.0"
 
 # ---- args ----
 if [[ $# -lt 1 ]]; then
@@ -153,6 +161,7 @@ python3 "${ML_PY}" \
   --per-market-topk "${PER_MARKET_TOPK}" \
   --stake "${STAKE}" \
   --kelly-cap "${KELLY_CAP}" \
+  --kelly-floor "${KELLY_FLOOR}" \
   --ltp-min "${LTP_MIN}" \
   --ltp-max "${LTP_MAX}" \
   --side "${SIDE}" \
