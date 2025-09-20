@@ -15,8 +15,8 @@ set -euo pipefail
 #
 # Notes:
 # - START_DATE is the first training day.
-# - We **exclude today** from validation. ASOF = today - 1 day.
-#   So:  valid = [ASOF-(VALID_DAYS-1), ASOF], train ends at ASOF-VALID_DAYS.
+# - We exclude today from validation. ASOF = today - 1 day.
+#   So: valid = [ASOF-(VALID_DAYS-1), ASOF], train ends at ASOF-VALID_DAYS.
 # ------------------------------------------------------------
 
 # Project paths
@@ -31,17 +31,12 @@ SPORT="${2:-horse-racing}"
 PREOFF_MINS="${3:-30}"
 DOWNSAMPLE_SECS="${4:-5}"
 
-# ---- Tunable defaults (reflecting our latest findings) ----
-# Trading / backtest
+# ---- Tunable defaults ----
 COMMISSION="${COMMISSION:-0.02}"
-EDGE_THRESH="${EDGE_THRESH:-0.015}"          # entry cutoff
-EDGE_PROB="${EDGE_PROB:-cal}"                # use calibrated probs for edge calc
+EDGE_THRESH="${EDGE_THRESH:-0.015}"
+EDGE_PROB="${EDGE_PROB:-cal}"
 NO_SUM_TO_ONE="${NO_SUM_TO_ONE:-0}"          # 1 disables normalization; 0 enables
-
-# Market probability comparator
 MARKET_PROB="${MARKET_PROB:-overround}"      # 'overround' recommended
-
-# Selection policy and flow control
 PER_MARKET_TOPK="${PER_MARKET_TOPK:-1}"      # #picks per market (across sides)
 SIDE="${SIDE:-back}"                         # back | lay | both
 
@@ -55,7 +50,7 @@ KELLY_CAP="${KELLY_CAP:-0.05}"               # max Kelly fraction (if STAKE=kell
 KELLY_FLOOR="${KELLY_FLOOR:-0.0}"            # minimum Kelly fraction floor
 BANKROLL_NOM="${BANKROLL_NOM:-1000}"
 
-# Price-move head (labels only; not used for value backtest)
+# Price-move head / gating
 PM_HORIZON_SECS="${PM_HORIZON_SECS:-300}"
 PM_TICK_THRESHOLD="${PM_TICK_THRESHOLD:-1}"
 PM_SLACK_SECS="${PM_SLACK_SECS:-3}"
@@ -64,8 +59,11 @@ PM_CUTOFF="${PM_CUTOFF:-0.0}"
 # Device
 DEVICE="${DEVICE:-cuda}"
 
-# Validation window length
+# Validation window length (days)
 VALID_DAYS="${VALID_DAYS:-3}"
+
+# Optional: output dir passthrough for Python
+OUTPUT_DIR="${OUTPUT_DIR:-${ML_ROOT}/output}"
 
 # ---- args ----
 if [[ $# -lt 1 ]]; then
@@ -80,11 +78,16 @@ if [[ ! -d "${CURATED_ROOT}" ]]; then
   exit 2
 fi
 
+if ! [[ "${VALID_DAYS}" =~ ^[0-9]+$ ]] || [[ "${VALID_DAYS}" -lt 1 ]]; then
+  echo "ERROR: VALID_DAYS must be an integer >= 1 (got '${VALID_DAYS}')." >&2
+  exit 2
+fi
+
 # ---- date math (Europe/London) ----
 export TZ="Europe/London"
 TODAY="$(date +%F)"
-ASOF="$(date -d "${TODAY} -1 day" +%F)"     # exclude today
-TRAIN_END="$(date -d "${ASOF} -${VALID_DAYS} day" +%F)" # training ends at ASOF-VALID_DAYS
+ASOF="$(date -d "${TODAY} -1 day" +%F)"                         # exclude today
+TRAIN_END="$(date -d "${ASOF} -${VALID_DAYS} day" +%F)"         # training ends at ASOF-VALID_DAYS
 VALID_START="$(date -d "${ASOF} -$((VALID_DAYS-1)) day" +%F)"
 VALID_END="${ASOF}"
 
@@ -124,10 +127,12 @@ echo "PM horizon (secs):    ${PM_HORIZON_SECS}"
 echo "PM tick threshold:    ${PM_TICK_THRESHOLD}"
 echo "PM slack (secs):      ${PM_SLACK_SECS}"
 echo "PM cutoff:            ${PM_CUTOFF}"
+echo "Output dir:           ${OUTPUT_DIR}"
 echo
 
 # ---- run Python ----
 export PYTHONPATH="${ML_ROOT}/ml:${PYTHONPATH:-}"
+export OUTPUT_DIR
 
 python3 "${ML_PY}" \
   --curated "${CURATED_ROOT}" \
