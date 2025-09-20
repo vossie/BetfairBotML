@@ -34,7 +34,7 @@ def safe_logloss(y_true, p):
     return float(-(y_true * np.log(p) + (1 - y_true) * np.log(1 - p)).mean())
 
 def kelly_fraction(p, odds):
-    """Full Kelly for BACK bets. f = (b*p - (1-p))/b, b=odds-1."""
+    """Full Kelly for BACK bets. f = (b*p - (1-p))/b, where b=odds-1."""
     b = float(odds) - 1.0
     if b <= 0: return 0.0
     q = 1.0 - float(p)
@@ -68,7 +68,6 @@ def roi_by_odds_buckets(odds, outcomes, flat_stake=10.0):
         if n == 0:
             res.append((lo, hi, 0, None, None)); continue
         wins = int(outcomes[m].sum())
-        # Approx profit: win gets (avg(odds)-1)*stake; lose loses stake
         profit = wins * (float(odds[m].mean()) - 1.0) * flat_stake - (n - wins) * flat_stake
         roi = profit / (n * flat_stake) if n > 0 else None
         hit = wins / n if n > 0 else None
@@ -196,8 +195,7 @@ def main():
     print(f"Edge threshold:       {args.edge_thresh}")
     print(f"Edge prob:            {args.edge_prob}")
     print(f"Sum-to-one:           {'disabled' if args.no_sum_to_one else 'enabled'}")
-    print(f"Market prob:          {args.market_pro}") if False else None
-    print(f"Market prob:          {args.market_pro}")
+    print(f"Market prob:          {args.market_prob}")
     print(f"Per-market topK:      {args.per_market_topk}")
     print(f"Side:                 {args.side}")
     print(f"LTP range:            [{args.ltp_min}, {args.ltp_max}]")
@@ -207,11 +205,12 @@ def main():
     print(f"PM tick threshold:    {args.pm_tick_threshold}")
     print(f"PM slack (secs):      {args.pm_slack_secs}")
     print(f"PM cutoff:            {args.pm_cutoff}")
+    print(f"Output dir:           {OUTPUT_DIR}")
     print()
 
     # -------------------------------
     # Synthetic features (replace with your real pipeline)
-    # NOTE: Big enough to engage GPU meaningfully.
+    # Big enough to exercise GPU meaningfully.
     # -------------------------------
     rng = np.random.default_rng(42)
     n_train = max(120_000, args.train_days * 25_000)
