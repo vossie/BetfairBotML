@@ -65,7 +65,7 @@ PM_CUTOFF="${PM_CUTOFF:-0.0}"
 DEVICE="${DEVICE:-cuda}"
 
 # Validation window length
-VALID_DAYS="${VALID_DAYS:-2}"
+VALID_DAYS="${VALID_DAYS:-3}"
 
 # ---- args ----
 if [[ $# -lt 1 ]]; then
