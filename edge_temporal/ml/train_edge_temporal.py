@@ -166,7 +166,9 @@ def evaluate(df_valid, odds, y, p_model, p_market, edge_thresh, topk, lo, hi,
         "p_model": p_model[mask],
     }).filter(pl.col("edge") >= edge_thresh)
     if df.height == 0: return dict(roi=0.0, profit=0.0, n_trades=0)
-    df = df.with_columns(pl.rank("dense", descending=True).over("marketId").alias("rk")).filter(pl.col("rk")<=topk).drop("rk")
+    df = df.with_columns(
+        pl.col("edge").rank(method="dense", descending=True).over("marketId").alias("rk")
+    ).filter(pl.col("rk") <= topk).drop("rk")
     outcomes = df["y"].to_numpy().astype(np.float32)
     odds_sel = df["ltp"].to_numpy().astype(np.float32)
     p_model_sel = df["p_model"].to_numpy().astype(np.float32)
