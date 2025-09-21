@@ -18,9 +18,11 @@ def to_ms(dt: datetime) -> int:
 
 def safe_logloss(y_true, y_pred):
     try:
-        return log_loss(y_true, y_pred, eps=1e-15)
+        y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
+        return log_loss(y_true, y_pred)
     except ValueError:
         return float("nan")
+
 
 def die(msg, code=2):
     print(f"[ERROR] {msg}", file=sys.stderr); sys.exit(code)
