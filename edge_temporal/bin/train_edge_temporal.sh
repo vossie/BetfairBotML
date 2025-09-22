@@ -1,24 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ASOF_DATE="${1:?need asof date (e.g. 2025-09-20)}"
+# Usage: CURATED_ROOT=/path/to/curated /opt/BetfairBotML/edge_temporal/bin/train_edge_temporal.sh YYYY-MM-DD
+ASOF_DATE="${1:?need ASOF date, e.g. 2025-09-21}"
 CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
 START_DATE="${START_DATE:-2025-09-05}"
+
+VALID_DAYS="${VALID_DAYS:-3}"
+SPORT="${SPORT:-horse-racing}"
+DEVICE="${DEVICE:-cuda}"
+COMMISSION="${COMMISSION:-0.02}"
+BANKROLL_NOM="${BANKROLL_NOM:-5000}"
+KELLY_CAP="${KELLY_CAP:-0.05}"
+KELLY_FLOOR="${KELLY_FLOOR:-0.002}"
+
+echo "=== Edge Temporal Training (LOCAL) ==="
+echo "Curated root:         $CURATED_ROOT"
+echo "ASOF (arg to trainer):$ASOF_DATE"
+echo "Start date (train):   $START_DATE"
 
 python3 /opt/BetfairBotML/edge_temporal/ml/train_edge_temporal.py \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF_DATE" \
   --start-date "$START_DATE" \
-  --valid-days "${VALID_DAYS:-3}" \
-  --sport "${SPORT:-horse-racing}" \
-  --device "${DEVICE:-cuda}" \
-  --commission "${COMMISSION:-0.02}" \
-  --bankroll-nom "${BANKROLL_NOM:-5000}" \
-  --kelly-cap "${KELLY_CAP:-0.05}" \
-  --kelly-floor "${KELLY_FLOOR:-0.002}" \
-  --preoff-mins "${PREOFF_MINS:-30}" \
-  --pm-cutoff "${PM_CUTOFF:-0.65}" \
-  --edge-thresh "${EDGE_THRESH:-0.015}" \
-  --per-market-topk "${PER_MARKET_TOPK:-1}" \
-  --ltp-min "${LTP_MIN:-1.5}" \
-  --ltp-max "${LTP_MAX:-5.0}"
+  --valid-days "$VALID_DAYS" \
+  --sport "$SPORT" \
+  --device "$DEVICE" \
+  --commission "$COMMISSION" \
+  --bankroll-nom "$BANKROLL_NOM" \
+  --kelly-cap "$KELLY_CAP" \
+  --kelly-floor "$KELLY_FLOOR"
