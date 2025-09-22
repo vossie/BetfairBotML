@@ -167,97 +167,89 @@ def evaluate(df_valid, odds, y, p_model, p_market, edge_thresh, topk, lo, hi,
     return dict(roi=roi, profit=pnl, n_trades=int(outcomes.size))
 
 def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--curated", required=True)
-    ap.add_argument("--asof", required=True)
-    ap.add_argument("--start-date", required=True)
-    ap.add_argument("--valid-days", type=int, default=3)
-    ap.add_argument("--sport", default="horse-racing")
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--commission", type=float, default=0.02)
-    ap.add_argument("--bankroll-nom", type=float, default=5000.0)
-    ap.add_argument("--kelly-cap", type=float, default=0.05)
-    ap.add_argument("--kelly-floor", type=float, default=0.002)
-    ap.add_argument("--preoff-mins", type=int, default=30)
-    ap.add_argument("--pm-cutoff", type=float, default=0.65)
-    ap.add_argument("--edge-thresh", type=float, default=0.015)
-    ap.add_argument("--per-market-topk", type=int, default=1)
-    ap.add_argument("--ltp-min", type=float, default=1.5)
-    ap.add_argument("--ltp-max", type=float, default=5.0)
-    args = ap.parse_args()
+    args = parse_args()
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/opt/BetfairBotML/edge_temporal/output"))
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    outdir = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
-    outdir.mkdir(parents=True, exist_ok=True)
+    asof_dt = parse_date(args.asof)
+    start_dt = parse_date(args.start_date)
 
-    train_start, train_end, valid_start, valid_end = compute_windows(args.start_date, args.asof, args.valid_days)
+    # Training / validation split
+    train_end   = asof_dt - timedelta(days=args.valid_days)
+    train_start = start_dt
+    valid_start = train_end + timedelta(days=1)
+    valid_end   = asof_dt
+
     print(f"Training window:   {train_start.date()} .. {train_end.date()}")
     print(f"Validation window: {valid_start.date()} .. {valid_end.date()}")
 
     curated = Path(args.curated)
-    snap_df = load_snapshots(curated, train_start, valid_end, args.sport)
-    res_df  = load_results(curated,  train_start, valid_end, args.sport)
-    defs_df = load_defs(curated,     train_start, valid_end, args.sport)
-    if snap_df.is_empty() or res_df.is_empty(): die("no snapshots or results loaded")
 
-    df_all = join_all(snap_df, res_df, defs_df)
-    if df_all.is_empty(): die("empty after join")
+    # Load datasets
+    snap_lf = load_snapshots(curated, train_start, valid_end, args.sport)
+    defs_lf = load_defs(curated, train_start, valid_end, args.sport)
+    res_lf  = load_results(curated, train_start, valid_end, args.sport)
 
-    if "winLabel" not in df_all.columns: die("winLabel missing")
-    if "ltp" not in df_all.columns: die("ltp missing")
-    df_all = df_all.filter(pl.col("winLabel").is_not_null()).with_columns(
-        pl.when(pl.col("winLabel")>0).then(1).otherwise(0).alias("winLabel")
-    ).filter(pl.col("ltp").is_not_null())
+    # Join — only keep winLabel from results
+    res_lf = res_lf.select(["marketId", "selectionId", "winLabel"])
+    df_all = join_snapshots_results(snap_lf, res_lf).join(defs_lf, on=["marketId", "selectionId"], how="left")
 
-    df_all = add_preoff_filter(df_all, args.preoff_mins)
-    df_all = apply_pm_gate(df_all, args.pm_cutoff)
-    df_all = encode_categoricals(df_all)
+    # Drop leakage-prone cols
+    drop_cols = {"runnerStatus", "settledTimeMs", "eventId", "marketType"}
+    df_all = df_all.drop([c for c in drop_cols if c in df_all.columns])
 
-    train_end_excl = to_ms(train_end + timedelta(days=1))
-    valid_end_excl = to_ms(valid_end + timedelta(days=1))
-    df_train = df_all.filter((pl.col("publishTimeMs") >= to_ms(train_start)) & (pl.col("publishTimeMs") < train_end_excl))
-    df_valid = df_all.filter((pl.col("publishTimeMs") >= to_ms(valid_start)) & (pl.col("publishTimeMs") < valid_end_excl))
-    if df_train.is_empty() or df_valid.is_empty(): die("empty train/valid")
+    # Split train/valid
+    df_train = df_all.filter(
+        (pl.col("publishTimeMs") >= int(train_start.replace(tzinfo=timezone.utc).timestamp() * 1000)) &
+        (pl.col("publishTimeMs") <  int((train_end + timedelta(days=1)).replace(tzinfo=timezone.utc).timestamp() * 1000))
+    )
+    df_valid = df_all.filter(
+        (pl.col("publishTimeMs") >= int(valid_start.replace(tzinfo=timezone.utc).timestamp() * 1000)) &
+        (pl.col("publishTimeMs") <  int((valid_end + timedelta(days=1)).replace(tzinfo=timezone.utc).timestamp() * 1000))
+    )
 
-    exclude = {"winLabel","sport","marketId","selectionId","marketStartMs"}
-    X_train = numeric_only(df_train, exclude)
-    X_valid = numeric_only(df_valid, exclude)
-    y_train = df_train["winLabel"].to_numpy().astype(np.float32)
+    feats = [c for c in df_all.columns if c not in ("winLabel", "sport", "marketId", "selectionId")]
+    print(f"[rows] train={df_train.height:,}  valid={df_valid.height:,}  features={len(feats)}")
+    print("Features:", feats)
+
+    # Build matrices
+    dtrain = xgb.DMatrix(df_train.select(feats).to_arrow(), label=df_train["winLabel"].to_numpy().astype(np.float32))
+    dvalid = xgb.DMatrix(df_valid.select(feats).to_arrow(), label=df_valid["winLabel"].to_numpy().astype(np.float32))
+
+    # Train
+    booster = train(make_params(args.device), dtrain, dvalid, must_gpu=(args.device == "cuda"))
+    preds = booster.predict(dvalid)
+
+    # Validation metrics
     y_valid = df_valid["winLabel"].to_numpy().astype(np.float32)
+    odds    = df_valid["ltp"].to_numpy().astype(np.float32)
+    p_model = preds.astype(np.float32)
+    p_market = (1.0 / np.clip(odds, 1e-12, None)).astype(np.float32)
 
-    print(f"[rows] train={df_train.height:,}  valid={df_valid.height:,}  features={X_train.width}")
+    print(f"[Value] logloss={safe_logloss(y_valid, preds):.4f}  auc={roc_auc_score(y_valid, preds):.3f}")
 
-    params = make_params(args.device)
-    dtrain = xgb.DMatrix(X_train.to_arrow(), label=y_train)
-    dvalid = xgb.DMatrix(X_valid.to_arrow(), label=y_valid)
-    booster = train(params, dtrain, dvalid)
-
-    p = booster.predict(dvalid).astype(np.float32)
-    odds = df_valid["ltp"].to_numpy().astype(np.float32)
-    p_market = (1.0/np.clip(odds,1e-12,None)).astype(np.float32)
-
-    print(f"[Value] logloss={safe_logloss(y_valid,p):.4f}  auc={roc_auc_score(y_valid,p):.3f}")
-
-    # Use the CLI-provided single config; evaluate BOTH flat and kelly
-    configs = [
+    # Sweep
+    EDGE_T = [float(os.environ.get("EDGE_THRESH", 0.015))]
+    TOPK   = [int(os.environ.get("PER_MARKET_TOPK", 1))]
+    LTP_W  = [(float(os.environ.get("LTP_MIN", 1.5)), float(os.environ.get("LTP_MAX", 5.0)))]
+    STAKE  = [
         ("flat", None, None, args.bankroll_nom),
         ("kelly", args.kelly_cap, args.kelly_floor, args.bankroll_nom),
     ]
-    recs=[]
-    for (sm, cap, floor_, bank) in configs:
-        m = evaluate(df_valid, odds, y_valid, p, p_market,
-                     args.edge_thresh, args.per_market_topk, args.ltp_min, args.ltp_max,
-                     sm, cap or 0.0, floor_ or 0.0, bank or 1000.0, float(args.commission))
-        m.update(dict(edge_thresh=args.edge_thresh, topk=args.per_market_topk,
-                      ltp_min=args.ltp_min, ltp_max=args.ltp_max,
-                      stake_mode=("flat" if sm=="flat" else f"kelly_cap{cap}_floor{floor_}")))
+
+    recs = []
+    for e, t, (lo, hi), (sm, cap, floor_, bank) in itertools.product(EDGE_T, TOPK, LTP_W, STAKE):
+        m = evaluate(df_valid, odds, y_valid, p_model, p_market,
+                     e, t, lo, hi, sm, cap or 0.0, floor_ or 0.0, bank or 1000.0, args.commission)
+        m.update(dict(edge_thresh=e, topk=t, ltp_min=lo, ltp_max=hi, stake_mode=sm))
         recs.append(m)
 
-    sweep = pl.DataFrame(recs).sort(["roi","n_trades"], descending=[True, True])
-    out   = outdir / f"edge_sweep_{args.asof}.csv"
+    sweep = pl.DataFrame(recs).sort(["roi", "n_trades"], descending=[True, True])
+    out = OUTPUT_DIR / f"edge_sweep_{args.asof}.csv"
     sweep.write_csv(str(out))
     print(f"sweep saved → {out}")
-    print(sweep)
+    print(sweep.select(["roi", "profit", "n_trades", "edge_thresh", "stake_mode"]).head(10))
+
 
 if __name__ == "__main__":
     main()
