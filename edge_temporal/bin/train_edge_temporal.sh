@@ -6,7 +6,7 @@ ASOF_DATE="${1:?need ASOF date, e.g. 2025-09-21}"
 CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
 START_DATE="${START_DATE:-2025-09-05}"
 
-VALID_DAYS="${VALID_DAYS:-3}"
+VALID_DAYS="${VALID_DAYS:-7}"            # default rolling 7-day validation
 SPORT="${SPORT:-horse-racing}"
 DEVICE="${DEVICE:-cuda}"
 COMMISSION="${COMMISSION:-0.02}"

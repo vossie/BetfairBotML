@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# complete drop-in: env-driven filters, no leakage, CUDA by default
+# rolling valid window, per-day ROI (flat & kelly), CUDA default, no leakage
 
 import os, sys, glob, itertools
 from pathlib import Path
@@ -10,9 +10,7 @@ import numpy as np
 import xgboost as xgb
 from sklearn.metrics import log_loss, roc_auc_score
 
-
 # -------------------- helpers --------------------
-
 def parse_date(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
@@ -38,9 +36,7 @@ def compute_windows(start_date_str: str, asof_str: str, valid_days: int):
     train_end   = valid_start - timedelta(days=1)
     return train_start, train_end, valid_start, valid_end
 
-
 # -------------------- data loading --------------------
-
 def list_parquet_between(root: Path, sub: str, start: datetime, end: datetime):
     files = []
     cur = start
@@ -55,7 +51,6 @@ def load_snapshots(curated: Path, start: datetime, end: datetime, sport: str):
     files = list_parquet_between(curated, f"orderbook_snapshots_5s/sport={sport}", start, end)
     if not files: return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    # keep only scalar numeric-friendly cols (lists dropped)
     keep = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","ltpTick"]
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
@@ -65,8 +60,7 @@ def load_results(curated: Path, start: datetime, end: datetime, sport: str):
     files = list_parquet_between(curated, f"results/sport={sport}", start, end)
     if not files: return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    # only bring the label; drop leakage fields
-    keep = ["sport","marketId","selectionId","winLabel"]
+    keep = ["sport","marketId","selectionId","winLabel"]  # label only (no leakage)
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
     return lf.select(cols).collect()
@@ -103,11 +97,8 @@ def join_all(snap_df: pl.DataFrame, res_df: pl.DataFrame, defs_df: pl.DataFrame)
         df = df.join(defs_df, on=on_cols, how="left")
     return df
 
-
 # -------------------- prep / features --------------------
-
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
-    # only safe pre-off metadata
     for col in ["marketType_def","countryCode"]:
         if col in df.columns:
             df = df.with_columns(pl.col(col).fill_null("UNK"))
@@ -125,7 +116,6 @@ def add_preoff_filter(df: pl.DataFrame, preoff_mins: int) -> pl.DataFrame:
     return df.filter((pl.col("mins_to_start") >= 0) & (pl.col("mins_to_start") <= preoff_mins))
 
 def apply_pm_gate(df: pl.DataFrame, pm_cutoff: float) -> pl.DataFrame:
-    # optional; only if pm_label exists in curated features
     if "pm_label" in df.columns:
         df = df.filter(pl.col("pm_label").is_not_null())
         df = df.filter(pl.col("pm_label") >= pm_cutoff)
@@ -133,16 +123,12 @@ def apply_pm_gate(df: pl.DataFrame, pm_cutoff: float) -> pl.DataFrame:
 
 def numeric_only(df: pl.DataFrame, exclude: set) -> pl.DataFrame:
     df = df.drop([c for c in exclude if c in df.columns])
-    # drop list/struct columns
     drop_ls = [c for c, dt in zip(df.columns, df.dtypes) if isinstance(dt, (pl.List, pl.Struct))]
     if drop_ls: df = df.drop(drop_ls)
-    # keep numeric/bool only
     keep = [c for c, dt in zip(df.columns, df.dtypes) if dt.is_numeric() or isinstance(dt, pl.Boolean)]
     return df.select(keep)
 
-
 # -------------------- model --------------------
-
 def make_params(device="cuda"):
     return {
         "objective": "binary:logistic",
@@ -208,33 +194,29 @@ def evaluate(df_valid, odds, y, p_model, p_market, edge_thresh, topk, lo, hi,
     roi = pnl/staked if staked>0 else 0.0
     return dict(roi=roi, profit=pnl, n_trades=int(outcomes.size))
 
-
 # -------------------- CLI --------------------
-
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
-    p.add_argument("--valid-days", type=int, default=3)
+    p.add_argument("--valid-days", type=int, default=7)  # default 7-day rolling valid
     p.add_argument("--sport", default="horse-racing")
-    p.add_argument("--device", default="cuda")  # default CUDA
+    p.add_argument("--device", default="cuda")
     p.add_argument("--commission", type=float, default=0.02)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
     p.add_argument("--kelly-cap", type=float, default=0.05)
     p.add_argument("--kelly-floor", type=float, default=0.002)
     return p.parse_args()
 
-
 # -------------------- main --------------------
-
 def main():
     args = parse_args()
     outdir = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # env-driven trading/backtest controls
+    # env-driven backtest controls
     PREOFF_MINS      = int(os.environ.get("PREOFF_MINS", "30"))
     PM_CUTOFF        = float(os.environ.get("PM_CUTOFF", "0.65"))
     EDGE_THRESH      = float(os.environ.get("EDGE_THRESH", "0.015"))
@@ -257,21 +239,17 @@ def main():
     if df_all.is_empty():
         die("empty after join")
 
-    # label + odds
     if "winLabel" not in df_all.columns: die("winLabel missing")
     if "ltp" not in df_all.columns: die("ltp missing")
     df_all = df_all.filter(pl.col("winLabel").is_not_null()).with_columns(
         pl.when(pl.col("winLabel")>0).then(1).otherwise(0).alias("winLabel")
     ).filter(pl.col("ltp").is_not_null())
 
-    # 0..preoff minutes only
     df_all = add_preoff_filter(df_all, PREOFF_MINS)
-    # optional PM gate
     df_all = apply_pm_gate(df_all, PM_CUTOFF)
-    # safe categoricals
     df_all = encode_categoricals(df_all)
 
-    # time slice
+    # split
     train_end_excl = to_ms(train_end + timedelta(days=1))
     valid_end_excl = to_ms(valid_end + timedelta(days=1))
     df_train = df_all.filter((pl.col("publishTimeMs") >= to_ms(train_start)) & (pl.col("publishTimeMs") < train_end_excl))
@@ -301,7 +279,7 @@ def main():
 
     print(f"[Value] logloss={safe_logloss(y_valid,p):.4f}  auc={roc_auc_score(y_valid,p):.3f}")
 
-    # evaluate both flat & kelly with the SAME env filters
+    # evaluate both flat & kelly with SAME env filters
     configs = [
         ("flat",  None, None, args.bankroll_nom),
         ("kelly", args.kelly_cap, args.kelly_floor, args.bankroll_nom),
@@ -321,6 +299,38 @@ def main():
     sweep.write_csv(str(out))
     print(f"sweep saved → {out}")
     print(sweep)
+
+    # -------------------- per-day ROI inside rolling valid window --------------------
+    df_valid = df_valid.with_columns(
+        (pl.from_epoch(pl.col("publishTimeMs")//1000, time_unit="s", tu="us").dt.replace_time_zone("UTC").dt.date())
+        .alias("__vday")
+    )
+    days = df_valid.select("__vday").unique().to_series().to_list()
+    daily_rows = []
+    for d in sorted(days):
+        dv = df_valid.filter(pl.col("__vday")==d)
+        Xv = numeric_only(dv, exclude)
+        if Xv.is_empty(): continue
+        yv = dv["winLabel"].to_numpy().astype(np.float32)
+        pv = booster.predict(xgb.DMatrix(Xv.to_arrow())).astype(np.float32)
+        ov = dv["ltp"].to_numpy().astype(np.float32)
+        pm = (1.0/np.clip(ov,1e-12,None)).astype(np.float32)
+        for (sm, cap, floor_, bank) in configs:
+            met = evaluate(dv, ov, yv, pv, pm, EDGE_THRESH, PER_MARKET_TOPK, LTP_MIN, LTP_MAX,
+                           sm, cap or 0.0, floor_ or 0.0, bank or 1000.0, float(args.commission))
+            daily_rows.append({
+                "day": str(d),
+                "stake_mode": ("flat" if sm=="flat" else f"kelly_cap{cap}_floor{floor_}"),
+                "roi": met["roi"],
+                "profit": met["profit"],
+                "n_trades": met["n_trades"],
+            })
+    if daily_rows:
+        daily_df = pl.DataFrame(daily_rows).sort(["day","stake_mode"])
+        daily_out = outdir / f"edge_daily_{args.asof}.csv"
+        daily_df.write_csv(str(daily_out))
+        print(f"daily saved → {daily_out}")
+        print(daily_df)
 
 if __name__ == "__main__":
     main()
