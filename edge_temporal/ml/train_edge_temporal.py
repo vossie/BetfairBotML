@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# rolling valid window, per-day ROI (flat & kelly), CUDA default, no leakage
+# complete drop-in: rolling valid, CUDA default, no leakage, per-day ROI (fixed)
 
 import os, sys, glob, itertools
 from pathlib import Path
@@ -10,7 +10,9 @@ import numpy as np
 import xgboost as xgb
 from sklearn.metrics import log_loss, roc_auc_score
 
+
 # -------------------- helpers --------------------
+
 def parse_date(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
@@ -36,7 +38,18 @@ def compute_windows(start_date_str: str, asof_str: str, valid_days: int):
     train_end   = valid_start - timedelta(days=1)
     return train_start, train_end, valid_start, valid_end
 
+def epoch_date_expr(colname: str) -> pl.Expr:
+    # auto-detect seconds vs milliseconds
+    # if values are large (>= 1e11), treat as ms; else seconds
+    return (
+        pl.when(pl.col(colname) >= 100_000_000_000)
+        .then(pl.from_epoch(pl.col(colname), time_unit="ms"))
+        .otherwise(pl.from_epoch(pl.col(colname), time_unit="s"))
+    ).dt.with_time_zone("UTC").dt.date()
+
+
 # -------------------- data loading --------------------
+
 def list_parquet_between(root: Path, sub: str, start: datetime, end: datetime):
     files = []
     cur = start
@@ -97,7 +110,9 @@ def join_all(snap_df: pl.DataFrame, res_df: pl.DataFrame, defs_df: pl.DataFrame)
         df = df.join(defs_df, on=on_cols, how="left")
     return df
 
+
 # -------------------- prep / features --------------------
+
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
     for col in ["marketType_def","countryCode"]:
         if col in df.columns:
@@ -125,10 +140,12 @@ def numeric_only(df: pl.DataFrame, exclude: set) -> pl.DataFrame:
     df = df.drop([c for c in exclude if c in df.columns])
     drop_ls = [c for c, dt in zip(df.columns, df.dtypes) if isinstance(dt, (pl.List, pl.Struct))]
     if drop_ls: df = df.drop(drop_ls)
-    keep = [c for c, dt in zip(df.columns, df.dtypes) if dt.is_numeric() or isinstance(dt, pl.Boolean)]
+    keep = [c for c, dt in zip(df.columns, df.dtypes) if dt.is_numeric() or dt == pl.Boolean]
     return df.select(keep)
 
+
 # -------------------- model --------------------
+
 def make_params(device="cuda"):
     return {
         "objective": "binary:logistic",
@@ -194,7 +211,9 @@ def evaluate(df_valid, odds, y, p_model, p_market, edge_thresh, topk, lo, hi,
     roi = pnl/staked if staked>0 else 0.0
     return dict(roi=roi, profit=pnl, n_trades=int(outcomes.size))
 
+
 # -------------------- CLI --------------------
+
 def parse_args():
     import argparse
     p = argparse.ArgumentParser()
@@ -203,14 +222,16 @@ def parse_args():
     p.add_argument("--start-date", required=True)
     p.add_argument("--valid-days", type=int, default=7)  # default 7-day rolling valid
     p.add_argument("--sport", default="horse-racing")
-    p.add_argument("--device", default="cuda")
+    p.add_argument("--device", default="cuda")  # default CUDA
     p.add_argument("--commission", type=float, default=0.02)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
     p.add_argument("--kelly-cap", type=float, default=0.05)
     p.add_argument("--kelly-floor", type=float, default=0.002)
     return p.parse_args()
 
+
 # -------------------- main --------------------
+
 def main():
     args = parse_args()
     outdir = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
@@ -300,11 +321,8 @@ def main():
     print(f"sweep saved → {out}")
     print(sweep)
 
-    # -------------------- per-day ROI inside rolling valid window --------------------
-    df_valid = df_valid.with_columns(
-        (pl.from_epoch(pl.col("publishTimeMs")//1000, time_unit="s", tu="us").dt.replace_time_zone("UTC").dt.date())
-        .alias("__vday")
-    )
+    # -------------------- per-day ROI inside rolling valid window (fixed) --------------------
+    df_valid = df_valid.with_columns(epoch_date_expr("publishTimeMs").alias("__vday"))
     days = df_valid.select("__vday").unique().to_series().to_list()
     daily_rows = []
     for d in sorted(days):
