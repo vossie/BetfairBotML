@@ -295,6 +295,16 @@ def main():
 
     # predictions
     p = booster.predict(dvalid).astype(np.float32)
+    # --- optional calibration ---
+    CALIB_PATH = os.environ.get("CALIB_PATH", "").strip()
+    if CALIB_PATH:
+        import pickle
+        with open(CALIB_PATH, "rb") as f:
+            obj = pickle.load(f)
+        if obj.get("type") == "isotonic":
+            iso = obj["iso"]
+            p = iso.predict(p)  # calibrated probs
+
     odds = df_valid["ltp"].to_numpy().astype(np.float32)
     p_market = (1.0/np.clip(odds,1e-12,None)).astype(np.float32)
 
