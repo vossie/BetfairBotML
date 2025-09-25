@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: CURATED_ROOT=/path/to/curated /opt/BetfairBotML/edge_temporal/bin/train_edge_temporal.sh YYYY-MM-DD
-ASOF_DATE="${1:?need ASOF date, e.g. 2025-09-21}"
-CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
-START_DATE="${START_DATE:-2025-09-05}"
+# Usage (example):
+#   CURATED_ROOT=/mnt/nvme/betfair-curated \
+#   EDGE_THRESH=0.024 PER_MARKET_TOPK=1 LTP_MIN=2.2 LTP_MAX=3.8 PREOFF_MINS=20 \
+#   /opt/BetfairBotML/edge_temporal/bin/train_edge_temporal.sh 2025-09-24
 
-VALID_DAYS="${VALID_DAYS:-7}"            # default rolling 7-day validation
+ASOF_DATE="${1:?need ASOF date, e.g. 2025-09-24}"
+CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
+
+START_DATE="${START_DATE:-2025-09-05}"
+VALID_DAYS="${VALID_DAYS:-7}"
 SPORT="${SPORT:-horse-racing}"
 DEVICE="${DEVICE:-cuda}"
 COMMISSION="${COMMISSION:-0.02}"
@@ -29,4 +33,6 @@ python3 /opt/BetfairBotML/edge_temporal/ml/train_edge_temporal.py \
   --commission "$COMMISSION" \
   --bankroll-nom "$BANKROLL_NOM" \
   --kelly-cap "$KELLY_CAP" \
-  --kelly-floor "$KELLY_FLOOR"
+  --kelly-floor "$KELLY_FLOOR" \
+  ${FIT_CALIB:+--fit-calib} \
+  ${CALIB_OUT:+--calib-out "$CALIB_OUT"}

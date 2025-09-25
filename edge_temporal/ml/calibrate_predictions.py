@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Fit OOF isotonic calibrator on TRAIN window only; save pickle.
+# Build model on TRAIN, predict VALID, apply OOF isotonic fitted on TRAIN, and save raw+calibrated predictions.
 
 import os, sys, glob, pickle
 from pathlib import Path
@@ -103,29 +103,25 @@ def make_params(device="cuda"):
             "subsample":0.8,"colsample_bytree":0.8}
 
 import argparse
-p=argparse.ArgumentParser(description="Fit OOF isotonic calibrator on TRAIN window.")
+p=argparse.ArgumentParser(description="Predict VALID with raw and calibrated probabilities; save CSV.")
 p.add_argument("--curated", required=True)
 p.add_argument("--asof", required=True)
 p.add_argument("--start-date", required=True)
 p.add_argument("--valid-days", type=int, default=7)
 p.add_argument("--sport", default="horse-racing")
 p.add_argument("--device", default="cuda")
-p.add_argument("--output", default="/opt/BetfairBotML/edge_temporal/output/isotonic.pkl")
 args=p.parse_args()
 
 PREOFF_MINS=int(os.environ.get("PREOFF_MINS","30"))
 PM_CUTOFF=float(os.environ.get("PM_CUTOFF","0.65"))
+outdir = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output")); outdir.mkdir(parents=True, exist_ok=True)
 
 train_start, train_end, valid_start, valid_end = compute_windows(args.start_date, args.asof, args.valid_days)
-print(f"[calfit] TRAIN: {train_start.date()}..{train_end.date()}")
 
 curated=Path(args.curated)
-snap=load_snapshots(curated, train_start, train_end, args.sport)
-res =load_results  (curated, train_start, train_end, args.sport)
-defs=load_defs     (curated, train_start, train_end, args.sport)
-if snap.is_empty() or res.is_empty():
-    print("[ERROR] no train data", file=sys.stderr); sys.exit(2)
-
+snap=load_snapshots(curated, train_start, valid_end, args.sport)
+res =load_results  (curated, train_start, valid_end, args.sport)
+defs=load_defs     (curated, train_start, valid_end, args.sport)
 df=join_all(snap,res,defs)
 df=df.filter(pl.col("winLabel").is_not_null()).with_columns(
     pl.when(pl.col("winLabel")>0).then(1).otherwise(0).alias("winLabel")
@@ -134,26 +130,46 @@ df=add_preoff_filter(df, PREOFF_MINS)
 df=apply_pm_gate(df, PM_CUTOFF)
 df=encode_categoricals(df)
 
+train_end_excl = to_ms(train_end + timedelta(days=1))
+valid_end_excl = to_ms(valid_end + timedelta(days=1))
+df_train=df.filter((pl.col("publishTimeMs")>=to_ms(train_start))&(pl.col("publishTimeMs")<train_end_excl))
+df_valid=df.filter((pl.col("publishTimeMs")>=to_ms(valid_start))&(pl.col("publishTimeMs")<valid_end_excl))
 exclude={"winLabel","sport","marketId","selectionId","marketStartMs","secs_to_start"}
-X=numeric_only(df, exclude); y=df["winLabel"].to_numpy().astype(np.float32)
-print(f"[calfit] rows={df.height:,} feats={X.width}")
+Xtr=numeric_only(df_train, exclude); ytr=df_train["winLabel"].to_numpy().astype(np.float32)
+Xva=numeric_only(df_valid, exclude);  yva=df_valid["winLabel"].to_numpy().astype(np.float32)
 
 params=make_params(args.device)
-X_np=X.to_numpy()
-oof=np.zeros_like(y, dtype=np.float32)
+bst=xgb.train(params, xgb.DMatrix(Xtr.to_arrow(), label=ytr), num_boost_round=500,
+              evals=[(xgb.DMatrix(Xtr.to_arrow(), label=ytr),"train"),
+                     (xgb.DMatrix(Xva.to_arrow(), label=yva),"valid")],
+              early_stopping_rounds=30, verbose_eval=False)
+p_raw = bst.predict(xgb.DMatrix(Xva.to_arrow())).astype(np.float32)
+
+# OOF isotonic on TRAIN, then apply to VALID predictions
+X_np=Xtr.to_numpy()
+oof=np.zeros_like(ytr, dtype=np.float32)
 kf=KFold(n_splits=5, shuffle=True, random_state=42)
-for fold,(tr,va) in enumerate(kf.split(X_np), start=1):
-    dtr=xgb.DMatrix(X_np[tr], label=y[tr])
-    dva=xgb.DMatrix(X_np[va], label=y[va])
-    bst=xgb.train(params, dtr, num_boost_round=500,
-                  evals=[(dtr,"train"),(dva,"valid")],
-                  early_stopping_rounds=30, verbose_eval=False)
-    oof[va]=bst.predict(dva).astype(np.float32)
-    print(f"[calfit] fold {fold} valid={len(va):,}")
+for tr,va in kf.split(X_np):
+    b=xgb.train(params, xgb.DMatrix(X_np[tr], label=ytr[tr]), num_boost_round=500,
+                evals=[(xgb.DMatrix(X_np[tr], label=ytr[tr]),"train"),
+                       (xgb.DMatrix(X_np[va], label=ytr[va]),"valid")],
+                early_stopping_rounds=30, verbose_eval=False)
+    oof[va]=b.predict(xgb.DMatrix(X_np[va])).astype(np.float32)
 
 iso=IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6)
-iso.fit(oof, y)
-Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-with open(args.output,"wb") as f:
-    pickle.dump({"type":"isotonic","iso":iso}, f)
-print(f"[calfit] saved calibrator → {args.output}")
+iso.fit(oof, ytr)
+p_cal = iso.predict(p_raw).astype(np.float32)
+
+out = pl.DataFrame({
+    "sport": df_valid["sport"],
+    "marketId": df_valid["marketId"],
+    "selectionId": df_valid["selectionId"],
+    "publishTimeMs": df_valid["publishTimeMs"],
+    "ltp": df_valid["ltp"],
+    "winLabel": yva,
+    "prob_raw": p_raw,
+    "prob_cal": p_cal,
+})
+csv_path = outdir / f"valid_probs_{args.asof}.csv"
+out.write_csv(str(csv_path))
+print(f"[calpred] saved → {csv_path}")
