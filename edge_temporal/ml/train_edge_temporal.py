@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# complete drop-in: rolling valid, CUDA default, no leakage, per-day ROI (fixed)
+# Polars 1.33 compatible. Env-driven filters. CUDA default. No leakage.
+# Rolling validation with per-day ROI (flat & kelly).
 
-import os, sys, glob, itertools
+import os, sys, glob
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +12,7 @@ import xgboost as xgb
 from sklearn.metrics import log_loss, roc_auc_score
 
 
-# -------------------- helpers --------------------
+# ---------- helpers ----------
 
 def parse_date(s: str) -> datetime:
     return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -39,16 +40,15 @@ def compute_windows(start_date_str: str, asof_str: str, valid_days: int):
     return train_start, train_end, valid_start, valid_end
 
 def epoch_date_expr(colname: str) -> pl.Expr:
-    # auto-detect seconds vs milliseconds
-    # if values are large (>= 1e11), treat as ms; else seconds
+    # Detect ms vs s; output UTC date (Polars 1.33)
     return (
         pl.when(pl.col(colname) >= 100_000_000_000)
         .then(pl.from_epoch(pl.col(colname), time_unit="ms"))
         .otherwise(pl.from_epoch(pl.col(colname), time_unit="s"))
-    ).dt.with_time_zone("UTC").dt.date()
+    ).dt.replace_time_zone("UTC").dt.date()
 
 
-# -------------------- data loading --------------------
+# ---------- data loading ----------
 
 def list_parquet_between(root: Path, sub: str, start: datetime, end: datetime):
     files = []
@@ -111,7 +111,7 @@ def join_all(snap_df: pl.DataFrame, res_df: pl.DataFrame, defs_df: pl.DataFrame)
     return df
 
 
-# -------------------- prep / features --------------------
+# ---------- prep / features ----------
 
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
     for col in ["marketType_def","countryCode"]:
@@ -144,7 +144,7 @@ def numeric_only(df: pl.DataFrame, exclude: set) -> pl.DataFrame:
     return df.select(keep)
 
 
-# -------------------- model --------------------
+# ---------- model ----------
 
 def make_params(device="cuda"):
     return {
@@ -212,7 +212,7 @@ def evaluate(df_valid, odds, y, p_model, p_market, edge_thresh, topk, lo, hi,
     return dict(roi=roi, profit=pnl, n_trades=int(outcomes.size))
 
 
-# -------------------- CLI --------------------
+# ---------- CLI ----------
 
 def parse_args():
     import argparse
@@ -220,9 +220,9 @@ def parse_args():
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
-    p.add_argument("--valid-days", type=int, default=7)  # default 7-day rolling valid
+    p.add_argument("--valid-days", type=int, default=7)  # default rolling 7-day valid
     p.add_argument("--sport", default="horse-racing")
-    p.add_argument("--device", default="cuda")  # default CUDA
+    p.add_argument("--device", default="cuda")           # default CUDA
     p.add_argument("--commission", type=float, default=0.02)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
     p.add_argument("--kelly-cap", type=float, default=0.05)
@@ -230,14 +230,14 @@ def parse_args():
     return p.parse_args()
 
 
-# -------------------- main --------------------
+# ---------- main ----------
 
 def main():
     args = parse_args()
     outdir = Path(os.environ.get("OUTPUT_DIR","/opt/BetfairBotML/edge_temporal/output"))
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # env-driven backtest controls
+    # Env-driven backtest controls (match your usage)
     PREOFF_MINS      = int(os.environ.get("PREOFF_MINS", "30"))
     PM_CUTOFF        = float(os.environ.get("PM_CUTOFF", "0.65"))
     EDGE_THRESH      = float(os.environ.get("EDGE_THRESH", "0.015"))
@@ -287,7 +287,7 @@ def main():
 
     print(f"[rows] train={df_train.height:,}  valid={df_valid.height:,}  features={X_train.width}")
 
-    # xgb
+    # xgboost
     params = make_params(args.device)
     dtrain = xgb.DMatrix(X_train.to_arrow(), label=y_train)
     dvalid = xgb.DMatrix(X_valid.to_arrow(), label=y_valid)
@@ -321,7 +321,7 @@ def main():
     print(f"sweep saved → {out}")
     print(sweep)
 
-    # -------------------- per-day ROI inside rolling valid window (fixed) --------------------
+    # per-day ROI for rolling valid
     df_valid = df_valid.with_columns(epoch_date_expr("publishTimeMs").alias("__vday"))
     days = df_valid.select("__vday").unique().to_series().to_list()
     daily_rows = []
