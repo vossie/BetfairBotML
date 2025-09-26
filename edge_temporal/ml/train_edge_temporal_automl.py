@@ -7,12 +7,6 @@ AutoML tuner for Edge Temporal with:
 - GPU training via XGBoost QuantileDMatrix + OOF Isotonic calibration
 - Searches trading policy (pm_cutoff, edge_thresh, ltp band) + a few model params
 - Saves best config, trials table, model.json, isotonic.pkl
-
-Usage:
-  python3 /opt/BetfairBotML/edge_temporal/ml/train_edge_temporal_automl.py \
-    --curated /mnt/nvme/betfair-curated --asof 2025-09-25 --start-date 2025-09-05 \
-    --valid-days 7 --sport horse-racing --device cuda \
-    --output-dir /opt/BetfairBotML/edge_temporal/output/automl --n-trials 40
 """
 import os
 import sys
@@ -69,7 +63,7 @@ def load_snapshots(curated: Path, start: datetime, end: datetime, sport: str) ->
     if not files:
         return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    keep = ["sport", "marketId", "selectionId", "publishTimeMs", "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1", "ltpTick"]
+    keep = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","ltpTick"]
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
     return _collect_gpu(lf.select(cols))
@@ -79,7 +73,7 @@ def load_results(curated: Path, start: datetime, end: datetime, sport: str) -> p
     if not files:
         return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    keep = ["sport", "marketId", "selectionId", "winLabel"]
+    keep = ["sport","marketId","selectionId","winLabel"]
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
     return _collect_gpu(lf.select(cols))
@@ -92,7 +86,7 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str) -> pl.D
     names = lf.collect_schema().names()
     if "runners" in names:
         lf = lf.explode("runners").select([
-            "sport", "marketId",
+            "sport","marketId",
             pl.col("runners").struct.field("selectionId").alias("selectionId"),
             pl.col("marketStartMs"),
             pl.col("marketType").alias("marketType_def"),
@@ -102,7 +96,7 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str) -> pl.D
             pl.col("runners").struct.field("reductionFactor"),
         ])
     else:
-        have = [c for c in ["sport", "marketId", "marketStartMs", "marketType", "countryCode"] if c in names]
+        have = [c for c in ["sport","marketId","marketStartMs","marketType","countryCode"] if c in names]
         lf = lf.select(have)
     return _collect_gpu(lf)
 
@@ -110,17 +104,17 @@ def join_all(snap_df: pl.DataFrame, res_df: pl.DataFrame, defs_df: pl.DataFrame)
     if snap_df.is_empty() or res_df.is_empty():
         return pl.DataFrame()
     df = snap_df.join(
-        res_df.select(["sport", "marketId", "selectionId", "winLabel"]),
-        on=["sport", "marketId", "selectionId"],
+        res_df.select(["sport","marketId","selectionId","winLabel"]),
+        on=["sport","marketId","selectionId"],
         how="inner"
     )
     if not defs_df.is_empty():
-        on_cols = [c for c in ["sport", "marketId", "selectionId"] if c in defs_df.columns and c in df.columns]
+        on_cols = [c for c in ["sport","marketId","selectionId"] if c in defs_df.columns and c in df.columns]
         df = df.join(defs_df, on=on_cols, how="left")
     return df
 
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
-    for col in ["marketType_def", "countryCode"]:
+    for col in ["marketType_def","countryCode"]:
         if col in df.columns:
             df = df.with_columns(pl.col(col).fill_null("UNK"))
             df = df.to_dummies(columns=[col])
@@ -144,6 +138,7 @@ def numeric_only(df: pl.DataFrame, exclude: set) -> pl.DataFrame:
     keep = [c for c, dt in zip(df.columns, df.dtypes) if dt.is_numeric() or dt == pl.Boolean]
     return df.select(keep)
 
+# ---------------- modeling ----------------
 def make_params(device="cuda"):
     return {
         "objective": "binary:logistic",
@@ -154,19 +149,16 @@ def make_params(device="cuda"):
         "eta": 0.05,
         "subsample": 0.8,
         "colsample_bytree": 0.8,
-        "max_bin": 256
+        "max_bin": 256,
     }
 
 def train_xgb(params, Xtr, ytr, Xva, yva):
     dtr = xgb.QuantileDMatrix(Xtr, label=ytr)
     dva = xgb.QuantileDMatrix(Xva, label=yva)
     return xgb.train(
-        params,
-        dtr,
-        num_boost_round=500,
+        params, dtr, num_boost_round=500,
         evals=[(dtr, "train"), (dva, "valid")],
-        early_stopping_rounds=30,
-        verbose_eval=False
+        early_stopping_rounds=30, verbose_eval=False
     )
 
 def safe_logloss(y_true, y_pred):
@@ -222,8 +214,7 @@ def evaluate(df_valid, odds, y, p_model, p_market_norm, edge_thresh, topk, lo, h
     roi = pnl / staked if staked > 0 else 0.0
     return dict(roi=roi, profit=pnl, n_trades=int(outcomes.size))
 
-
-# -------------- main --------------
+# ---------------- main ----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--curated", required=True)
@@ -324,7 +315,7 @@ def main():
         yva = y_all[mask_valid]
 
         booster = train_xgb(params, Xtr, ytr, Xva, yva)
-        p_raw = booster.predict(xgb.DMatrix(Xva)).astype(np.float32)
+        p_raw = booster.inplace_predict(Xva).astype(np.float32)
 
         # OOF isotonic on TRAIN
         oof = np.zeros_like(ytr, dtype=np.float32)
@@ -341,7 +332,7 @@ def main():
                 early_stopping_rounds=30,
                 verbose_eval=False
             )
-            oof[va_idx] = b.predict(xgb.DMatrix(Xtr[va_idx])).astype(np.float32)
+            oof[va_idx] = b.inplace_predict(Xtr[va_idx]).astype(np.float32)
 
         iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
         p_val = iso.predict(p_raw).astype(np.float32)
@@ -374,17 +365,12 @@ def main():
         days  = valid_frame["__vday"].to_list()
 
         # Per-day evaluation (flat staking)
-        uniq_days = []
-        seen = set()
+        uniq_days, seen = [], set()
         for d in days:
             if d not in seen:
-                uniq_days.append(d)
-                seen.add(d)
+                uniq_days.append(d); seen.add(d)
 
-        daily_rois = []
-        total_profit = 0.0
-        total_trades = 0
-
+        daily_rois, total_profit, total_trades = [], 0.0, 0
         for d in uniq_days:
             day_mask = np.array([dd == d for dd in days], dtype=bool)
             if not day_mask.any():
@@ -405,6 +391,7 @@ def main():
 
         median_roi = float(np.median(daily_rois))
         avg_roi    = float(np.mean(daily_rois))
+        # diagnostics
         trial.set_user_attr("median_daily_roi", median_roi)
         trial.set_user_attr("avg_daily_roi", avg_roi)
         trial.set_user_attr("min_daily_roi", float(np.min(daily_rois)))
@@ -502,7 +489,7 @@ def main():
             early_stopping_rounds=30,
             verbose_eval=False
         )
-        oof[va_idx] = b.predict(xgb.DMatrix(Xtr[va_idx])).astype(np.float32)
+        oof[va_idx] = b.inplace_predict(Xtr[va_idx]).astype(np.float32)
 
     iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
     with open(outdir / "isotonic.pkl", "wb") as f:
