@@ -256,7 +256,7 @@ def main():
             df_day,
             odds[day_mask], y[day_mask], p_cal[day_mask], p_mkt[day_mask],
             edge_thresh, 1, ltp_min, ltp_max,
-            args.stake-mode if False else "flat",  # keep flat by default
+            args.stake_mode,  # keep flat by default
             float(args.kelly_cap), float(args.kelly_floor), float(bankroll_nom),
             float(commission)
         )
