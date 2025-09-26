@@ -365,11 +365,11 @@ def main():
     dv_mkt = (
         df_valid
         .select(["marketId", "publishTimeMs", "ltp"])
-        .with_columns((1.0 / pl.col("ltp").clip_min(1e-12)).alias("__inv"))
+        .with_columns((1.0 / pl.col("ltp").clip(lower=1e-12)).alias("__inv"))
     )
     sums = dv_mkt.group_by(["marketId", "publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
     dv_mkt = dv_mkt.join(sums, on=["marketId", "publishTimeMs"], how="left").with_columns(
-        (pl.col("__inv") / pl.col("__inv_sum").clip_min(1e-12)).alias("__p_mkt_norm")
+        (pl.col("__inv") / pl.col("__inv_sum").clip(lower=1e-12)).alias("__p_mkt_norm")
     )
     p_market_norm = dv_mkt["__p_mkt_norm"].to_numpy().astype(np.float32)
 
@@ -420,11 +420,11 @@ def main():
         # daily normalized market probs
         dm = (
             dv.select(["marketId", "publishTimeMs", "ltp"])
-              .with_columns((1.0 / pl.col("ltp").clip_min(1e-12)).alias("__inv"))
+              .with_columns((1.0 / pl.col("ltp").clip(lower=1e-12)).alias("__inv"))
         )
         ds = dm.group_by(["marketId", "publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
         dm = dm.join(ds, on=["marketId", "publishTimeMs"], how="left").with_columns(
-            (pl.col("__inv") / pl.col("__inv_sum").clip_min(1e-12)).alias("__p_mkt_norm")
+            (pl.col("__inv") / pl.col("__inv_sum").clip(lower=1e-12)).alias("__p_mkt_norm")
         )
         pm = dm["__p_mkt_norm"].to_numpy().astype(np.float32)
 
