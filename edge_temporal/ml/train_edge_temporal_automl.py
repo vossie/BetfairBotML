@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 """
-AutoML tuner for Edge Temporal with realism controls.
+AutoML tuner for Edge Temporal with realism controls (GPU train + GPU predict).
 
 Features:
 - Pre-off constraint (<= --preoff-max minutes; default 180)
 - Validation on the LAST N DAYS (default 7)
-- Objective = MEDIAN of DAILY ROI (more robust than mean)
-- GPU training via XGBoost QuantileDMatrix + OOF Isotonic calibration
-- Searches trading policy (pm_cutoff, edge_thresh, ltp band) + key model params
-- Realism knobs applied during validation:
-    * --downsample-secs N        (0 disables)
+- Objective = MEDIAN of DAILY ROI (robust)
+- GPU training via XGBoost QuantileDMatrix + GPU predictions via CuPy inplace_predict
+- Searches policy (pm_cutoff, edge_thresh, ltp band) + model params
+- Realism knobs during validation:
+    * --downsample-secs N
     * --dedupe-mode {none,first_cross,max_edge}
-    * --haircut-ticks N          (worsen back fills by N ticks)
-    * --stake-mode {flat,kelly}  (+ --kelly-cap/--kelly-floor/--bankroll-nom)
-- Saves: trials CSV, best_config.json, model.json, isotonic.pkl
+    * --haircut-ticks N
+    * --stake-mode {flat,kelly} (+ caps)
+Saves: trials CSV, best_config.json, model.json, isotonic.pkl
 """
-import os
-import sys
-import glob
-import json
-import pickle
-import argparse
+import os, sys, glob, json, pickle, argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import polars as pl
 import numpy as np
+import cupy as cp
 import xgboost as xgb
 import optuna
 from sklearn.metrics import log_loss, roc_auc_score
@@ -384,16 +380,15 @@ def main():
             Xva_ds = Xva[idx]
             yva_ds = yva[idx]
         else:
-            # no downsample; 1:1 mapping
             Xva_ds = Xva
             yva_ds = yva
-            # also give base a sequential index to keep shapes explicit
             base = base.with_row_index("__idx")
 
-        # Predict (raw -> isotonic via OOF on TRAIN below)
-        p_raw = booster.inplace_predict(Xva_ds).astype(np.float32)
+        # Predict on GPU, then bring back for isotonic
+        p_raw_gpu = booster.inplace_predict(cp.asarray(Xva_ds))
+        p_raw = cp.asnumpy(p_raw_gpu).astype(np.float32)
 
-        # OOF isotonic on TRAIN
+        # OOF isotonic on TRAIN (CPU arrays)
         oof = np.zeros_like(ytr, dtype=np.float32)
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
         for tr_idx, va_idx in kf.split(Xtr):
@@ -408,7 +403,9 @@ def main():
                 early_stopping_rounds=30,
                 verbose_eval=False
             )
-            oof[va_idx] = b.inplace_predict(Xtr[va_idx]).astype(np.float32)
+            oof_pred_gpu = b.inplace_predict(cp.asarray(Xtr[va_idx]))
+            oof[va_idx] = cp.asnumpy(oof_pred_gpu).astype(np.float32)
+
         iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
         p_val = iso.predict(p_raw).astype(np.float32)
 
@@ -425,7 +422,6 @@ def main():
         odds  = base["ltp"].to_numpy().astype(np.float32)
         if args.haircut_ticks and args.haircut_ticks > 0:
             odds = np.array([shift_ticks_down(float(o), int(args.haircut_ticks)) for o in odds], dtype=np.float32)
-        days  = base["__vday"].to_list()
 
         # Build work frame for dedupe + filters
         work = pl.DataFrame({
@@ -491,7 +487,6 @@ def main():
         trial.set_user_attr("days_evaluated", len(daily_rois))
         trial.set_user_attr("total_profit", total_profit)
         trial.set_user_attr("total_trades", total_trades)
-        # Model diagnostics on VALID slice used:
         try:
             trial.set_user_attr("logloss", float(safe_logloss(np.asarray(work["y"]), np.asarray(work["p_model"]))))
             trial.set_user_attr("auc", float(roc_auc_score(np.asarray(work["y"]), np.asarray(work["p_model"]))))
@@ -525,7 +520,7 @@ def main():
     print(trials_df.head(10))
     print(f"Wrote trials → {trials_csv}")
 
-    # Save best config and artifacts (+ realism knobs)
+    # Save best config (+ realism knobs)
     best = study.best_trial
     best_cfg = {
         "asof": args.asof,
@@ -591,7 +586,8 @@ def main():
             early_stopping_rounds=30,
             verbose_eval=False
         )
-        oof[va_idx] = b.inplace_predict(Xtr[va_idx]).astype(np.float32)
+        oof_pred_gpu = b.inplace_predict(cp.asarray(Xtr[va_idx]))
+        oof[va_idx] = cp.asnumpy(oof_pred_gpu).astype(np.float32)
 
     iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
     with open(outdir / "isotonic.pkl", "wb") as f:
