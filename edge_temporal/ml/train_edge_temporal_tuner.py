@@ -173,8 +173,8 @@ def make_params(device="cuda"):
 
 def train_xgb(params, Xtr, ytr, Xva, yva):
     # GPU-native quantile matrices
-    dtr = xgb.DeviceQuantileDMatrix(Xtr, label=ytr)
-    dva = xgb.DeviceQuantileDMatrix(Xva, label=yva)
+    dtr = xgb.QuantileDMatrix(Xtr, label=ytr)
+    dva = xgb.QuantileDMatrix(Xva, label=yva)
     return xgb.train(
         params,
         dtr,
@@ -351,11 +351,11 @@ def main():
             for tr_idx, va_idx in kf.split(Xtr):
                 b = xgb.train(
                     params,
-                    xgb.DeviceQuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]),
+                    xgb.QuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]),
                     num_boost_round=500,
                     evals=[
-                        (xgb.DeviceQuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]), "train"),
-                        (xgb.DeviceQuantileDMatrix(Xtr[va_idx], label=ytr[va_idx]), "valid"),
+                        (xgb.QuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]), "train"),
+                        (xgb.QuantileDMatrix(Xtr[va_idx], label=ytr[va_idx]), "valid"),
                     ],
                     early_stopping_rounds=30,
                     verbose_eval=False,
