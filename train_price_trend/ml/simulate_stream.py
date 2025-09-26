@@ -55,7 +55,7 @@ def parse_args():
     p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
     p.add_argument("--calib-path", default="", help="optional isotonic.pkl for calibrating __p_pred (rarely needed for delta model)")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
-    p.add_argument("--device", default="cuda", choices=["cuda","cpu"])  # used by XGB if needed for pred
+    p.add_argument("--device", default="cuda", choices=["cuda","cpu"])  # used by XGB for pred
     p.add_argument("--batch-size", type=int, default=200_000, help="batch predict to avoid RAM spikes")
     return p.parse_args()
 
@@ -142,6 +142,13 @@ def main():
     # Load model (+ optional calibrator)
     bst = xgb.Booster()
     bst.load_model(args.model_path)
+    # --- NEW: force device for prediction when requested (XGBoost ≥2.x) ---
+    try:
+        bst.set_param({"device": args.device})
+    except Exception:
+        # harmless if using older versions or CPU-only build
+        pass
+
     calibrator = None
     if args.calib_path:
         with open(args.calib_path, "rb") as f:
@@ -235,11 +242,20 @@ def main():
 
 def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
     X = np.asarray(feature_rows, dtype=np.float32)
-    dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
-    delta_pred = bst.predict(dm)
+
+    # --- NEW: Prefer fast GPU inference with inplace_predict when device=cuda ---
+    try:
+        if args.device == "cuda":
+            delta_pred = bst.inplace_predict(X)  # uses GPU when device=cuda
+        else:
+            dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
+            delta_pred = bst.predict(dm)
+    except Exception:
+        # Fallback path (e.g., older XGB build): DMatrix+predict
+        dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
+        delta_pred = bst.predict(dm)
+
     # p_pred = p_now + delta; (optional) calibrate probability if calibrator provided
-    # Here calibrator is ignored by default because model predicts delta; if you pass a calibrator
-    # trained on p_pred, we’ll apply: p_pred = calibrator.transform(p_pred)
     out = []
     commission = float(args.commission)
     for i, (ts, mid, sid, ltp, p_now) in enumerate(meta_rows):

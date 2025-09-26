@@ -46,9 +46,7 @@ def parse_args():
 
 # simple rolling feature builder on a sorted DataFrame
 def build_features(df: pl.DataFrame) -> pl.DataFrame:
-    # assume sorted by marketId, selectionId, publishTimeMs
     w = ["marketId","selectionId"]
-    # 5s cadence → 30/60/120s are 6/12/24 steps
     df = (
         df.sort(["marketId","selectionId","publishTimeMs"])
           .with_columns([
@@ -93,6 +91,7 @@ def main():
     print(f"Horizon (secs):  {args.horizon_secs}")
     print(f"Pre-off max (m): {args.preoff_max}")
     print(f"Stake mode:      {args.stake_mode} (cap={args.kelly_cap} floor={args.kelly_floor})")
+    print(f"XGBoost device:  {args.device}")
 
     print(f"[trend] TRAIN: {start_dt.date()} .. {(valid_start - timedelta(days=1)).date()}")
     print(f"[trend] VALID: {valid_start.date()} .. {valid_end.date()}")
@@ -122,7 +121,6 @@ def main():
         df_valid = df_valid.filter(pl.col(col).is_not_null())
 
     # TARGET: next-120s probability delta ≈ (p(t+H) - p(t))
-    # Build approximate label with forward shift over group
     g = ["marketId","selectionId"]
     df_train = df_train.with_columns(
         ( (1.0 / pl.when(pl.col("ltp").shift(-24).over(g) < 1e-12).then(1e-12).otherwise(pl.col("ltp").shift(-24).over(g)))
