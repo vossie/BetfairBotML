@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Forward tester with realism controls:
+Forward tester with realism controls (GPU predictions):
 - --dedupe-mode {none,first_cross,max_edge}
 - --downsample-secs N
 - --haircut-ticks N  (worse price for back bets by N Betfair ticks)
 Outputs per-day ROI.
 
 Assumes back bets (P&L = y*(odds-1)*stake - (1-y)*stake).
+Requires: cupy (cupy-cuda11x or cupy-cuda12x).
 """
 import os, sys, glob, json, pickle, argparse
 from pathlib import Path
@@ -14,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 import polars as pl
 import numpy as np
+import cupy as cp
 import xgboost as xgb
 
 # ---------- utils ----------
@@ -280,8 +282,12 @@ def main():
         X = X[idx]
         y = y[idx]
 
-    # Predictions (raw -> isotonic-calibrated)
-    p_raw = booster.inplace_predict(X).astype(np.float32)
+    # Predictions (GPU -> bring back to numpy for calibrator)
+    X_gpu = cp.asarray(X)
+    p_raw_gpu = xgb.Booster.inplace_predict(booster, X_gpu)  # same as booster.inplace_predict(X_gpu)
+    p_raw = cp.asnumpy(p_raw_gpu).astype(np.float32)
+
+    # Isotonic calibration
     p_cal = iso.predict(p_raw).astype(np.float32)
 
     # Normalized market probabilities (overround fix) on the *current base*
@@ -295,7 +301,6 @@ def main():
 
     p_mkt = dv["__p_mkt_norm"].to_numpy().astype(np.float32)
     odds  = base["ltp"].to_numpy().astype(np.float32)
-    days  = base["__day"].to_list()
 
     # Apply haircuts (worsen back odds by N ticks)
     if args.haircut_ticks and args.haircut_ticks > 0:
