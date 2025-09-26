@@ -4,6 +4,14 @@ set -euo pipefail
 ASOF="${1:?usage: train_price_trend.sh YYYY-MM-DD}"
 CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
 
+# Resolve project layout from this script's location:
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "$BIN_DIR/.." && pwd)"             # /opt/BetfairBotML/train_price_trend
+ML_DIR="$BASE_DIR/ml"
+OUTDIR="${OUTDIR:-$BASE_DIR/output}"
+MODEL_PATH="$OUTDIR/models/xgb_trend_reg.json"
+
+# Data/Training params
 START_DATE="${START_DATE:-2025-09-05}"
 VALID_DAYS="${VALID_DAYS:-7}"
 SPORT="${SPORT:-horse-racing}"
@@ -13,18 +21,16 @@ HORIZON_SECS="${HORIZON_SECS:-120}"
 PREOFF_MAX="${PREOFF_MAX:-30}"
 COMMISSION="${COMMISSION:-0.02}"
 
-# Simulation/backtest controls (used only by simulate_stream.py)
+# Simulation params (used only by simulate_stream.py)
 EDGE_THRESH="${EDGE_THRESH:-0.0}"
-STAKE="${STAKE:-kelly}"
+STAKE="${STAKE:-kelly}"              # flat|kelly
 KELLY_CAP="${KELLY_CAP:-0.02}"
 KELLY_FLOOR="${KELLY_FLOOR:-0.001}"
 BANKROLL_NOM="${BANKROLL_NOM:-5000}"
 
-# Control whether to run the post-training simulation (1=yes, 0=no)
-RUN_SIM="${RUN_SIM:-1}"
-
-OUTDIR="${OUTDIR:-/opt/BetfairBotML/train_price_trend/output}"
-MODEL_PATH="$OUTDIR/models/xgb_trend_reg.json"
+# Controls
+RUN_SIM="${RUN_SIM:-1}"              # 1 to simulate after training
+FORCE_TRAIN="${FORCE_TRAIN:-0}"      # 1 to force retrain even if model exists
 
 echo "=== Price Trend Training ==="
 echo "Curated root:    $CURATED_ROOT"
@@ -34,29 +40,34 @@ echo "Valid days:      $VALID_DAYS"
 echo "Horizon (secs):  $HORIZON_SECS"
 echo "Pre-off max (m): $PREOFF_MAX"
 echo "Stake mode:      $STAKE (cap=$KELLY_CAP floor=$KELLY_FLOOR)"
+echo "Output dir:      $OUTDIR"
 
-# ---- TRAIN (no --edge-thresh here) ----
-python3 /opt/BetfairBotML/train_price_trend/ml/train_price_trend.py \
-  --curated "$CURATED_ROOT" \
-  --asof "$ASOF" \
-  --start-date "$START_DATE" \
-  --valid-days "$VALID_DAYS" \
-  --sport "$SPORT" \
-  --device "$DEVICE" \
-  --horizon-secs "$HORIZON_SECS" \
-  --preoff-max "$PREOFF_MAX" \
-  --commission "$COMMISSION" \
-  --stake-mode "$STAKE" \
-  --kelly-cap "$KELLY_CAP" \
-  --kelly-floor "$KELLY_FLOOR" \
-  --bankroll-nom "$BANKROLL_NOM" \
-  --output-dir "$OUTDIR"
+# ---- TRAIN (skip if model exists unless forced) ----
+if [[ "$FORCE_TRAIN" == "1" || ! -f "$MODEL_PATH" ]]; then
+  python3 "$ML_DIR/train_price_trend.py" \
+    --curated "$CURATED_ROOT" \
+    --asof "$ASOF" \
+    --start-date "$START_DATE" \
+    --valid-days "$VALID_DAYS" \
+    --sport "$SPORT" \
+    --device "$DEVICE" \
+    --horizon-secs "$HORIZON_SECS" \
+    --preoff-max "$PREOFF_MAX" \
+    --commission "$COMMISSION" \
+    --stake-mode "$STAKE" \
+    --kelly-cap "$KELLY_CAP" \
+    --kelly-floor "$KELLY_FLOOR" \
+    --bankroll-nom "$BANKROLL_NOM" \
+    --output-dir "$OUTDIR"
+else
+  echo "Model exists at $MODEL_PATH — skipping training (set FORCE_TRAIN=1 to retrain)."
+fi
 
-# ---- OPTIONAL: SIMULATE / BACKTEST ----
+# ---- SIMULATE / BACKTEST ----
 if [[ "$RUN_SIM" == "1" ]]; then
   echo "=== Streaming Backtest ==="
   echo "EV threshold:    $EDGE_THRESH per £1"
-  python3 /opt/BetfairBotML/train_price_trend/ml/simulate_stream.py \
+  python3 "$ML_DIR/simulate_stream.py" \
     --curated "$CURATED_ROOT" \
     --asof "$ASOF" \
     --start-date "$START_DATE" \
