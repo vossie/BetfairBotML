@@ -44,7 +44,6 @@ def parse_args():
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output")
     return p.parse_args()
 
-# simple rolling feature builder on a sorted DataFrame
 def build_features(df: pl.DataFrame) -> pl.DataFrame:
     w = ["marketId","selectionId"]
     df = (
@@ -157,15 +156,15 @@ def main():
     evallist = [(dtr, "train"), (dva, "valid")]
     bst = xgb.train(params, dtr, num_boost_round=500, evals=evallist, verbose_eval=False)
 
-    # quick validation EV snapshot (not a full sim)
+    # quick validation EV snapshot (not a full sim) — FIXED EV formulas
     p_now = df_valid["__p_now"].to_numpy()
     dp = bst.predict(dva)
     p_pred = np.clip(p_now + dp, 0.0, 1.0)
     ltp = df_valid["ltp"].to_numpy()
 
     commission = float(args.commission)
-    ev_back = p_pred * (ltp - 1.0) * (1.0 - commission)
-    ev_lay = (1.0 - p_pred) - p_pred * (ltp - 1.0)
+    ev_back = p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
+    ev_lay  = (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
     ev = np.where(dp >= 0.0, ev_back, ev_lay)
 
     print(f"[trend] rows train={len(y_tr):,}  valid={len(y_va):,}")

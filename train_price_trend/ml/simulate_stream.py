@@ -142,11 +142,10 @@ def main():
     # Load model (+ optional calibrator)
     bst = xgb.Booster()
     bst.load_model(args.model_path)
-    # --- NEW: force device for prediction when requested (XGBoost ≥2.x) ---
+    # Force device for prediction when requested (XGBoost ≥2.x)
     try:
         bst.set_param({"device": args.device})
     except Exception:
-        # harmless if using older versions or CPU-only build
         pass
 
     calibrator = None
@@ -211,7 +210,7 @@ def main():
             )
             .group_by("day","stake_mode")
             .agg([
-                pl.count().alias("n_trades"),
+                pl.len().alias("n_trades"),               # fixed deprecation
                 pl.sum("exp_pnl").alias("exp_profit"),
                 pl.mean("ev_per_1").alias("avg_ev"),
                 pl.mean("stake").alias("avg_stake"),
@@ -243,7 +242,7 @@ def main():
 def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
     X = np.asarray(feature_rows, dtype=np.float32)
 
-    # --- NEW: Prefer fast GPU inference with inplace_predict when device=cuda ---
+    # Prefer fast GPU inference with inplace_predict when device=cuda
     try:
         if args.device == "cuda":
             delta_pred = bst.inplace_predict(X)  # uses GPU when device=cuda
@@ -251,11 +250,10 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
             dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
             delta_pred = bst.predict(dm)
     except Exception:
-        # Fallback path (e.g., older XGB build): DMatrix+predict
+        # Fallback path: DMatrix+predict
         dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
         delta_pred = bst.predict(dm)
 
-    # p_pred = p_now + delta; (optional) calibrate probability if calibrator provided
     out = []
     commission = float(args.commission)
     for i, (ts, mid, sid, ltp, p_now) in enumerate(meta_rows):
@@ -273,9 +271,9 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
         if side == "none":
             continue
 
-        # EV per £1
-        ev_back = p_pred * (ltp - 1.0) * (1.0 - commission)
-        ev_lay  = ((1.0 - p_pred) - p_pred * (ltp - 1.0))
+        # EV per £1 (FIXED formulas, include losing leg and commission)
+        ev_back = p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
+        ev_lay  = (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
         ev_per_1 = ev_back if side == "back" else ev_lay
 
         if ev_per_1 < args.edge_thresh:
@@ -314,6 +312,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
             "exp_pnl": pl.Float64,
             "stake_mode": pl.Utf8,
         },
+        orient="row",  # fixes DataOrientationWarning
     )
     idx = len(list(outdir.glob("trades_part_*.parquet")))
     part.write_parquet(outdir / f"trades_part_{idx:05d}.parquet")
