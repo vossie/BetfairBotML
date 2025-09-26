@@ -1,0 +1,1 @@
+pip install polars pyarrow numpy xgboost scikit-learn s3fs matplotlib pandas
