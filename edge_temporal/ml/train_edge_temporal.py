@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Drop-in: trains XGBoost on real data and evaluates with per-market overround-normalized market probabilities.
-# - Polars 1.33 compatible
+# - Polars 1.33 compatible (uses clip_min)
 # - CUDA by default (XGBoost: device="cuda", tree_method="hist")
 # - Env-driven filters: PREOFF_MINS, PM_CUTOFF, EDGE_THRESH, PER_MARKET_TOPK, LTP_MIN, LTP_MAX
 # - Optional isotonic calibration: --fit-calib / CALIB_PATH
@@ -361,15 +361,14 @@ def main():
     odds = df_valid["ltp"].to_numpy().astype(np.float32)
 
     # ----------- MARKET PROBABILITY: OVERROUND-NORMALIZED -----------
-    # Compute p_market_norm per (marketId, publishTimeMs) so probs sum to 1 within each book snapshot.
     dv_mkt = (
         df_valid
         .select(["marketId", "publishTimeMs", "ltp"])
-        .with_columns((1.0 / pl.col("ltp").clip(lower=1e-12)).alias("__inv"))
+        .with_columns((1.0 / pl.col("ltp").clip_min(1e-12)).alias("__inv"))
     )
     sums = dv_mkt.group_by(["marketId", "publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
     dv_mkt = dv_mkt.join(sums, on=["marketId", "publishTimeMs"], how="left").with_columns(
-        (pl.col("__inv") / pl.col("__inv_sum").clip(lower=1e-12)).alias("__p_mkt_norm")
+        (pl.col("__inv") / pl.col("__inv_sum").clip_min(1e-12)).alias("__p_mkt_norm")
     )
     p_market_norm = dv_mkt["__p_mkt_norm"].to_numpy().astype(np.float32)
 
@@ -417,14 +416,13 @@ def main():
             pv = iso.predict(pv).astype(np.float32)
         ov = dv["ltp"].to_numpy().astype(np.float32)
 
-        # daily normalized market probs
         dm = (
             dv.select(["marketId", "publishTimeMs", "ltp"])
-              .with_columns((1.0 / pl.col("ltp").clip(lower=1e-12)).alias("__inv"))
+              .with_columns((1.0 / pl.col("ltp").clip_min(1e-12)).alias("__inv"))
         )
         ds = dm.group_by(["marketId", "publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
         dm = dm.join(ds, on=["marketId", "publishTimeMs"], how="left").with_columns(
-            (pl.col("__inv") / pl.col("__inv_sum").clip(lower=1e-12)).alias("__p_mkt_norm")
+            (pl.col("__inv") / pl.col("__inv_sum").clip_min(1e-12)).alias("__p_mkt_norm")
         )
         pm = dm["__p_mkt_norm"].to_numpy().astype(np.float32)
 
