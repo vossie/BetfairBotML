@@ -271,7 +271,7 @@ def main():
         masked_df = (df.select(keys)
                        .with_columns(pl.Series("__mask", use_mask))
                        .filter(pl.col("__mask")).drop("__mask"))
-        masked_df = masked_df.with_row_count("__idx")
+        masked_df = masked_df.with_row_index("__idx")
         base = base.join(masked_df, on=keys, how="left")
         idx = base["__idx"].to_numpy()
         good = np.isfinite(idx)
