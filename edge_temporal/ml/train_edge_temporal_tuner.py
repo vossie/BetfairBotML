@@ -292,18 +292,18 @@ def main():
     df = add_preoff_columns(df)
     df = encode_categoricals(df)
 
-    # Split indices ONCE — build NumPy masks to avoid Polars/NumPy mixing
+    # Split indices ONCE — build NumPy masks (no copy kw)
     train_end_excl = to_ms(train_end + timedelta(days=1))
     valid_end_excl = to_ms(valid_end + timedelta(days=1))
-    ts_np   = df["publishTimeMs"].to_numpy(copy=False)
-    mins_np = df["mins_to_start"].to_numpy(copy=False)
+    ts_np   = df["publishTimeMs"].to_numpy()
+    mins_np = df["mins_to_start"].to_numpy()
     mask_train_time = (ts_np >= to_ms(train_start)) & (ts_np < train_end_excl)
     mask_valid_time = (ts_np >= to_ms(valid_start)) & (ts_np < valid_end_excl)
 
     # Prepare numeric feature view ONCE
     exclude = {"winLabel", "sport", "marketId", "selectionId", "marketStartMs", "secs_to_start"}
     X_all = numeric_only(df, exclude)
-    X_np_all = X_all.to_numpy()  # use once, slice per mask
+    X_np_all = X_all.to_numpy()
     y_all = df["winLabel"].to_numpy().astype(np.float32)
 
     # Base VALID view for market prob normalization
@@ -324,7 +324,7 @@ def main():
 
         for pmc in args.pm_cutoff:
             if "pm_label" in df.columns:
-                pm_mask = df["pm_label"].to_numpy(copy=False) >= pmc
+                pm_mask = df["pm_label"].to_numpy() >= pmc
             else:
                 pm_mask = np.ones(df.height, dtype=bool)
 
@@ -365,7 +365,7 @@ def main():
             iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
             p_val = iso.predict(p_raw).astype(np.float32)
 
-            odds = df["ltp"].to_numpy(copy=False).astype(np.float32)[mask_valid]
+            odds = df["ltp"].to_numpy().astype(np.float32)[mask_valid]
 
             # Market prob normalization on this VALID subset (safe Polars filtering)
             dv = (
