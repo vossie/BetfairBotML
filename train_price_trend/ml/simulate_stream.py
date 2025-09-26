@@ -32,7 +32,6 @@ NUMERIC_FEATS = [
     # lags
     "ltp_lag30s","ltp_lag60s","ltp_lag120s",
     "tradedVolume_lag30s","tradedVolume_lag60s","tradedVolume_lag120s",
-    # momentum / returns
     "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
     "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
 ]
@@ -201,7 +200,7 @@ def main():
         all_trades.write_csv(trades_csv)
         for p in trades_parts: p.unlink(missing_ok=True)
 
-        # daily summary
+        # daily summary (+ ROI per day)
         daily = (
             all_trades
             .with_columns(
@@ -210,17 +209,21 @@ def main():
             )
             .group_by("day","stake_mode")
             .agg([
-                pl.len().alias("n_trades"),               # fixed deprecation
+                pl.len().alias("n_trades"),
                 pl.sum("exp_pnl").alias("exp_profit"),
                 pl.mean("ev_per_1").alias("avg_ev"),
                 pl.mean("stake").alias("avg_stake"),
             ])
+            .with_columns(
+                (pl.col("exp_profit") / pl.lit(float(args.bankroll_nom))).alias("roi")  # daily ROI
+            )
             .sort("day")
         )
         daily_csv = outdir / f"daily_{args.asof}.csv"
         daily.write_csv(daily_csv)
 
-        # summary json
+        # summary json (also include overall ROI)
+        total_exp_profit = float(all_trades["exp_pnl"].sum())
         summ = {
             "asof": args.asof,
             "start_date": args.start_date,
@@ -234,8 +237,9 @@ def main():
             "bankroll_nom": args.bankroll_nom,
             "rows": int(all_trades.height),
             "n_trades": int(all_trades.height),
-            "total_exp_profit": float(all_trades["exp_pnl"].sum()),
+            "total_exp_profit": total_exp_profit,
             "avg_ev_per_1": float(all_trades["ev_per_1"].mean()),
+            "overall_roi": (total_exp_profit / float(args.bankroll_nom)) if args.bankroll_nom else None,
         }
         write_json(outdir / f"summary_{args.asof}.json", summ)
 
@@ -271,7 +275,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
         if side == "none":
             continue
 
-        # EV per £1 (FIXED formulas, include losing leg and commission)
+        # EV per £1 (includes losing leg and commission)
         ev_back = p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
         ev_lay  = (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
         ev_per_1 = ev_back if side == "back" else ev_lay
@@ -312,7 +316,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
             "exp_pnl": pl.Float64,
             "stake_mode": pl.Utf8,
         },
-        orient="row",  # fixes DataOrientationWarning
+        orient="row",
     )
     idx = len(list(outdir.glob("trades_part_*.parquet")))
     part.write_parquet(outdir / f"trades_part_{idx:05d}.parquet")
