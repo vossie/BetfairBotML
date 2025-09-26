@@ -3,7 +3,7 @@
 AutoML tuner for Edge Temporal with:
 - Hard pre-off constraint (<= 180 min)
 - Validation on the LAST N DAYS (default 7)
-- Objective = MEDIAN of DAILY ROI over the validation days ("better spread")
+- Objective = MEDIAN of DAILY ROI over the validation days
 - GPU training via XGBoost DeviceQuantileDMatrix + OOF Isotonic calibration
 - Searches trading policy (pm_cutoff, edge_thresh, ltp band) + a few model params
 - Saves best config, trials table, model.json, isotonic.pkl
@@ -14,7 +14,12 @@ Usage:
     --valid-days 7 --sport horse-racing --device cuda \
     --output-dir /opt/BetfairBotML/edge_temporal/output/automl --n-trials 40
 """
-import os, sys, glob, json, pickle, argparse
+import os
+import sys
+import glob
+import json
+import pickle
+import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -61,30 +66,33 @@ def _collect_gpu(lf: pl.LazyFrame) -> pl.DataFrame:
 
 def load_snapshots(curated: Path, start: datetime, end: datetime, sport: str) -> pl.DataFrame:
     files = list_parquet_between(curated, f"orderbook_snapshots_5s/sport={sport}", start, end)
-    if not files: return pl.DataFrame()
+    if not files:
+        return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    keep = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","ltpTick"]
+    keep = ["sport", "marketId", "selectionId", "publishTimeMs", "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1", "ltpTick"]
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
     return _collect_gpu(lf.select(cols))
 
 def load_results(curated: Path, start: datetime, end: datetime, sport: str) -> pl.DataFrame:
     files = list_parquet_between(curated, f"results/sport={sport}", start, end)
-    if not files: return pl.DataFrame()
+    if not files:
+        return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    keep = ["sport","marketId","selectionId","winLabel"]
+    keep = ["sport", "marketId", "selectionId", "winLabel"]
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
     return _collect_gpu(lf.select(cols))
 
 def load_defs(curated: Path, start: datetime, end: datetime, sport: str) -> pl.DataFrame:
     files = list_parquet_between(curated, f"market_definitions/sport={sport}", start, end)
-    if not files: return pl.DataFrame()
+    if not files:
+        return pl.DataFrame()
     lf = pl.scan_parquet(files)
     names = lf.collect_schema().names()
     if "runners" in names:
         lf = lf.explode("runners").select([
-            "sport","marketId",
+            "sport", "marketId",
             pl.col("runners").struct.field("selectionId").alias("selectionId"),
             pl.col("marketStartMs"),
             pl.col("marketType").alias("marketType_def"),
@@ -94,21 +102,25 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str) -> pl.D
             pl.col("runners").struct.field("reductionFactor"),
         ])
     else:
-        have = [c for c in ["sport","marketId","marketStartMs","marketType","countryCode"] if c in names]
+        have = [c for c in ["sport", "marketId", "marketStartMs", "marketType", "countryCode"] if c in names]
         lf = lf.select(have)
     return _collect_gpu(lf)
 
-def join_all(snap_df, res_df, defs_df):
-    if snap_df.is_empty() or res_df.is_empty(): return pl.DataFrame()
-    df = snap_df.join(res_df.select(["sport","marketId","selectionId","winLabel"]),
-                      on=["sport","marketId","selectionId"], how="inner")
+def join_all(snap_df: pl.DataFrame, res_df: pl.DataFrame, defs_df: pl.DataFrame) -> pl.DataFrame:
+    if snap_df.is_empty() or res_df.is_empty():
+        return pl.DataFrame()
+    df = snap_df.join(
+        res_df.select(["sport", "marketId", "selectionId", "winLabel"]),
+        on=["sport", "marketId", "selectionId"],
+        how="inner"
+    )
     if not defs_df.is_empty():
-        on_cols = [c for c in ["sport","marketId","selectionId"] if c in defs_df.columns and c in df.columns]
+        on_cols = [c for c in ["sport", "marketId", "selectionId"] if c in defs_df.columns and c in df.columns]
         df = df.join(defs_df, on=on_cols, how="left")
     return df
 
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
-    for col in ["marketType_def","countryCode"]:
+    for col in ["marketType_def", "countryCode"]:
         if col in df.columns:
             df = df.with_columns(pl.col(col).fill_null("UNK"))
             df = df.to_dummies(columns=[col])
@@ -116,42 +128,60 @@ def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
 
 def add_preoff_columns(df: pl.DataFrame) -> pl.DataFrame:
     if "marketStartMs" not in df.columns:
-        print("[ERROR] marketStartMs missing after join", file=sys.stderr); sys.exit(2)
+        print("[ERROR] marketStartMs missing after join", file=sys.stderr)
+        sys.exit(2)
     df = df.filter(pl.col("marketStartMs").is_not_null())
     return df.with_columns([
         (pl.col("marketStartMs") - pl.col("publishTimeMs")).alias("secs_to_start"),
-        ((pl.col("marketStartMs") - pl.col("publishTimeMs"))/60000).alias("mins_to_start"),
+        ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000).alias("mins_to_start"),
     ])
 
-def numeric_only(df: pl.DataFrame, exclude:set) -> pl.DataFrame:
+def numeric_only(df: pl.DataFrame, exclude: set) -> pl.DataFrame:
     df = df.drop([c for c in exclude if c in df.columns])
-    drop_ls = [c for c,dt in zip(df.columns, df.dtypes) if isinstance(dt,(pl.List,pl.Struct))]
-    if drop_ls: df = df.drop(drop_ls)
-    keep = [c for c,dt in zip(df.columns, df.dtypes) if dt.is_numeric() or dt==pl.Boolean]
+    drop_ls = [c for c, dt in zip(df.columns, df.dtypes) if isinstance(dt, (pl.List, pl.Struct))]
+    if drop_ls:
+        df = df.drop(drop_ls)
+    keep = [c for c, dt in zip(df.columns, df.dtypes) if dt.is_numeric() or dt == pl.Boolean]
     return df.select(keep)
 
 def make_params(device="cuda"):
-    return {"objective":"binary:logistic","eval_metric":["logloss","auc"],"tree_method":"hist",
-            "device":"cuda" if device!="cpu" else "cpu","max_depth":6,"eta":0.05,
-            "subsample":0.8,"colsample_bytree":0.8,"max_bin":256}
+    return {
+        "objective": "binary:logistic",
+        "eval_metric": ["logloss", "auc"],
+        "tree_method": "hist",
+        "device": "cuda" if device != "cpu" else "cpu",
+        "max_depth": 6,
+        "eta": 0.05,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "max_bin": 256
+    }
 
 def train_xgb(params, Xtr, ytr, Xva, yva):
     dtr = xgb.DeviceQuantileDMatrix(Xtr, label=ytr)
     dva = xgb.DeviceQuantileDMatrix(Xva, label=yva)
-    return xgb.train(params, dtr, num_boost_round=500,
-                     evals=[(dtr,"train"),(dva,"valid")],
-                     early_stopping_rounds=30, verbose_eval=False)
+    return xgb.train(
+        params,
+        dtr,
+        num_boost_round=500,
+        evals=[(dtr, "train"), (dva, "valid")],
+        early_stopping_rounds=30,
+        verbose_eval=False
+    )
 
 def safe_logloss(y_true, y_pred):
-    y_pred = np.clip(y_pred, 1e-15, 1-1e-15)
-    try: return log_loss(y_true, y_pred)
-    except Exception: return float("nan")
+    y_pred = np.clip(y_pred, 1e-15, 1 - 1e-15)
+    try:
+        return log_loss(y_true, y_pred)
+    except Exception:
+        return float("nan")
 
 def evaluate(df_valid, odds, y, p_model, p_market_norm, edge_thresh, topk, lo, hi,
              stake_mode, cap, floor_, bank, commission):
     edge = p_model - p_market_norm
     mask = (odds >= lo) & (odds <= hi) & np.isfinite(edge)
-    if not mask.any(): return dict(roi=0.0, profit=0.0, n_trades=0)
+    if not mask.any():
+        return dict(roi=0.0, profit=0.0, n_trades=0)
     df = pl.DataFrame({
         "marketId": df_valid["marketId"].to_numpy()[mask],
         "publishTimeMs": df_valid["publishTimeMs"].to_numpy()[mask],
@@ -161,23 +191,28 @@ def evaluate(df_valid, odds, y, p_model, p_market_norm, edge_thresh, topk, lo, h
         "y": y[mask],
         "p_model": p_model[mask],
     }).filter(pl.col("edge") >= edge_thresh)
-    if df.height == 0: return dict(roi=0.0, profit=0.0, n_trades=0)
+    if df.height == 0:
+        return dict(roi=0.0, profit=0.0, n_trades=0)
     df = df.with_columns(
-        pl.col("edge").rank(method="dense", descending=True).over(["marketId","publishTimeMs"]).alias("rk")
+        pl.col("edge").rank(method="dense", descending=True).over(["marketId", "publishTimeMs"]).alias("rk")
     ).filter(pl.col("rk") <= topk).drop("rk")
+
     outcomes = df["y"].to_numpy().astype(np.float32)
     odds_sel = df["ltp"].to_numpy().astype(np.float32)
     p_model_sel = df["p_model"].to_numpy().astype(np.float32)
+
     if stake_mode == "kelly":
-        def kf(p,o):
-            b=o-1.0
-            if b<=0: return 0.0
-            q=1.0-p
-            return max(0.0,(b*p - q)/b)
-        f = np.array([max(floor_, min(cap, kf(pi,oi))) for pi,oi in zip(p_model_sel,odds_sel)], dtype=np.float32)
+        def kf(p, o):
+            b = o - 1.0
+            if b <= 0:
+                return 0.0
+            q = 1.0 - p
+            return max(0.0, (b * p - q) / b)
+        f = np.array([max(floor_, min(cap, kf(pi, oi))) for pi, oi in zip(p_model_sel, odds_sel)], dtype=np.float32)
         stakes = f * bank
     else:
         stakes = np.full_like(odds_sel, 10.0, dtype=np.float32)
+
     gross = outcomes * (odds_sel - 1.0) * stakes
     net = gross * (1.0 - commission)
     loss = (1.0 - outcomes) * stakes
@@ -204,8 +239,8 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    outdir = Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
-    rng = np.random.default_rng(args.seed)
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     # Windows: last N days for VALID
     train_start, train_end, valid_start, valid_end = compute_windows(args.start_date, args.asof, args.valid_days)
@@ -213,21 +248,27 @@ def main():
 
     # Load once
     snap = load_snapshots(curated, train_start, valid_end, args.sport)
-    res  = load_results  (curated, train_start, valid_end, args.sport)
-    defs = load_defs     (curated, train_start, valid_end, args.sport)
+    res  = load_results(curated, train_start, valid_end, args.sport)
+    defs = load_defs(curated, train_start, valid_end, args.sport)
     if snap.is_empty() or res.is_empty():
-        print("[ERROR] no snapshots or results", file=sys.stderr); sys.exit(2)
+        print("[ERROR] no snapshots or results", file=sys.stderr)
+        sys.exit(2)
 
     df = join_all(snap, res, defs)
-    if df.is_empty(): print("[ERROR] empty after join", file=sys.stderr); sys.exit(2)
+    if df.is_empty():
+        print("[ERROR] empty after join", file=sys.stderr)
+        sys.exit(2)
     if "ltp" not in df.columns or "winLabel" not in df.columns:
-        print("[ERROR] missing ltp/winLabel", file=sys.stderr); sys.exit(2)
+        print("[ERROR] missing ltp/winLabel", file=sys.stderr)
+        sys.exit(2)
 
     # Clean + enforce pre-off <= 180 min
-    df = (df.filter(pl.col("winLabel").is_not_null())
-            .with_columns(pl.when(pl.col("winLabel")>0).then(1).otherwise(0).alias("winLabel"))
-            .filter(pl.col("ltp").is_not_null()))
-    df = add_preoff_columns(df).filter((pl.col("mins_to_start")>=0) & (pl.col("mins_to_start")<=180))
+    df = (
+        df.filter(pl.col("winLabel").is_not_null())
+          .with_columns(pl.when(pl.col("winLabel") > 0).then(1).otherwise(0).alias("winLabel"))
+          .filter(pl.col("ltp").is_not_null())
+    )
+    df = add_preoff_columns(df).filter((pl.col("mins_to_start") >= 0) & (pl.col("mins_to_start") <= 180))
     df = encode_categoricals(df)
 
     # Time masks (NumPy)
@@ -238,13 +279,13 @@ def main():
     mask_valid_time = (ts_np >= to_ms(valid_start)) & (ts_np < valid_end_excl)
 
     # Features once
-    exclude = {"winLabel","sport","marketId","selectionId","marketStartMs","secs_to_start"}
+    exclude = {"winLabel", "sport", "marketId", "selectionId", "marketStartMs", "secs_to_start"}
     X_all = numeric_only(df, exclude)
     X_np_all = X_all.to_numpy()
     y_all = df["winLabel"].to_numpy().astype(np.float32)
 
     # We'll need this to build per-day VALID views
-    base_cols = ["marketId","publishTimeMs","selectionId","ltp"]
+    base_cols = ["marketId", "publishTimeMs", "selectionId", "ltp"]
     base_for_valid = df.select(base_cols)
 
     params_base = make_params(args.device)
@@ -252,18 +293,18 @@ def main():
     # Objective: median of daily ROI over last N days (flat staking)
     def objective(trial: optuna.trial.Trial):
         # Policy
-        pm_cutoff  = trial.suggest_float("pm_cutoff", 0.85, 0.97)
-        edge_thr   = trial.suggest_float("edge_thresh", 0.03, 0.15)
-        ltp_min    = trial.suggest_float("ltp_min", 1.8, 3.0)
-        ltp_max    = trial.suggest_float("ltp_max", max(ltp_min+0.2, 2.2), 4.0)
+        pm_cutoff = trial.suggest_float("pm_cutoff", 0.85, 0.97)
+        edge_thr  = trial.suggest_float("edge_thresh", 0.03, 0.15)
+        ltp_min   = trial.suggest_float("ltp_min", 1.8, 3.0)
+        ltp_max   = trial.suggest_float("ltp_max", max(ltp_min + 0.2, 2.2), 4.0)
 
         # Model tweaks
         params = params_base.copy()
-        params["max_depth"]       = trial.suggest_int("max_depth", 4, 8)
-        params["eta"]             = trial.suggest_float("eta", 0.02, 0.15, log=True)
-        params["subsample"]       = trial.suggest_float("subsample", 0.6, 1.0)
-        params["colsample_bytree"]= trial.suggest_float("colsample_bytree", 0.5, 1.0)
-        params["min_child_weight"]= trial.suggest_float("min_child_weight", 1.0, 10.0)
+        params["max_depth"] = trial.suggest_int("max_depth", 4, 8)
+        params["eta"] = trial.suggest_float("eta", 0.02, 0.15, log=True)
+        params["subsample"] = trial.suggest_float("subsample", 0.6, 1.0)
+        params["colsample_bytree"] = trial.suggest_float("colsample_bytree", 0.5, 1.0)
+        params["min_child_weight"] = trial.suggest_float("min_child_weight", 1.0, 10.0)
 
         # PM mask (if available)
         if "pm_label" in df.columns:
@@ -288,16 +329,20 @@ def main():
         # OOF isotonic on TRAIN
         oof = np.zeros_like(ytr, dtype=np.float32)
         kf = KFold(n_splits=5, shuffle=True, random_state=42)
-        for tr, va in kf.split(Xtr):
+        for tr_idx, va_idx in kf.split(Xtr):
             b = xgb.train(
                 params,
-                xgb.DeviceQuantileDMatrix(Xtr[tr], label=ytr[tr]),
+                xgb.DeviceQuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]),
                 num_boost_round=500,
-                evals=[(xgb.DeviceQuantileDMatrix(Xtr[tr], label=ytr[tr]),"train"),
-                       (xgb.DeviceQuantileDMatrix(Xtr[va], label=ytr[va]),"valid")],
-                early_stopping_rounds=30, verbose_eval=False
+                evals=[
+                    (xgb.DeviceQuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]), "train"),
+                    (xgb.DeviceQuantileDMatrix(Xtr[va_idx], label=ytr[va_idx]), "valid")
+                ],
+                early_stopping_rounds=30,
+                verbose_eval=False
             )
-            oof[va] = b.predict(xgb.DMatrix(Xtr[va])).astype(np.float32)
+            oof[va_idx] = b.predict(xgb.DMatrix(Xtr[va_idx])).astype(np.float32)
+
         iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
         p_val = iso.predict(p_raw).astype(np.float32)
 
@@ -305,7 +350,8 @@ def main():
         valid_frame = (
             base_for_valid
             .with_columns(pl.Series("__mask", mask_valid))
-            .filter(pl.col("__mask")).drop("__mask")
+            .filter(pl.col("__mask"))
+            .drop("__mask")
             .with_columns(
                 pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms")
                   .dt.replace_time_zone("UTC")
@@ -315,11 +361,11 @@ def main():
         )
 
         # Overround-normalized market probabilities for VALID
-        dv = valid_frame.select(["marketId","publishTimeMs","ltp","__vday"]).with_columns(
+        dv = valid_frame.select(["marketId", "publishTimeMs", "ltp", "__vday"]).with_columns(
             (1.0 / pl.col("ltp").clip(lower_bound=1e-12)).alias("__inv")
         )
-        sums = dv.group_by(["marketId","publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
-        dv = dv.join(sums, on=["marketId","publishTimeMs"], how="left").with_columns(
+        sums = dv.group_by(["marketId", "publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
+        dv = dv.join(sums, on=["marketId", "publishTimeMs"], how="left").with_columns(
             (pl.col("__inv") / pl.col("__inv_sum").clip(lower_bound=1e-12)).alias("__p_mkt_norm")
         )
 
@@ -343,7 +389,6 @@ def main():
             day_mask = np.array([dd == d for dd in days], dtype=bool)
             if not day_mask.any():
                 continue
-            # Build a Polars df subset for grouping-by (marketId,publishTimeMs)
             df_day = valid_frame.filter(pl.Series(day_mask))
             met = evaluate(
                 df_day,
@@ -367,11 +412,10 @@ def main():
         trial.set_user_attr("days_evaluated", len(daily_rois))
         trial.set_user_attr("total_profit", total_profit)
         trial.set_user_attr("total_trades", total_trades)
-        # Also log discrimination quality on pooled VALID
         trial.set_user_attr("logloss", float(safe_logloss(yva, p_val)))
         trial.set_user_attr("auc", float(roc_auc_score(yva, p_val)))
 
-        return median_roi  # optimize median daily ROI across the last N days
+        return median_roi  # optimize median daily ROI
 
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=args.seed))
     study.optimize(objective, n_trials=args.n_trials, show_progress_bar=False)
@@ -392,8 +436,7 @@ def main():
             "auc":                    t.user_attrs.get("auc", float("nan")),
         }
         rows.append(r)
-    trials_df = pl.DataFrame(rows).sort(["score_median_daily_roi","total_profit"], descending=[True,True])
-    outdir.mkdir(parents=True, exist_ok=True)
+    trials_df = pl.DataFrame(rows).sort(["score_median_daily_roi", "total_profit"], descending=[True, True])
     trials_csv = outdir / f"trials_{args.asof}.csv"
     trials_df.write_csv(str(trials_csv))
     print(trials_df.head(10))
@@ -428,7 +471,6 @@ def main():
         "min_child_weight": float(p["min_child_weight"]),
     })
 
-    # Rebuild masks with best pm_cutoff
     if "pm_label" in df.columns:
         pm_mask = df["pm_label"].to_numpy() >= pm_cutoff
     else:
@@ -437,27 +479,36 @@ def main():
     mask_train = mask_train_time & pm_mask
     mask_valid = mask_valid_time & pm_mask
 
-    Xtr = X_np_all[mask_train].astype(np.float32, copy=False); ytr = y_all[mask_train]
-    Xva = X_np_all[mask_valid].astype(np.float32, copy=False); yva = y_all[mask_valid]
+    Xtr = X_np_all[mask_train].astype(np.float32, copy=False)
+    ytr = y_all[mask_train]
+    Xva = X_np_all[mask_valid].astype(np.float32, copy=False)
+    yva = y_all[mask_valid]
 
     booster = train_xgb(params, Xtr, ytr, Xva, yva)
     booster.save_model(str(outdir / "model.json"))
 
-    # OOF iso on TRAIN for persistence
+    # OOF isotonic for persistence
     oof = np.zeros_like(ytr, dtype=np.float32)
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
-    for tr, va in kf.split(Xtr):
-        b = xgb.train(params,
-                      xgb.DeviceQuantileDMatrix(Xtr[tr], label=ytr[tr]),
-                      num_boost_round=500,
-                      evals=[(xgb.DeviceQuantileDMatrix(Xtr[tr], label=ytr[tr]),"train"),
-                             (xgb.DeviceQuantileDMatrix(Xtr[va], label=ytr[va]),"valid")],
-                      early_stopping_rounds=30, verbose_eval=False)
-        oof[va] = b.predict(xgb.DMatrix(Xtr[va])).astype(np.float32)
+    for tr_idx, va_idx in kf.split(Xtr):
+        b = xgb.train(
+            params,
+            xgb.DeviceQuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]),
+            num_boost_round=500,
+            evals=[
+                (xgb.DeviceQuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]), "train"),
+                (xgb.DeviceQuantileDMatrix(Xtr[va_idx], label=ytr[va_idx]), "valid")
+            ],
+            early_stopping_rounds=30,
+            verbose_eval=False
+        )
+        oof[va_idx] = b.predict(xgb.DMatrix(Xtr[va_idx])).astype(np.float32)
+
     iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
-    with open(outdir / "isotonic.pkl","wb") as f:
-        pickle.dump({"type":"isotonic","iso":iso}, f)
+    with open(outdir / "isotonic.pkl", "wb") as f:
+        pickle.dump({"type": "isotonic", "iso": iso}, f)
     print("Saved model.json and isotonic.pkl")
+
 
 if __name__ == "__main__":
     main()
