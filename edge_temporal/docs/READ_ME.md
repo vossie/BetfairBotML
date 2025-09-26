@@ -1,3 +1,5 @@
+**** !!! Didnt work to great, had some predictive qualities but generally sucked !!! ****
+
 Temporal-split training with two heads in one run:
   1) Value head: p(win) with optional isotonic calibration + PnL-style backtest.
   2) Price-move head: short-horizon label (pm_up) built from the stream.
