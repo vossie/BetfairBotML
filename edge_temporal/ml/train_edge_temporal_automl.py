@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-AutoML tuner for Edge Temporal with:
-- Hard pre-off constraint (<= 180 min)
+AutoML tuner for Edge Temporal with realism controls.
+
+Features:
+- Pre-off constraint (<= --preoff-max minutes; default 180)
 - Validation on the LAST N DAYS (default 7)
-- Objective = MEDIAN of DAILY ROI over the validation days
+- Objective = MEDIAN of DAILY ROI (more robust than mean)
 - GPU training via XGBoost QuantileDMatrix + OOF Isotonic calibration
-- Searches trading policy (pm_cutoff, edge_thresh, ltp band) + a few model params
-- Saves best config, trials table, model.json, isotonic.pkl
+- Searches trading policy (pm_cutoff, edge_thresh, ltp band) + key model params
+- Realism knobs applied during validation:
+    * --downsample-secs N        (0 disables)
+    * --dedupe-mode {none,first_cross,max_edge}
+    * --haircut-ticks N          (worsen back fills by N ticks)
+    * --stake-mode {flat,kelly}  (+ --kelly-cap/--kelly-floor/--bankroll-nom)
+- Saves: trials CSV, best_config.json, model.json, isotonic.pkl
 """
 import os
 import sys
@@ -24,7 +31,6 @@ import optuna
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import KFold
 from sklearn.isotonic import IsotonicRegression
-
 
 # ---------------- utils ----------------
 def parse_date(s: str) -> datetime:
@@ -63,7 +69,8 @@ def load_snapshots(curated: Path, start: datetime, end: datetime, sport: str) ->
     if not files:
         return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    keep = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","ltpTick"]
+    keep = ["sport", "marketId", "selectionId", "publishTimeMs", "ltp",
+            "tradedVolume", "spreadTicks", "imbalanceBest1", "ltpTick"]
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
     return _collect_gpu(lf.select(cols))
@@ -73,7 +80,7 @@ def load_results(curated: Path, start: datetime, end: datetime, sport: str) -> p
     if not files:
         return pl.DataFrame()
     lf = pl.scan_parquet(files)
-    keep = ["sport","marketId","selectionId","winLabel"]
+    keep = ["sport", "marketId", "selectionId", "winLabel"]
     names = lf.collect_schema().names()
     cols = [c for c in keep if c in names]
     return _collect_gpu(lf.select(cols))
@@ -86,7 +93,7 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str) -> pl.D
     names = lf.collect_schema().names()
     if "runners" in names:
         lf = lf.explode("runners").select([
-            "sport","marketId",
+            "sport", "marketId",
             pl.col("runners").struct.field("selectionId").alias("selectionId"),
             pl.col("marketStartMs"),
             pl.col("marketType").alias("marketType_def"),
@@ -96,7 +103,7 @@ def load_defs(curated: Path, start: datetime, end: datetime, sport: str) -> pl.D
             pl.col("runners").struct.field("reductionFactor"),
         ])
     else:
-        have = [c for c in ["sport","marketId","marketStartMs","marketType","countryCode"] if c in names]
+        have = [c for c in ["sport", "marketId", "marketStartMs", "marketType", "countryCode"] if c in names]
         lf = lf.select(have)
     return _collect_gpu(lf)
 
@@ -104,17 +111,17 @@ def join_all(snap_df: pl.DataFrame, res_df: pl.DataFrame, defs_df: pl.DataFrame)
     if snap_df.is_empty() or res_df.is_empty():
         return pl.DataFrame()
     df = snap_df.join(
-        res_df.select(["sport","marketId","selectionId","winLabel"]),
-        on=["sport","marketId","selectionId"],
+        res_df.select(["sport", "marketId", "selectionId", "winLabel"]),
+        on=["sport", "marketId", "selectionId"],
         how="inner"
     )
     if not defs_df.is_empty():
-        on_cols = [c for c in ["sport","marketId","selectionId"] if c in defs_df.columns and c in df.columns]
+        on_cols = [c for c in ["sport", "marketId", "selectionId"] if c in defs_df.columns and c in df.columns]
         df = df.join(defs_df, on=on_cols, how="left")
     return df
 
 def encode_categoricals(df: pl.DataFrame) -> pl.DataFrame:
-    for col in ["marketType_def","countryCode"]:
+    for col in ["marketType_def", "countryCode"]:
         if col in df.columns:
             df = df.with_columns(pl.col(col).fill_null("UNK"))
             df = df.to_dummies(columns=[col])
@@ -137,6 +144,27 @@ def numeric_only(df: pl.DataFrame, exclude: set) -> pl.DataFrame:
         df = df.drop(drop_ls)
     keep = [c for c, dt in zip(df.columns, df.dtypes) if dt.is_numeric() or dt == pl.Boolean]
     return df.select(keep)
+
+# Betfair tick utilities
+def _tick_size(o: float) -> float:
+    if o < 2.0: return 0.01
+    if o < 3.0: return 0.02
+    if o < 4.0: return 0.05
+    if o < 6.0: return 0.10
+    if o < 10.0: return 0.20
+    if o < 20.0: return 0.50
+    if o < 30.0: return 1.00
+    if o < 50.0: return 2.00
+    if o < 100.0: return 5.00
+    return 10.0
+
+def shift_ticks_down(odds: float, n_ticks: int) -> float:
+    if n_ticks <= 0: return max(1.01, odds)
+    o = odds
+    for _ in range(n_ticks):
+        step = _tick_size(o)
+        o = max(1.01, round(o - step + 1e-12, 2))
+    return o
 
 # ---------------- modeling ----------------
 def make_params(device="cuda"):
@@ -223,8 +251,15 @@ def main():
     ap.add_argument("--valid-days", type=int, default=7)
     ap.add_argument("--sport", default="horse-racing")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--preoff-max", type=int, default=180)
     ap.add_argument("--commission", type=float, default=0.02)
     ap.add_argument("--bankroll-nom", type=float, default=5000.0)
+    ap.add_argument("--stake-mode", choices=["flat","kelly"], default="flat")
+    ap.add_argument("--kelly-cap", type=float, default=0.05)
+    ap.add_argument("--kelly-floor", type=float, default=0.002)
+    ap.add_argument("--downsample-secs", type=int, default=0)
+    ap.add_argument("--dedupe-mode", choices=["none","first_cross","max_edge"], default="none")
+    ap.add_argument("--haircut-ticks", type=int, default=0)
     ap.add_argument("--output-dir", required=True)
     ap.add_argument("--n-trials", type=int, default=40)
     ap.add_argument("--seed", type=int, default=42)
@@ -233,7 +268,7 @@ def main():
     outdir = Path(args.output_dir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # Windows: last N days for VALID
+    # Windows
     train_start, train_end, valid_start, valid_end = compute_windows(args.start_date, args.asof, args.valid_days)
     curated = Path(args.curated)
 
@@ -242,27 +277,26 @@ def main():
     res  = load_results(curated, train_start, valid_end, args.sport)
     defs = load_defs(curated, train_start, valid_end, args.sport)
     if snap.is_empty() or res.is_empty():
-        print("[ERROR] no snapshots or results", file=sys.stderr)
-        sys.exit(2)
+        print("[ERROR] no snapshots or results", file=sys.stderr); sys.exit(2)
 
     df = join_all(snap, res, defs)
     if df.is_empty():
-        print("[ERROR] empty after join", file=sys.stderr)
-        sys.exit(2)
+        print("[ERROR] empty after join", file=sys.stderr); sys.exit(2)
     if "ltp" not in df.columns or "winLabel" not in df.columns:
-        print("[ERROR] missing ltp/winLabel", file=sys.stderr)
-        sys.exit(2)
+        print("[ERROR] missing ltp/winLabel", file=sys.stderr); sys.exit(2)
 
-    # Clean + enforce pre-off <= 180 min
+    # Clean + enforce pre-off
     df = (
         df.filter(pl.col("winLabel").is_not_null())
           .with_columns(pl.when(pl.col("winLabel") > 0).then(1).otherwise(0).alias("winLabel"))
           .filter(pl.col("ltp").is_not_null())
     )
-    df = add_preoff_columns(df).filter((pl.col("mins_to_start") >= 0) & (pl.col("mins_to_start") <= 180))
+    df = add_preoff_columns(df).filter(
+        (pl.col("mins_to_start") >= 0) & (pl.col("mins_to_start") <= args.preoff_max)
+    )
     df = encode_categoricals(df)
 
-    # Time masks (NumPy)
+    # Time masks
     train_end_excl = to_ms(train_end + timedelta(days=1))
     valid_end_excl = to_ms(valid_end + timedelta(days=1))
     ts_np = df["publishTimeMs"].to_numpy()
@@ -275,13 +309,13 @@ def main():
     X_np_all = X_all.to_numpy()
     y_all = df["winLabel"].to_numpy().astype(np.float32)
 
-    # We'll need this to build per-day VALID views
-    base_cols = ["marketId", "publishTimeMs", "selectionId", "ltp"]
-    base_for_valid = df.select(base_cols)
+    # Base frame for masking/realism
+    base_cols = ["marketId", "publishTimeMs", "selectionId", "ltp", "winLabel"]
+    full_base = df.select(base_cols)
 
     params_base = make_params(args.device)
 
-    # Objective: median of daily ROI over last N days (flat staking)
+    # Objective: median of daily ROI on VALID with realism applied
     def objective(trial: optuna.trial.Trial):
         # Policy
         pm_cutoff = trial.suggest_float("pm_cutoff", 0.85, 0.97)
@@ -297,7 +331,7 @@ def main():
         params["colsample_bytree"] = trial.suggest_float("colsample_bytree", 0.5, 1.0)
         params["min_child_weight"] = trial.suggest_float("min_child_weight", 1.0, 10.0)
 
-        # PM mask (if available)
+        # PM gate
         if "pm_label" in df.columns:
             pm_mask = df["pm_label"].to_numpy() >= pm_cutoff
         else:
@@ -308,14 +342,56 @@ def main():
         if not mask_train.any() or not mask_valid.any():
             raise optuna.TrialPruned()
 
-        # Train once on TRAIN slice
+        # Train on TRAIN slice
         Xtr = X_np_all[mask_train].astype(np.float32, copy=False)
         ytr = y_all[mask_train]
         Xva = X_np_all[mask_valid].astype(np.float32, copy=False)
         yva = y_all[mask_valid]
 
         booster = train_xgb(params, Xtr, ytr, Xva, yva)
-        p_raw = booster.inplace_predict(Xva).astype(np.float32)
+
+        # Build VALID base and apply realism before predictions
+        base = (
+            full_base
+            .with_columns(pl.Series("__mask", mask_valid))
+            .filter(pl.col("__mask")).drop("__mask")
+            .with_columns(
+                pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms")
+                  .dt.replace_time_zone("UTC")
+                  .dt.date().alias("__vday")
+            )
+        )
+
+        # Optional downsample per runner into time buckets
+        if args.downsample_secs and args.downsample_secs > 0:
+            bucket = (pl.col("publishTimeMs") // (args.downsample_secs*1000)).alias("__bucket")
+            base = (base
+                    .with_columns(bucket)
+                    .sort(["marketId","selectionId","publishTimeMs"])
+                    .unique(subset=["marketId","selectionId","__bucket"], keep="first")
+                    .drop("__bucket"))
+            # map to original masked indices to slice Xva/yva
+            keys = ["marketId","selectionId","publishTimeMs"]
+            masked_df = (full_base.select(keys)
+                           .with_columns(pl.Series("__mask", mask_valid))
+                           .filter(pl.col("__mask")).drop("__mask"))
+            masked_df = masked_df.with_row_index("__idx")
+            base = base.join(masked_df, on=keys, how="left")
+            idx = base["__idx"].to_numpy()
+            good = np.isfinite(idx)
+            base = base.filter(pl.Series(good))
+            idx = idx[good].astype(np.int64)
+            Xva_ds = Xva[idx]
+            yva_ds = yva[idx]
+        else:
+            # no downsample; 1:1 mapping
+            Xva_ds = Xva
+            yva_ds = yva
+            # also give base a sequential index to keep shapes explicit
+            base = base.with_row_index("__idx")
+
+        # Predict (raw -> isotonic via OOF on TRAIN below)
+        p_raw = booster.inplace_predict(Xva_ds).astype(np.float32)
 
         # OOF isotonic on TRAIN
         oof = np.zeros_like(ytr, dtype=np.float32)
@@ -327,60 +403,77 @@ def main():
                 num_boost_round=500,
                 evals=[
                     (xgb.QuantileDMatrix(Xtr[tr_idx], label=ytr[tr_idx]), "train"),
-                    (xgb.QuantileDMatrix(Xtr[va_idx], label=ytr[va_idx]), "valid")
+                    (xgb.QuantileDMatrix(Xtr[va_idx], label=ytr[va_idx]), "valid"),
                 ],
                 early_stopping_rounds=30,
                 verbose_eval=False
             )
             oof[va_idx] = b.inplace_predict(Xtr[va_idx]).astype(np.float32)
-
         iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-6, y_max=1-1e-6).fit(oof, ytr)
         p_val = iso.predict(p_raw).astype(np.float32)
 
-        # Build VALID frame (order aligned with arrays)
-        valid_frame = (
-            base_for_valid
-            .with_columns(pl.Series("__mask", mask_valid))
-            .filter(pl.col("__mask"))
-            .drop("__mask")
-            .with_columns(
-                pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms")
-                  .dt.replace_time_zone("UTC")
-                  .dt.date()
-                  .alias("__vday")
-            )
-        )
-
-        # Overround-normalized market probabilities for VALID
-        dv = valid_frame.select(["marketId", "publishTimeMs", "ltp", "__vday"]).with_columns(
+        # Overround-normalized market probs on the CURRENT base
+        dv = base.select(["marketId","publishTimeMs","ltp","__vday"]).with_columns(
             (1.0 / pl.col("ltp").clip(lower_bound=1e-12)).alias("__inv")
         )
-        sums = dv.group_by(["marketId", "publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
-        dv = dv.join(sums, on=["marketId", "publishTimeMs"], how="left").with_columns(
+        sums = dv.group_by(["marketId","publishTimeMs"]).agg(pl.col("__inv").sum().alias("__inv_sum"))
+        dv = dv.join(sums, on=["marketId","publishTimeMs"], how="left").with_columns(
             (pl.col("__inv") / pl.col("__inv_sum").clip(lower_bound=1e-12)).alias("__p_mkt_norm")
         )
 
         p_mkt = dv["__p_mkt_norm"].to_numpy().astype(np.float32)
-        odds  = valid_frame["ltp"].to_numpy().astype(np.float32)
-        days  = valid_frame["__vday"].to_list()
+        odds  = base["ltp"].to_numpy().astype(np.float32)
+        if args.haircut_ticks and args.haircut_ticks > 0:
+            odds = np.array([shift_ticks_down(float(o), int(args.haircut_ticks)) for o in odds], dtype=np.float32)
+        days  = base["__vday"].to_list()
 
-        # Per-day evaluation (flat staking)
+        # Build work frame for dedupe + filters
+        work = pl.DataFrame({
+            "marketId": base["marketId"],
+            "selectionId": base["selectionId"],
+            "publishTimeMs": base["publishTimeMs"],
+            "__vday": base["__vday"],
+            "ltp": odds,
+            "y": yva_ds,
+            "p_model": p_val,
+            "p_mkt": p_mkt
+        }).with_columns((pl.col("p_model") - pl.col("p_mkt")).alias("__edge"))
+
+        # Filter by odds band + edge threshold
+        work = work.filter(
+            (pl.col("ltp") >= ltp_min) & (pl.col("ltp") <= ltp_max) & (pl.col("__edge") >= edge_thr)
+        )
+
+        # Dedupe options (one bet per runner)
+        if args.dedupe_mode == "first_cross":
+            work = (work.sort("publishTimeMs")
+                        .unique(subset=["marketId","selectionId"], keep="first"))
+        elif args.dedupe_mode == "max_edge":
+            work = (work.sort(["__edge","publishTimeMs"], descending=[True, False])
+                        .unique(subset=["marketId","selectionId"], keep="first"))
+
+        if work.is_empty():
+            raise optuna.TrialPruned()
+
+        # Per-day evaluation
         uniq_days, seen = [], set()
-        for d in days:
-            if d not in seen:
-                uniq_days.append(d); seen.add(d)
+        for d in work["__vday"].to_list():
+            if d not in seen: uniq_days.append(d); seen.add(d)
 
         daily_rois, total_profit, total_trades = [], 0.0, 0
         for d in uniq_days:
-            day_mask = np.array([dd == d for dd in days], dtype=bool)
-            if not day_mask.any():
-                continue
-            df_day = valid_frame.filter(pl.Series(day_mask))
+            df_day = work.filter(pl.col("__vday") == d)
+            df_valid = df_day.select(["marketId","publishTimeMs","selectionId"])
+            odds_day = df_day["ltp"].to_numpy().astype(np.float32)
+            y_day = df_day["y"].to_numpy().astype(np.float32)
+            p_model_day = df_day["p_model"].to_numpy().astype(np.float32)
+            p_mkt_day = df_day["p_mkt"].to_numpy().astype(np.float32)
             met = evaluate(
-                df_day,
-                odds[day_mask], yva[day_mask], p_val[day_mask], p_mkt[day_mask],
+                df_valid,
+                odds_day, y_day, p_model_day, p_mkt_day,
                 edge_thr, 1, ltp_min, ltp_max,
-                "flat", 0.0, 0.0, float(5000.0), float(args.commission)
+                args.stake_mode, float(args.kelly_cap), float(args.kelly_floor),
+                float(args.bankroll_nom), float(args.commission)
             )
             daily_rois.append(met["roi"])
             total_profit += float(met["profit"])
@@ -391,7 +484,6 @@ def main():
 
         median_roi = float(np.median(daily_rois))
         avg_roi    = float(np.mean(daily_rois))
-        # diagnostics
         trial.set_user_attr("median_daily_roi", median_roi)
         trial.set_user_attr("avg_daily_roi", avg_roi)
         trial.set_user_attr("min_daily_roi", float(np.min(daily_rois)))
@@ -399,10 +491,14 @@ def main():
         trial.set_user_attr("days_evaluated", len(daily_rois))
         trial.set_user_attr("total_profit", total_profit)
         trial.set_user_attr("total_trades", total_trades)
-        trial.set_user_attr("logloss", float(safe_logloss(yva, p_val)))
-        trial.set_user_attr("auc", float(roc_auc_score(yva, p_val)))
+        # Model diagnostics on VALID slice used:
+        try:
+            trial.set_user_attr("logloss", float(safe_logloss(np.asarray(work["y"]), np.asarray(work["p_model"]))))
+            trial.set_user_attr("auc", float(roc_auc_score(np.asarray(work["y"]), np.asarray(work["p_model"]))))
+        except Exception:
+            pass
 
-        return median_roi  # optimize median daily ROI
+        return median_roi
 
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=args.seed))
     study.optimize(objective, n_trials=args.n_trials, show_progress_bar=False)
@@ -429,15 +525,21 @@ def main():
     print(trials_df.head(10))
     print(f"Wrote trials → {trials_csv}")
 
-    # Save best config and artifacts
+    # Save best config and artifacts (+ realism knobs)
     best = study.best_trial
     best_cfg = {
         "asof": args.asof,
         "start_date": args.start_date,
         "valid_days": args.valid_days,
-        "preoff_max_minutes": 180,
+        "preoff_max_minutes": args.preoff_max,
         "commission": args.commission,
         "bankroll_nom": args.bankroll_nom,
+        "stake_mode": args.stake_mode,
+        "kelly_cap": args.kelly_cap,
+        "kelly_floor": args.kelly_floor,
+        "downsample_secs": args.downsample_secs,
+        "dedupe_mode": args.dedupe_mode,
+        "haircut_ticks": args.haircut_ticks,
         "best_median_daily_roi": best.user_attrs.get("median_daily_roi"),
         "best_avg_daily_roi": best.user_attrs.get("avg_daily_roi"),
         "best_params": best.params,
@@ -446,7 +548,7 @@ def main():
         json.dump(best_cfg, f, indent=2)
     print("Best config →", outdir / "best_config.json")
 
-    # Refit best model & save calibrator
+    # Refit best model on TRAIN slice & save calibrator
     p = best.params
     pm_cutoff = p["pm_cutoff"]
     params = make_params(args.device)
@@ -495,7 +597,6 @@ def main():
     with open(outdir / "isotonic.pkl", "wb") as f:
         pickle.dump({"type": "isotonic", "iso": iso}, f)
     print("Saved model.json and isotonic.pkl")
-
 
 if __name__ == "__main__":
     main()
