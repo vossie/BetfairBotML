@@ -32,6 +32,7 @@ NUMERIC_FEATS = [
     # lags
     "ltp_lag30s","ltp_lag60s","ltp_lag120s",
     "tradedVolume_lag30s","tradedVolume_lag60s","tradedVolume_lag120s",
+    # momentum / returns
     "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
     "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
 ]
@@ -39,11 +40,11 @@ NUMERIC_FEATS = [
 def parse_args():
     p = argparse.ArgumentParser(description="Streaming-style simulator for price trend model")
     p.add_argument("--curated", required=True)
-    p.add_argument("--asof", required=True)                 # inclusive valid end
-    p.add_argument("--start-date", required=True)           # train/start for simulation window
-    p.add_argument("--valid-days", type=int, default=7)     # simulate over last N days up to asof
+    p.add_argument("--asof", required=True)
+    p.add_argument("--start-date", required=True)
+    p.add_argument("--valid-days", type=int, default=7)
     p.add_argument("--sport", default="horse-racing")
-    p.add_argument("--horizon-secs", type=int, default=120) # only to document; model already fixed
+    p.add_argument("--horizon-secs", type=int, default=120)
     p.add_argument("--preoff-max", type=int, default=30)
     p.add_argument("--commission", type=float, default=0.02)
     p.add_argument("--edge-thresh", type=float, default=0.0)
@@ -54,16 +55,11 @@ def parse_args():
     p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
     p.add_argument("--calib-path", default="", help="optional isotonic.pkl for calibrating __p_pred (rarely needed for delta model)")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
-    p.add_argument("--device", default="cuda", choices=["cuda","cpu"])  # used by XGB for pred
+    p.add_argument("--device", default="cuda", choices=["cuda","cpu"])
     p.add_argument("--batch-size", type=int, default=200_000, help="batch predict to avoid RAM spikes")
     return p.parse_args()
 
 def _make_features_row(bufs, last_row):
-    """
-    bufs: dict with keys 'ltp', 'vol', each a deque of latest values per runner
-    last_row: dict-like with raw values for current tick
-    returns dict of engineered features for current tick (or None if not enough history)
-    """
     if len(bufs["ltp"]) < LAG_120S or len(bufs["vol"]) < LAG_120S:
         return None
 
@@ -113,7 +109,6 @@ def _make_features_row(bufs, last_row):
         "ltp_ret_60s": safe_div(ltp_now - ltp_l60, ltp_l60),
         "ltp_ret_120s": safe_div(ltp_now - ltp_l120, ltp_l120),
     }
-    # sanitize Nones
     for k, v in feats.items():
         if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
             feats[k] = np.nan
@@ -128,20 +123,16 @@ def main():
     valid_end = asof_dt
     valid_start = asof_dt - timedelta(days=args.valid_days)
     start_dt = parse_date(args.start_date)
-    # Load only from start_dt..valid_end
+
     lf = read_snapshots(curated, start_dt, valid_end, args.sport).with_columns([
         time_to_off_minutes_expr(),
     ])
     df = lf.collect()
     df = filter_preoff(df, args.preoff_max)
-
-    # Stream order: by time
     df = df.sort(["publishTimeMs","marketId","selectionId"])
 
-    # Load model (+ optional calibrator)
     bst = xgb.Booster()
     bst.load_model(args.model_path)
-    # Force device for prediction when requested (XGBoost ≥2.x)
     try:
         bst.set_param({"device": args.device})
     except Exception:
@@ -152,7 +143,6 @@ def main():
         with open(args.calib_path, "rb") as f:
             calibrator = pickle.load(f)
 
-    # rolling buffers per (marketId, selectionId)
     bufs_ltp = defaultdict(lambda: deque(maxlen=LAG_120S))
     bufs_vol = defaultdict(lambda: deque(maxlen=LAG_120S))
 
@@ -160,7 +150,6 @@ def main():
     feature_rows = []
     meta_rows = []
 
-    # Simulate tick-by-tick
     for r in rows:
         key = (r["marketId"], int(r["selectionId"]))
         bufs_ltp[key].append(float(r["ltp"]))
@@ -173,7 +162,7 @@ def main():
             "imbalanceBest1": float(r.get("imbalanceBest1") or 0.0),
             "mins_to_off": float(r["mins_to_off"]),
         })
-        if feats is None:  # not enough history yet
+        if feats is None:
             continue
 
         feature_rows.append([feats.get(c, np.nan) for c in NUMERIC_FEATS])
@@ -182,17 +171,14 @@ def main():
             float(r["ltp"]), float(feats["__p_now"])
         ))
 
-        # batch predict to keep memory bounded
         if len(feature_rows) >= args.batch_size:
             process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir)
             feature_rows.clear()
             meta_rows.clear()
 
-    # flush remainder
     if feature_rows:
         process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir)
 
-    # combine all chunks → trades.csv
     trades_parts = sorted(outdir.glob("trades_part_*.parquet"))
     if trades_parts:
         all_trades = pl.concat([pl.read_parquet(p) for p in trades_parts], how="vertical_relaxed")
@@ -200,7 +186,6 @@ def main():
         all_trades.write_csv(trades_csv)
         for p in trades_parts: p.unlink(missing_ok=True)
 
-        # daily summary (+ ROI per day)
         daily = (
             all_trades
             .with_columns(
@@ -215,14 +200,13 @@ def main():
                 pl.mean("stake").alias("avg_stake"),
             ])
             .with_columns(
-                (pl.col("exp_profit") / pl.lit(float(args.bankroll_nom))).alias("roi")  # daily ROI
+                (pl.col("exp_profit") / pl.lit(float(args.bankroll_nom))).alias("roi")
             )
             .sort("day")
         )
         daily_csv = outdir / f"daily_{args.asof}.csv"
         daily.write_csv(daily_csv)
 
-        # summary json (also include overall ROI)
         total_exp_profit = float(all_trades["exp_pnl"].sum())
         summ = {
             "asof": args.asof,
@@ -241,85 +225,3 @@ def main():
             "avg_ev_per_1": float(all_trades["ev_per_1"].mean()),
             "overall_roi": (total_exp_profit / float(args.bankroll_nom)) if args.bankroll_nom else None,
         }
-        write_json(outdir / f"summary_{args.asof}.json", summ)
-
-def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
-    X = np.asarray(feature_rows, dtype=np.float32)
-
-    # Prefer fast GPU inference with inplace_predict when device=cuda
-    try:
-        if args.device == "cuda":
-            delta_pred = bst.inplace_predict(X)  # uses GPU when device=cuda
-        else:
-            dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
-            delta_pred = bst.predict(dm)
-    except Exception:
-        # Fallback path: DMatrix+predict
-        dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
-        delta_pred = bst.predict(dm)
-
-    out = []
-    commission = float(args.commission)
-    for i, (ts, mid, sid, ltp, p_now) in enumerate(meta_rows):
-        dp = float(delta_pred[i])
-        p_pred = p_now + dp
-        # clip probability to [0,1]
-        p_pred = 0.0 if p_pred < 0.0 else (1.0 if p_pred > 1.0 else p_pred)
-        if calibrator:
-            try:
-                p_pred = float(calibrator.transform(np.array([p_pred]))[0])
-            except Exception:
-                pass
-
-        side = "back" if dp > 0 else ("lay" if dp < 0 else "none")
-        if side == "none":
-            continue
-
-        # EV per £1 (includes losing leg and commission)
-        ev_back = p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
-        ev_lay  = (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
-        ev_per_1 = ev_back if side == "back" else ev_lay
-
-        if ev_per_1 < args.edge_thresh:
-            continue
-
-        # stake sizing
-        if args.stake_mode == "flat":
-            stake = 1.0
-        else:
-            if side == "back":
-                f = kelly_fraction_back(p_pred, ltp, commission)
-            else:
-                f = kelly_fraction_lay(p_pred, ltp, commission)
-            f = max(args.kelly_floor, min(args.kelly_cap, f))
-            stake = f * float(args.bankroll_nom)
-
-        exp_pnl = ev_per_1 * stake
-        out.append((ts, mid, sid, ltp, p_now, p_pred, dp, side, ev_per_1, stake, exp_pnl,
-                    args.stake_mode))
-
-    if not out:
-        return
-    part = pl.DataFrame(
-        out,
-        schema={
-            "publishTimeMs": pl.Int64,
-            "marketId": pl.Utf8,
-            "selectionId": pl.Int64,
-            "ltp": pl.Float64,
-            "p_now": pl.Float64,
-            "p_pred": pl.Float64,
-            "delta_pred": pl.Float64,
-            "side": pl.Utf8,
-            "ev_per_1": pl.Float64,
-            "stake": pl.Float64,
-            "exp_pnl": pl.Float64,
-            "stake_mode": pl.Utf8,
-        },
-        orient="row",
-    )
-    idx = len(list(outdir.glob("trades_part_*.parquet")))
-    part.write_parquet(outdir / f"trades_part_{idx:05d}.parquet")
-
-if __name__ == "__main__":
-    main()
