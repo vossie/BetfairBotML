@@ -48,72 +48,74 @@ def _build_features(df: pl.DataFrame) -> pl.DataFrame:
     Assumes ~5s cadence snapshots; lags are N rows within (marketId, selectionId).
     """
     df = df.sort(["marketId","selectionId","publishTimeMs"])
-
     part = ["marketId","selectionId"]
 
-    ltp_shift_1   = pl.col("ltp").shift(1).over(part)
-    vol_shift_1   = pl.col("tradedVolume").shift(1).over(part)
+    ltp_shift_1 = pl.col("ltp").shift(1).over(part)
+    vol_shift_1 = pl.col("tradedVolume").shift(1).over(part)
 
-    ltp_lag30     = pl.col("ltp").shift(LAG_30S).over(part)
-    ltp_lag60     = pl.col("ltp").shift(LAG_60S).over(part)
-    ltp_lag120    = pl.col("ltp").shift(LAG_120S).over(part)
+    ltp_lag30  = pl.col("ltp").shift(LAG_30S).over(part)
+    ltp_lag60  = pl.col("ltp").shift(LAG_60S).over(part)
+    ltp_lag120 = pl.col("ltp").shift(LAG_120S).over(part)
 
-    vol_lag30     = pl.col("tradedVolume").shift(LAG_30S).over(part)
-    vol_lag60     = pl.col("tradedVolume").shift(LAG_60S).over(part)
-    vol_lag120    = pl.col("tradedVolume").shift(LAG_120S).over(part)
+    vol_lag30  = pl.col("tradedVolume").shift(LAG_30S).over(part)
+    vol_lag60  = pl.col("tradedVolume").shift(LAG_60S).over(part)
+    vol_lag120 = pl.col("tradedVolume").shift(LAG_120S).over(part)
 
     def safe_ret(cur, lag):
         return (cur - lag) / lag
 
-    df = df.with_columns([
-        # current
+    return df.with_columns([
         pl.col("ltp").cast(pl.Float64),
         pl.col("tradedVolume").cast(pl.Float64),
-        # diffs
         (pl.col("ltp") - ltp_shift_1).alias("ltp_diff_5s"),
         (pl.col("tradedVolume") - vol_shift_1).alias("vol_diff_5s"),
-        # lags
         ltp_lag30.alias("ltp_lag30s"),
         ltp_lag60.alias("ltp_lag60s"),
         ltp_lag120.alias("ltp_lag120s"),
         vol_lag30.alias("tradedVolume_lag30s"),
         vol_lag60.alias("tradedVolume_lag60s"),
         vol_lag120.alias("tradedVolume_lag120s"),
-        # momentum
         (pl.col("ltp") - ltp_lag30).alias("ltp_mom_30s"),
         (pl.col("ltp") - ltp_lag60).alias("ltp_mom_60s"),
         (pl.col("ltp") - ltp_lag120).alias("ltp_mom_120s"),
-        # returns
         safe_ret(pl.col("ltp"), ltp_lag30).alias("ltp_ret_30s"),
         safe_ret(pl.col("ltp"), ltp_lag60).alias("ltp_ret_60s"),
         safe_ret(pl.col("ltp"), ltp_lag120).alias("ltp_ret_120s"),
-        # prob now
         (1.0 / pl.col("ltp")).alias("__p_now"),
     ])
-    return df
 
 def _future_join(df: pl.DataFrame, horizon_secs: int) -> pl.DataFrame:
+    """
+    Join the future LTP at t+H per (marketId, selectionId).
+    Avoids left ts_dt column to prevent right-column suffixing like ts_dt_right.
+    """
     df2 = df.with_columns([
         (pl.col("publishTimeMs").cast(pl.Int64) + horizon_secs * 1000).alias("ts_exit_ms"),
-        pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone(UTC_TZ).alias("ts_dt"),
         pl.from_epoch(pl.col("publishTimeMs") + horizon_secs * 1000, time_unit="ms").dt.replace_time_zone(UTC_TZ).alias("ts_exit_dt"),
     ]).sort(["marketId","selectionId","ts_exit_dt"])
+
     exit_df = (
         df.select([
-            pl.col("marketId"), pl.col("selectionId"),
+            pl.col("marketId"),
+            pl.col("selectionId"),
             pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone(UTC_TZ).alias("ts_dt"),
             pl.col("ltp").alias("ltp_exit_proxy"),
         ])
         .filter(pl.col("ltp_exit_proxy").is_not_null() & (pl.col("ltp_exit_proxy") > 1.01))
         .sort(["marketId","selectionId","ts_dt"])
     )
+
     out = df2.join_asof(
-        exit_df, left_on="ts_exit_dt", right_on="ts_dt",
-        by=["marketId","selectionId"], strategy="forward",
+        exit_df,
+        left_on="ts_exit_dt",
+        right_on="ts_dt",
+        by=["marketId","selectionId"],
+        strategy="forward",
         tolerance=timedelta(minutes=10),
     ).with_columns(
         pl.col("ltp_exit_proxy").alias("ltp_future")
-    ).drop(["ts_dt","ts_exit_dt","ltp_exit_proxy"])
+    ).drop(["ts_exit_dt", "ts_dt", "ltp_exit_proxy"])
+
     return out
 
 def _ev_mtm_per1(p_now: np.ndarray, p_pred: np.ndarray, commission: float, side_back_mask: np.ndarray) -> np.ndarray:
@@ -143,20 +145,18 @@ def main():
     print(f"XGBoost device:  {args.device}")
     print(f"EV mode:         mtm")
 
-    # columns to fetch (include countryCode for facet)
+    # fetch columns (include countryCode for facet)
     cols = ["marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs","countryCode"]
-
     lf = read_snapshots(curated, start_dt, valid_end, args.sport)
     schema = lf.collect_schema().names()
     present = [c for c in cols if c in schema]
     lf = lf.select(present).with_columns([ time_to_off_minutes_expr() ])
 
     df = lf.collect()
-    # Sanity
     df = df.filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
     df = filter_preoff(df, args.preoff_max)
 
-    # Split train/valid
+    # split
     df = df.with_columns(
         pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone(UTC_TZ).dt.date().alias("__date")
     )
@@ -166,22 +166,26 @@ def main():
     df_tr = df.filter(pl.col("__date") < valid_start)
     df_va = df.filter((pl.col("__date") >= valid_start) & (pl.col("__date") <= valid_end))
 
-    # Build features + target
+    # build features + target
     def prep(df_in: pl.DataFrame) -> pl.DataFrame:
         f = _build_features(df_in)
         f = _future_join(f, args.horizon_secs)
         f = f.filter(pl.col("ltp_future").is_not_null() & (pl.col("ltp_future") > 1.01))
+        # step 1: probabilities
         f = f.with_columns([
             (1.0 / pl.col("ltp")).alias("p_now"),
             (1.0 / pl.col("ltp_future")).alias("p_future"),
-            (pl.col("p_future") - pl.col("p_now")).alias("dp"),
         ])
+        # step 2: delta
+        f = f.with_columns(
+            (pl.col("p_future") - pl.col("p_now")).alias("dp")
+        )
         return f
 
     df_tr_f = prep(df_tr)
     df_va_f = prep(df_va)
 
-    # Country facets: is_gb + frequency (computed on TRAIN only)
+    # country facets (is_gb + frequency from TRAIN only)
     feat_extra: list[str] = []
     if args.country_facet and "countryCode" in df_tr_f.columns:
         df_tr_f = df_tr_f.with_columns((pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb"))
@@ -205,7 +209,7 @@ def main():
     X_tr, y_tr = to_xy(df_tr_f)
     X_va, y_va = to_xy(df_va_f)
 
-    # Train XGB (GPU/CPU)
+    # train XGB
     params = {
         "max_depth": 6,
         "n_estimators": 400,
@@ -221,17 +225,17 @@ def main():
     bst = xgb.XGBRegressor(**params)
     bst.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
-    # Validation EV diagnostic (MTM style)
+    # validation EV (mtm-style)
     dp_pred = bst.predict(X_va)
     p_now = df_va_f["p_now"].to_numpy()
-    p_pred = np.clip(p_now + dp_pred, 1e-6, 1.0-1e-6)
+    p_pred = np.clip(p_now + dp_pred, 1e-6, 1.0 - 1e-6)
     side_back = dp_pred >= 0.0
     ev = _ev_mtm_per1(p_now, p_pred, args.commission, side_back)
 
     print(f"[trend] rows train={len(y_tr):,}  valid={len(y_va):,}")
     print(f"[trend] valid EV per £1: mean={ev.mean():.5f}  p>0 share={(ev>0).mean():.3f}")
 
-    # Save model (core Booster for simulator)
+    # save model
     model_dir = Path(args.output_dir) / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / "xgb_trend_reg.json"
