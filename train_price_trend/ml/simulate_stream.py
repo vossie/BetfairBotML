@@ -38,7 +38,7 @@ NUMERIC_FEATS = [
 ]
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Streaming-style simulator for price trend model (liquidity-aware)")
+    p = argparse.ArgumentParser(description="Streaming-style simulator for price trend model (liquidity-aware + settlement P&L)")
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)                 # inclusive valid end
     p.add_argument("--start-date", required=True)           # simulation window start
@@ -47,7 +47,7 @@ def parse_args():
     p.add_argument("--horizon-secs", type=int, default=120) # for documentation; model fixed
     p.add_argument("--preoff-max", type=int, default=30)
     p.add_argument("--commission", type=float, default=0.02)
-    p.add_argument("--edge-thresh", type=float, default=0.002)  # realistic default (≈0.2%)
+    p.add_argument("--edge-thresh", type=float, default=0.002)  # realistic default (≈0.2% per £1)
     p.add_argument("--stake-mode", choices=["flat","kelly"], default="kelly")
     p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
@@ -55,9 +55,10 @@ def parse_args():
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
     p.add_argument("--odds-min", type=float, default=None, help="optional min odds (ltp) filter")
     p.add_argument("--odds-max", type=float, default=None, help="optional max odds (ltp) filter")
-    # --- NEW: liquidity controls
+    # Liquidity controls
     p.add_argument("--liquidity-levels", type=int, default=1, help="sum available size across top-L book levels")
     p.add_argument("--enforce-liquidity", action="store_true", help="cap stake by available book size")
+    # I/O + runtime
     p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
     p.add_argument("--calib-path", default="", help="optional isotonic.pkl for calibrating __p_pred (rare for delta model)")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
@@ -66,11 +67,7 @@ def parse_args():
     return p.parse_args()
 
 def _make_features_row(bufs, last_row):
-    """
-    bufs: dict with keys 'ltp', 'vol', each a deque of latest values per runner
-    last_row: dict-like with raw values for current tick
-    returns dict of engineered features for current tick (or None if not enough history)
-    """
+    """Return engineered features for current tick (or None if not enough history)."""
     if len(bufs["ltp"]) < LAG_120S or len(bufs["vol"]) < LAG_120S:
         return None
 
@@ -120,7 +117,6 @@ def _make_features_row(bufs, last_row):
         "ltp_ret_60s": safe_div(ltp_now - ltp_l60, ltp_l60),
         "ltp_ret_120s": safe_div(ltp_now - ltp_l120, ltp_l120),
     }
-    # sanitize Nones
     for k, v in feats.items():
         if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
             feats[k] = np.nan
@@ -140,7 +136,7 @@ def _ev_mtm(p_now: float, p_pred: float, commission: float, side: str) -> float:
         return (1.0 - (p_now_c / p_pred_c)) * (1.0 - commission)
 
 def _ev_settlement(p_pred: float, ltp: float, commission: float, side: str) -> float:
-    """Settlement-style EV per £1 stake (only valid if p_pred is a true win probability)."""
+    """Settlement-style EV per £1 stake (valid only if p_pred is a true win probability)."""
     if side == "back":
         # p * (odds-1)*(1-comm) - (1-p)
         return p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
@@ -152,18 +148,50 @@ def _ev_settlement(p_pred: float, ltp: float, commission: float, side: str) -> f
 def _sum_available_size(side: str, back_sizes, lay_sizes, levels: int) -> float:
     """
     Sum available size across top 'levels' for the appropriate side.
-    We use 'availableToBack' for BACK (you can back that size),
-    and 'availableToLay' for LAY (you can lay that size).
+    Assumption: provided sizes arrays represent available size you can take now.
     """
-    if side == "back":
-        sizes = back_sizes or []
-    else:
-        sizes = lay_sizes or []
-    if sizes is None:
+    sizes = back_sizes if side == "back" else lay_sizes
+    if not sizes:
         return 0.0
     if levels <= 0:
         levels = 1
     return float(sum(sizes[:levels]))
+
+# ---------- Results loader ----------
+def _load_results(curated_root: Path, sport: str, start_dt, end_dt) -> pl.DataFrame:
+    """
+    Load settled results for [start_dt .. end_dt] (inclusive by day).
+    Expects schema with: marketId (str), selectionId (int), winLabel (0/1).
+    """
+    # daily partitions
+    days = []
+    day = start_dt
+    while day <= end_dt:
+        days.append(day.strftime("%Y-%m-%d"))
+        day += timedelta(days=1)
+
+    paths = [f"{curated_root}/results/sport={sport}/date={d}/*.parquet" for d in days]
+    # lazily scan & union; tolerate missing days via lazy scan try/catch
+    lfs = []
+    for pat in paths:
+        try:
+            lfs.append(pl.scan_parquet(pat))
+        except Exception:
+            continue
+    if not lfs:
+        return pl.DataFrame({"marketId": [], "selectionId": [], "winLabel": []})
+    lf = pl.concat(lfs, how="vertical_relaxed")
+
+    df = (
+        lf.select([
+            pl.col("marketId").cast(pl.Utf8),
+            pl.col("selectionId").cast(pl.Int64),
+            pl.col("winLabel").cast(pl.Int32).fill_null(0)
+        ])
+        .unique(maintain_order=False)
+        .collect()
+    )
+    return df
 
 def main():
     args = parse_args()
@@ -174,7 +202,8 @@ def main():
     valid_end = asof_dt
     valid_start = asof_dt - timedelta(days=args.valid_days)
     start_dt = parse_date(args.start_date)
-    # Load only from start_dt..valid_end
+
+    # Load only from start_dt..valid_end (snapshots) and filter to pre-off window
     lf = read_snapshots(curated, start_dt, valid_end, args.sport).with_columns([
         time_to_off_minutes_expr(),
     ])
@@ -228,18 +257,15 @@ def main():
         if feats is None:  # not enough history yet
             continue
 
-        # Keep minimal meta incl. book sizes for liquidity capping
+        # Keep meta incl. book sizes for liquidity capping
         meta_rows.append((
             r["publishTimeMs"],                    # 0
             r["marketId"],                         # 1
             int(r["selectionId"]),                 # 2
-            float(r["ltp"]),                       # 3
+            float(r["ltp"]),                       # 3 (exec odds approximation)
             float(feats["__p_now"]),               # 4 (p_now from ltp)
             r.get("backSizes") or [],              # 5 list[float]
             r.get("laySizes") or [],               # 6 list[float]
-            # ticks arrays are not required for size capping; kept for possible future VWAP
-            r.get("backTicks") or [],              # 7 list[int]
-            r.get("layTicks") or [],               # 8 list[int]
         ))
 
         feature_rows.append([feats.get(c, np.nan) for c in NUMERIC_FEATS])
@@ -256,61 +282,105 @@ def main():
 
     # combine all chunks → trades.csv
     trades_parts = sorted(outdir.glob("trades_part_*.parquet"))
-    if trades_parts:
-        all_trades = pl.concat([pl.read_parquet(p) for p in trades_parts], how="vertical_relaxed")
-        trades_csv = outdir / f"trades_{args.asof}.csv"
-        all_trades.write_csv(trades_csv)
-        for p in trades_parts: p.unlink(missing_ok=True)
+    if not trades_parts:
+        print("[simulate] no trades generated.")
+        return
 
-        # daily summary (+ ROI per day)
-        daily = (
-            all_trades
-            .with_columns(
-                pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
-                .dt.replace_time_zone("UTC").dt.date().cast(pl.Utf8).alias("day")
+    all_trades = pl.concat([pl.read_parquet(p) for p in trades_parts], how="vertical_relaxed")
+    for p in trades_parts: p.unlink(missing_ok=True)
+
+    # ----- JOIN RESULTS for settlement P&L -----
+    results_df = _load_results(curated, args.sport, start_dt, valid_end)
+    if results_df.height > 0:
+        all_trades = (
+            all_trades.join(
+                results_df,
+                on=["marketId","selectionId"],
+                how="left",
             )
-            .group_by("day","stake_mode")
-            .agg([
-                pl.len().alias("n_trades"),
-                pl.sum("exp_pnl").alias("exp_profit"),
-                pl.mean("ev_per_1").alias("avg_ev"),
-                pl.mean("stake_filled").alias("avg_stake_filled"),
-                pl.mean("fill_frac").alias("avg_fill_frac"),
-            ])
-            .with_columns(
-                (pl.col("exp_profit") / pl.lit(float(args.bankroll_nom))).alias("roi")
-            )
-            .sort("day")
+            .with_columns(pl.col("winLabel").fill_null(0).cast(pl.Int32))
         )
-        daily_csv = outdir / f"daily_{args.asof}.csv"
-        daily.write_csv(daily_csv)
+        # settlement P&L using exec odds ~= ltp at time of trade
+        # back: win -> (odds-1)*stake*(1-comm); lose -> -stake
+        # lay:  lose(win) -> -(odds-1)*stake; win(lose) -> +stake*(1-comm)
+        comm = float(args.commission)
 
-        # summary json (also include overall ROI + odds band + liquidity settings)
-        total_exp_profit = float(all_trades["exp_pnl"].sum())
-        summ = {
-            "asof": args.asof,
-            "start_date": args.start_date,
-            "valid_days": args.valid_days,
-            "preoff_max_minutes": args.preoff_max,
-            "commission": args.commission,
-            "edge_thresh": args.edge_thresh,
-            "ev_mode": args.ev_mode,
-            "odds_min": args.odds_min,
-            "odds_max": args.odds_max,
-            "stake_mode": args.stake_mode,
-            "kelly_cap": args.kelly_cap,
-            "kelly_floor": args.kelly_floor,
-            "bankroll_nom": args.bankroll_nom,
-            "liquidity_levels": args.liquidity_levels,
-            "enforce_liquidity": bool(args.enforce_liquidity),
-            "rows": int(all_trades.height),
-            "n_trades": int(all_trades.height),
-            "total_exp_profit": total_exp_profit,
-            "avg_ev_per_1": float(all_trades["ev_per_1"].mean()),
-            "overall_roi": (total_exp_profit / float(args.bankroll_nom)) if args.bankroll_nom else None,
-            "avg_fill_frac": float(all_trades["fill_frac"].mean()),
-        }
-        write_json(outdir / f"summary_{args.asof}.json", summ)
+        def _real_pnl_expr():
+            return (
+                pl.when(pl.col("side") == "back")
+                .then(
+                    pl.when(pl.col("winLabel") == 1)
+                    .then((pl.col("ltp") - 1.0) * pl.col("stake_filled") * (1.0 - comm))
+                    .otherwise(-pl.col("stake_filled"))
+                )
+                .otherwise(
+                    pl.when(pl.col("winLabel") == 1)
+                    .then(-(pl.col("ltp") - 1.0) * pl.col("stake_filled"))
+                    .otherwise(pl.col("stake_filled") * (1.0 - comm))
+                )
+            ).alias("real_pnl")
+        all_trades = all_trades.with_columns(_real_pnl_expr())
+    else:
+        all_trades = all_trades.with_columns(pl.lit(None, dtype=pl.Float64).alias("real_pnl"))
+
+    # write trades CSV
+    trades_csv = outdir / f"trades_{args.asof}.csv"
+    all_trades.write_csv(trades_csv)
+
+    # daily summary: expected vs realised
+    daily = (
+        all_trades
+        .with_columns(
+            pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
+            .dt.replace_time_zone("UTC").dt.date().cast(pl.Utf8).alias("day")
+        )
+        .group_by("day","stake_mode")
+        .agg([
+            pl.len().alias("n_trades"),
+            pl.sum("exp_pnl").alias("exp_profit"),
+            pl.sum("real_pnl").alias("real_profit"),
+            pl.mean("ev_per_1").alias("avg_ev"),
+            pl.mean("stake_filled").alias("avg_stake_filled"),
+            pl.mean("fill_frac").alias("avg_fill_frac"),
+        ])
+        .with_columns([
+            (pl.col("exp_profit")  / pl.lit(float(args.bankroll_nom))).alias("roi_exp"),
+            (pl.col("real_profit") / pl.lit(float(args.bankroll_nom))).alias("roi_real"),
+        ])
+        .sort("day")
+    )
+    daily_csv = outdir / f"daily_{args.asof}.csv"
+    daily.write_csv(daily_csv)
+
+    # summary json (overall exp vs realised)
+    total_exp_profit  = float(all_trades["exp_pnl"].sum())
+    total_real_profit = float(all_trades["real_pnl"].sum()) if all_trades["real_pnl"].dtype != pl.Null else None
+    summ = {
+        "asof": args.asof,
+        "start_date": args.start_date,
+        "valid_days": args.valid_days,
+        "preoff_max_minutes": args.preoff_max,
+        "commission": args.commission,
+        "edge_thresh": args.edge_thresh,
+        "ev_mode": args.ev_mode,
+        "odds_min": args.odds_min,
+        "odds_max": args.odds_max,
+        "stake_mode": args.stake_mode,
+        "kelly_cap": args.kelly_cap,
+        "kelly_floor": args.kelly_floor,
+        "bankroll_nom": args.bankroll_nom,
+        "liquidity_levels": args.liquidity_levels,
+        "enforce_liquidity": bool(args.enforce_liquidity),
+        "rows": int(all_trades.height),
+        "n_trades": int(all_trades.height),
+        "total_exp_profit": total_exp_profit,
+        "total_real_profit": total_real_profit,
+        "avg_ev_per_1": float(all_trades["ev_per_1"].mean()),
+        "overall_roi_exp": (total_exp_profit / float(args.bankroll_nom)) if args.bankroll_nom else None,
+        "overall_roi_real": (total_real_profit / float(args.bankroll_nom)) if (args.bankroll_nom and total_real_profit is not None) else None,
+        "avg_fill_frac": float(all_trades["fill_frac"].mean()),
+    }
+    write_json(outdir / f"summary_{args.asof}.json", summ)
 
 def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
     X = np.asarray(feature_rows, dtype=np.float32)
@@ -322,7 +392,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path):
     out = []
     commission = float(args.commission)
     for i, meta in enumerate(meta_rows):
-        (ts, mid, sid, ltp, p_now, back_sizes, lay_sizes, back_ticks, lay_ticks) = meta
+        ts, mid, sid, ltp, p_now, back_sizes, lay_sizes = meta
 
         dp = float(delta_pred[i])
         p_pred = p_now + dp
