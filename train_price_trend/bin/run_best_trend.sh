@@ -38,7 +38,6 @@ detect_threads() {
   fi
 }
 THREADS="$(detect_threads)"
-# leave a few cores free for IO/OS; floor at 2
 DEFAULT_MP=$(( THREADS > 8 ? THREADS - 4 : (THREADS > 2 ? THREADS - 1 : 2) ))
 MAX_PARALLEL="${MAX_PARALLEL:-$DEFAULT_MP}"
 
@@ -84,16 +83,16 @@ if [[ ! -f "$BEST_CFG" ]]; then
     --kelly-cap "${KELLY_CAP:-0.02}" \
     --kelly-floor "${KELLY_FLOOR:-0.001}" \
     --tag "$TAG"
-
-  if [[ ! -f "$BEST_CFG" ]]; then
-    echo "❌ AutoML finished but best_config.json not found: $BEST_CFG" >&2
-    exit 1
-  fi
 fi
 
 # ---------- jq required ----------
 if ! command -v jq >/dev/null 2>&1; then
   echo "❌ jq is required but not installed." >&2
+  exit 1
+fi
+
+if [[ ! -f "$BEST_CFG" ]]; then
+  echo "❌ best_config.json still not found at $BEST_CFG" >&2
   exit 1
 fi
 
@@ -111,7 +110,7 @@ export SPORT=$(jq -r '.sport' "$BEST_CFG")
 export PREOFF_MAX=$(jq -r '.preoff_max' "$BEST_CFG")
 export HORIZON_SECS=$(jq -r '.horizon_secs' "$BEST_CFG")
 export COMMISSION=$(jq -r '.commission' "$BEST_CFG")
-export DEVICE=$(jq -r '.device' "$BEST_CFG")        # training device used
+export DEVICE=$(jq -r '.device' "$BEST_CFG")
 export EV_MODE=$(jq -r '.ev_mode' "$BEST_CFG")
 export BANKROLL_NOM=$(jq -r '.bankroll_nom' "$BEST_CFG")
 export KELLY_CAP=$(jq -r '.kelly_cap' "$BEST_CFG")
@@ -134,3 +133,41 @@ export LIQUIDITY_LEVELS="$liq_levels"
 
 echo "[run_best_trend] ✅ Running backtest with best configuration (ASOF=$ASOF, TAG=$TAG)…"
 "$BIN_DIR/train_price_trend.sh" "$ASOF"
+
+# ---------- Cleanup old AutoML outputs ----------
+# Keeps the most recent N ASOF folders (default 3). Set DRY_RUN=1 to preview.
+KEEP_AUTOML_RUNS="${KEEP_AUTOML_RUNS:-3}"
+AUTOML_ROOT="$OUTDIR/automl"
+
+cleanup_automl() {
+  local root="$1"
+  local keep_n="$2"
+  local dry="${3:-0}"
+
+  [[ -d "$root" ]] || { echo "[cleanup] No automl dir at $root — skipping."; return; }
+
+  # List ASOF directories (YYYY-MM-DD), sorted ascending; keep the last N
+  mapfile -t ASOF_DIRS < <(ls -1 "$root" 2>/dev/null | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort)
+  local total="${#ASOF_DIRS[@]}"
+  if (( total <= keep_n )); then
+    echo "[cleanup] $total runs <= keep_n=$keep_n — nothing to remove."
+    return
+  fi
+
+  local to_delete=("${ASOF_DIRS[@]:0:total-keep_n}")
+  echo "[cleanup] Keeping last $keep_n runs; removing ${#to_delete[@]} older runs:"
+  for d in "${to_delete[@]}"; do
+    local path="$root/$d"
+    if [[ "$dry" == "1" ]]; then
+      echo "  DRY_RUN: rm -rf \"$path\""
+    else
+      echo "  rm -rf \"$path\""
+      rm -rf "$path" || echo "  WARN: failed to remove $path"
+    fi
+  done
+}
+
+echo "[cleanup] Pruning old AutoML outputs under $AUTOML_ROOT (keep $KEEP_AUTOML_RUNS)…"
+cleanup_automl "$AUTOML_ROOT" "$KEEP_AUTOML_RUNS" "${DRY_RUN:-0}"
+
+echo "[run_best_trend] Done."
