@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ASOF="${1:?usage: train_price_trend.sh YYYY-MM-DD}"
+# ---------- ASOF date (defaults to yesterday) ----------
+if [[ $# -ge 1 ]]; then
+  ASOF="$1"
+else
+  # Linux (GNU date)
+  if date -d "yesterday" +%Y-%m-%d >/dev/null 2>&1; then
+    ASOF="$(date -d "yesterday" +%Y-%m-%d)"
+  # macOS / BSD date
+  elif date -v-1d +%Y-%m-%d >/dev/null 2>&1; then
+    ASOF="$(date -v-1d +%Y-%m-%d)"
+  # GNU coreutils 'gdate' (sometimes on mac via brew)
+  elif command -v gdate >/dev/null 2>&1; then
+    ASOF="$(gdate -d "yesterday" +%Y-%m-%d)"
+  else
+    echo "ERROR: can't compute 'yesterday' (need GNU date or BSD date). Provide ASOF explicitly." >&2
+    exit 1
+  fi
+fi
+
 CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
 
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "$BIN_DIR/.." && pwd)"
 
+# ---------- Defaults (override via env) ----------
 START_DATE="${START_DATE:-2025-09-05}"
 VALID_DAYS="${VALID_DAYS:-7}"
 SPORT="${SPORT:-horse-racing}"
@@ -24,13 +43,15 @@ BANKROLL_NOM="${BANKROLL_NOM:-5000}"
 
 EV_MODE="${EV_MODE:-mtm}"
 
-# NEW: optional odds band + liquidity
+# Optional odds band + liquidity (off by default)
 ODDS_MIN="${ODDS_MIN:-}"
 ODDS_MAX="${ODDS_MAX:-}"
 ENFORCE_LIQUIDITY="${ENFORCE_LIQUIDITY:-0}"     # set to 1 to enable
 LIQUIDITY_LEVELS="${LIQUIDITY_LEVELS:-1}"
 
 OUTDIR="${OUTDIR:-$BASE_DIR/output}"
+
+MODEL_PATH="$OUTDIR/models/xgb_trend_reg.json"
 
 echo "=== Price Trend Training ==="
 echo "Curated root:    $CURATED_ROOT"
@@ -43,11 +64,10 @@ echo "Stake mode:      $STAKE (cap=$KELLY_CAP floor=$KELLY_FLOOR)"
 echo "EV mode:         $EV_MODE"
 echo "Odds band:       ${ODDS_MIN:--} .. ${ODDS_MAX:--}"
 echo "Liquidity:       enforce=${ENFORCE_LIQUIDITY} levels=${LIQUIDITY_LEVELS}"
+echo "Device:          $DEVICE"
 echo "Output dir:      $OUTDIR"
 
-MODEL_PATH="$OUTDIR/models/xgb_trend_reg.json"
-
-# Train unless model exists or FORCE_TRAIN=1
+# ---------- Train (skip if model exists and FORCE_TRAIN!=1) ----------
 if [[ "${FORCE_TRAIN:-0}" == "1" || ! -f "$MODEL_PATH" ]]; then
   python3 "$BASE_DIR/ml/train_price_trend.py" \
     --curated "$CURATED_ROOT" \
@@ -69,6 +89,7 @@ else
   echo "Model exists at $MODEL_PATH — skipping training (set FORCE_TRAIN=1 to retrain)."
 fi
 
+# ---------- Simulate (stream backtest) ----------
 echo "=== Streaming Backtest ==="
 echo "EV threshold:    $EDGE_THRESH per £1"
 
