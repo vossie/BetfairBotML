@@ -36,7 +36,7 @@ NUMERIC_FEATS = [
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Streaming backtest (column-pruned scans, VWAP/liquidity with fallback, MTM/settlement P&L)."
+        description="Streaming backtest (EV rescaling, liquidity VWAP, MTM/settlement P&L; no temp parquet)."
     )
     # Core
     p.add_argument("--curated", required=True)
@@ -52,6 +52,8 @@ def parse_args():
     p.add_argument("--edge-thresh", type=float, default=0.002)
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
     p.add_argument("--ev-cap", type=float, default=1.0, help="clip EV per £1 to [-cap,+cap] to avoid outliers in ranking")
+    # EV rescaling (applied BEFORE threshold and P&L)
+    p.add_argument("--ev-scale", type=float, default=1.0, help="multiply EV per £1 by this factor pre-threshold; use auto-suggest to tune")
 
     # Staking
     p.add_argument("--stake-mode", choices=["flat","kelly"], default="kelly")
@@ -63,9 +65,11 @@ def parse_args():
     p.add_argument("--odds-min", type=float, default=None)
     p.add_argument("--odds-max", type=float, default=None)
 
-    # Liquidity / VWAP (falls back automatically if book arrays missing)
+    # Liquidity / VWAP
     p.add_argument("--liquidity-levels", type=int, default=1)
     p.add_argument("--enforce-liquidity", action="store_true")
+    p.add_argument("--require-book", action="store_true", help="if set w/ enforce-liquidity, drop trades when book arrays are missing")
+    p.add_argument("--min-fill-frac", type=float, default=0.0, help="drop trade if filled < this fraction (e.g., 0.25)")
 
     # Runtime / I/O
     p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
@@ -181,7 +185,6 @@ def _load_results(curated_root: Path, sport: str, start_dt, end_dt) -> pl.DataFr
         )
     if not lfs:
         return pl.DataFrame({"marketId": [], "selectionId": [], "winLabel": []})
-    # no deprecated streaming flag
     return pl.concat(lfs, how="vertical_relaxed").unique().collect()
 
 def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
@@ -218,7 +221,6 @@ def main():
         cols += ["backTicks","backSizes","layTicks","laySizes"]
 
     lf = read_snapshots(curated, start_dt, valid_end, args.sport)
-    # cheap schema list; avoids PerformanceWarning
     schema_names = set(lf.collect_schema().names())
     present = [c for c in cols if c in schema_names]
     lf = lf.select(present).with_columns([ time_to_off_minutes_expr() ])
@@ -236,10 +238,19 @@ def main():
     book_available = _has_book_columns(df)
     effective_enforce = bool(args.enforce_liquidity and book_available)
     if args.enforce_liquidity and not book_available:
-        print("[simulate] NOTE: depth columns (back/lay ticks/sizes) not found; "
-              "falling back to LTP exec/exit and disabling liquidity enforcement.")
+        msg = "[simulate] NOTE: depth columns missing; "
+        if args.require_book:
+            msg += "require-book=on → dropping ALL trades (no liquidity info)."
+        else:
+            msg += "falling back to LTP exec/exit and disabling liquidity enforcement."
+        print(msg)
     print(f"[simulate] Liquidity: requested={'on' if args.enforce_liquidity else 'off'}, "
-          f"effective={'on' if effective_enforce else 'off'}")
+          f"effective={'on' if effective_enforce else 'off'}; require_book={'on' if args.require_book else 'off'}")
+
+    # If require-book and not available → empty run
+    if args.enforce_liquidity and args.require_book and not book_available:
+        _write_empty(outdir, args)
+        return
 
     # Sort for streaming + build exit table
     df = df.sort(["marketId","selectionId","publishTimeMs"])
@@ -247,7 +258,6 @@ def main():
 
     # ----- Model (+ optional calibrator) -----
     bst = xgb.Booster(); bst.load_model(args.model_path)
-    # prediction device hint; ignore if unused
     try:
         bst.set_param({"device": args.device})
     except Exception:
@@ -301,11 +311,7 @@ def main():
 
     if not all_records:
         print("[simulate] no trades generated.")
-        daily = pl.DataFrame({"day": [], "stake_mode": [], "n_trades": [], "exp_profit": [], "avg_ev": [],
-                              "avg_stake_filled": [], "avg_fill_frac": [], "real_mtm_profit": [], "real_settle_profit": [],
-                              "roi_exp": [], "roi_real_mtm": [], "roi_real_settle": []})
-        daily.write_csv(Path(args.output_dir) / f"daily_{args.asof}.csv")
-        write_json(Path(args.output_dir) / f"summary_{args.asof}.json", {"n_trades": 0})
+        _write_empty(outdir, args)
         return
 
     trades = pl.concat(all_records, how="vertical_relaxed")
@@ -327,15 +333,18 @@ def main():
     ).with_columns(
         pl.col("ltp_exit_proxy").alias("exit_odds")
     ).drop(["ts_dt","ts_exit_dt","ltp_exit_proxy"]).filter(
-        # keep only valid exits to avoid inf/NaN MTM
         pl.col("exit_odds").is_not_null() & (pl.col("exit_odds") > 1.01)
     )
 
-    # Clip EV to avoid dominance by outliers
+    # Enforce min fill fraction if requested
+    if args.min_fill_frac > 0:
+        trades2 = trades2.filter(pl.col("fill_frac") >= float(args.min_fill_frac))
+
+    # Clip EV, then apply EV scaling (prethreshold already happened in process_batch)
     EV_CAP = float(args.ev_cap)
     trades2 = trades2.with_columns(pl.col("ev_per_1").clip(-EV_CAP, EV_CAP))
 
-    # Realised MTM P&L (guarded)
+    # Realised MTM P&L (finite guard)
     trades2 = trades2.with_columns([
         pl.when(pl.col("side") == "back")
           .then(((pl.col("exec_odds") / pl.col("exit_odds")) - 1.0) * pl.col("stake_filled"))
@@ -397,21 +406,22 @@ def main():
     daily.write_csv(daily_csv)
 
     # Summary + ROI for the run (finite-safe)
-    def _finite_sum(s):
-        try:
-            v = float(pl.when(pl.col(s).is_finite()).then(pl.col(s)).otherwise(None).alias("_").fill_null(0.0).select(pl.col("_").sum()).to_numpy()[0][0])
-        except Exception:
-            v = float(trades2[s].fill_null(0.0).sum())
-        return v
-
     total_exp_profit   = float(trades2["exp_pnl"].fill_null(0.0).sum())
     avg_ev             = float(trades2["ev_per_1"].mean())
-    total_real_mtm     = _finite_sum("real_mtm_pnl")
-    total_real_settle  = _finite_sum("real_settle_pnl")
+    total_real_mtm     = float(trades2["real_mtm_pnl"].fill_null(0.0).sum())
+    total_real_settle  = float(trades2["real_settle_pnl"].fill_null(0.0).sum())
 
     roi_exp = (total_exp_profit / float(args.bankroll_nom)) if args.bankroll_nom else None
     roi_real_mtm = (total_real_mtm / float(args.bankroll_nom)) if args.bankroll_nom else None
     roi_real_settle = (total_real_settle / float(args.bankroll_nom)) if args.bankroll_nom else None
+
+    # Auto-suggest EV scale α = real_pnl / expected_pnl_raw (using MTM/settlement depending on ev_mode)
+    raw_exp_sum = float(trades2["exp_pnl_raw"].fill_null(0.0).sum()) if "exp_pnl_raw" in trades2.columns else None
+    if raw_exp_sum and abs(raw_exp_sum) > 1e-9:
+        target_real = total_real_mtm if args.ev_mode == "mtm" else total_real_settle
+        suggested_scale = target_real / raw_exp_sum
+    else:
+        suggested_scale = None
 
     summ = {
         "asof": args.asof,
@@ -422,6 +432,8 @@ def main():
         "commission": args.commission,
         "edge_thresh": args.edge_thresh,
         "ev_mode": args.ev_mode,
+        "ev_cap": args.ev_cap,
+        "ev_scale_used": args.ev_scale,
         "odds_min": args.odds_min,
         "odds_max": args.odds_max,
         "stake_mode": args.stake_mode,
@@ -431,6 +443,8 @@ def main():
         "liquidity_levels": args.liquidity_levels,
         "enforce_liquidity_requested": bool(args.enforce_liquidity),
         "enforce_liquidity_effective": bool(effective_enforce),
+        "require_book": bool(args.require_book),
+        "min_fill_frac": args.min_fill_frac,
         "n_trades": int(trades2.height),
         "total_exp_profit": total_exp_profit,
         "avg_ev_per_1": avg_ev,
@@ -439,15 +453,21 @@ def main():
         "overall_roi_exp": roi_exp,
         "overall_roi_real_mtm": roi_real_mtm,
         "overall_roi_real_settle": roi_real_settle,
+        "ev_scale_suggested": suggested_scale,
     }
     write_json(Path(args.output_dir) / f"summary_{args.asof}.json", summ)
 
     # Console prints
-    def _fmt(x): return "n/a" if x is None or (isinstance(x,float) and (np.isnan(x) or np.isinf(x))) else f"{x:.6f}"
+    def _fmt(x):
+        if x is None or (isinstance(x,float) and (np.isnan(x) or np.isinf(x))):
+            return "n/a"
+        return f"{x:.6f}"
     print(f"[simulate] ROI (exp)        : {_fmt(roi_exp)}")
     print(f"[simulate] ROI (real MTM)   : {_fmt(roi_real_mtm)}")
     print(f"[simulate] ROI (settlement) : {_fmt(roi_real_settle)}")
-    print(f"[simulate] Trades: {summ['n_trades']:,}  Avg EV/£1: {avg_ev:.6f}")
+    print(f"[simulate] Trades: {summ['n_trades']:,}  Avg EV/£1 (scaled): {avg_ev:.6f}")
+    if suggested_scale is not None:
+        print(f"[simulate] Suggested --ev-scale ≈ {suggested_scale:.6g} (based on {args.ev_mode} PnL)")
 
 def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce: bool) -> pl.DataFrame:
     X = np.asarray(feature_rows, dtype=np.float32)
@@ -460,6 +480,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
 
     out = []
     commission = float(args.commission)
+    scale = float(args.ev_scale)
 
     for i, meta in enumerate(meta_rows):
         ts_ms, mid, sid, ltp_now, p_now, back_ticks, back_sizes, lay_ticks, lay_sizes = meta
@@ -477,9 +498,12 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
         if side == "none":
             continue
 
-        # EV per £1
-        ev_per_1 = _ev_mtm(p_now, p_pred, commission, side) if args.ev_mode == "mtm" \
-                   else _ev_settlement(p_pred, ltp_now, commission, side)
+        # Raw EV per £1 (unscaled)
+        ev_raw = _ev_mtm(p_now, p_pred, commission, side) if args.ev_mode == "mtm" \
+                 else _ev_settlement(p_pred, ltp_now, commission, side)
+
+        # Apply EV scaling BEFORE thresholding
+        ev_per_1 = ev_raw * scale
         if ev_per_1 < args.edge_thresh:
             continue
 
@@ -500,6 +524,9 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             avail_sizes = back_sizes if side == "back" else lay_sizes
             avail_ticks = back_ticks if side == "back" else lay_ticks
             stake_filled, exec_vwap = _vwap_fill(side, avail_ticks, avail_sizes, stake_req, args.liquidity_levels)
+        elif args.enforce_liquidity and args.require_book:
+            # enforcement requested and book required, but not available here → drop
+            continue
         else:
             stake_filled = stake_req
             exec_vwap = float(ltp_now)
@@ -508,12 +535,14 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             continue
 
         fill_frac = stake_filled / stake_req if stake_req > 0 else 1.0
-        exp_pnl = ev_per_1 * stake_filled
+        exp_pnl_raw = ev_raw * stake_filled   # for auto scale suggestion
+        exp_pnl = ev_per_1 * stake_filled     # scaled EV pnl used in summaries
 
         out.append((
             int(ts_ms), str(mid), int(sid),
             float(ltp_now), float(p_now), float(p_pred), float(dp), str(side), float(ev_per_1),
-            float(stake_req), float(stake_filled), float(fill_frac), float(exec_vwap), float(exp_pnl), str(args.stake_mode),
+            float(stake_req), float(stake_filled), float(fill_frac), float(exec_vwap),
+            float(exp_pnl), float(exp_pnl_raw), str(args.stake_mode),
         ))
 
     if not out:
@@ -522,7 +551,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             "ltp": pl.Float64, "p_now": pl.Float64, "p_pred": pl.Float64, "delta_pred": pl.Float64,
             "side": pl.Utf8, "ev_per_1": pl.Float64,
             "stake_req": pl.Float64, "stake_filled": pl.Float64, "fill_frac": pl.Float64,
-            "exec_odds": pl.Float64, "exp_pnl": pl.Float64, "stake_mode": pl.Utf8
+            "exec_odds": pl.Float64, "exp_pnl": pl.Float64, "exp_pnl_raw": pl.Float64, "stake_mode": pl.Utf8
         })
 
     df = pl.DataFrame(
@@ -541,12 +570,24 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             "stake_filled": pl.Float64,
             "fill_frac": pl.Float64,
             "exec_odds": pl.Float64,
-            "exp_pnl": pl.Float64,
+            "exp_pnl": pl.Float64,        # scaled
+            "exp_pnl_raw": pl.Float64,    # pre-scale
             "stake_mode": pl.Utf8,
         },
         orient="row",
     )
     return df
+
+def _write_empty(outdir: Path, args):
+    daily = pl.DataFrame({"day": [], "stake_mode": [], "n_trades": [], "exp_profit": [], "avg_ev": [],
+                          "avg_stake_filled": [], "avg_fill_frac": [], "real_mtm_profit": [], "real_settle_profit": [],
+                          "roi_exp": [], "roi_real_mtm": [], "roi_real_settle": []})
+    daily.write_csv(outdir / f"daily_{args.asof}.csv")
+    write_json(outdir / f"summary_{args.asof}.json", {
+        "asof": args.asof, "n_trades": 0, "ev_scale_used": args.ev_scale,
+        "enforce_liquidity_requested": bool(args.enforce_liquidity),
+        "require_book": bool(args.require_book)
+    })
 
 if __name__ == "__main__":
     main()
