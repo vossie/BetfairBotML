@@ -315,7 +315,6 @@ def main():
         df_trans = df.with_columns(
             pl.when(pl.col(col).is_null()).then(pl.lit(-1e18)).otherwise(pl.col(col)).alias(sc)
         )
-        nonlocal df
         df = df_trans
         return sc
 
