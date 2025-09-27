@@ -310,29 +310,30 @@ def main():
 
     # 5) Ranking: prefer settlement ROI, fallback to MTM, then expected, then exp profit
     # Build sorted score columns (nulls -> very small)
-    def scoreify(col: str) -> str:
-        sc = f"_{col}_score"
-        df_trans = df.with_columns(
-            pl.when(pl.col(col).is_null()).then(pl.lit(-1e18)).otherwise(pl.col(col)).alias(sc)
-        )
-        df = df_trans
-        return sc
 
-    order = []
+    score_cols = []
     if args.prefer == "settlement" and "overall_roi_real_settle" in df.columns:
-        order.append(scoreify("overall_roi_real_settle"))
-        if "overall_roi_real_mtm" in df.columns: order.append(scoreify("overall_roi_real_mtm"))
+        score_cols += ["overall_roi_real_settle"]
+        if "overall_roi_real_mtm" in df.columns:
+            score_cols += ["overall_roi_real_mtm"]
     elif args.prefer == "mtm" and "overall_roi_real_mtm" in df.columns:
-        order.append(scoreify("overall_roi_real_mtm"))
-        if "overall_roi_real_settle" in df.columns: order.append(scoreify("overall_roi_real_settle"))
+        score_cols += ["overall_roi_real_mtm"]
+        if "overall_roi_real_settle" in df.columns:
+            score_cols += ["overall_roi_real_settle"]
     else:
-        if "overall_roi_real_settle" in df.columns: order.append(scoreify("overall_roi_real_settle"))
-        if "overall_roi_real_mtm" in df.columns: order.append(scoreify("overall_roi_real_mtm"))
+        if "overall_roi_real_settle" in df.columns:
+            score_cols += ["overall_roi_real_settle"]
+        if "overall_roi_real_mtm" in df.columns:
+            score_cols += ["overall_roi_real_mtm"]
+    score_cols += ["overall_roi_exp", "total_exp_profit"]
 
-    order.append(scoreify("overall_roi_exp"))
-    order.append(scoreify("total_exp_profit"))
-
-    df = df.sort(by=order, descending=[True]*len(order))
+    for c in score_cols:
+        if c in df.columns:
+            df = df.with_columns(
+                pl.when(pl.col(c).is_null()).then(pl.lit(-1e18)).otherwise(pl.col(c)).alias(f"__{c}_score")
+            )
+    sort_by = [f"__{c}_score" for c in score_cols if f"__{c}_score" in df.columns]
+    df = df.sort(by=sort_by, descending=[True]*len(sort_by))
 
     trials_path = automl_root / f"trials_{args.asof}.csv"
     df.write_csv(trials_path)
