@@ -239,6 +239,14 @@ def _prepare_exit_prices(df_snap: pl.DataFrame, horizon_secs: int) -> pl.DataFra
 def main():
     args = parse_args()
     outdir = Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
+
+    # NEW: ensure no stale parts from previous schema versions
+    for _p in outdir.glob("trades_part_*.parquet"):
+        try:
+            _p.unlink()
+        except Exception:
+            pass
+
     curated = Path(args.curated)
 
     asof_dt = parse_date(args.asof)
@@ -332,7 +340,41 @@ def main():
     if not trades_parts:
         print("[simulate] no trades generated.")
         return
-    trades = pl.concat([pl.read_parquet(p) for p in trades_parts], how="vertical_relaxed")
+
+    # target schema (must match what you write in process_batch)
+    TARGET_SCHEMA = {
+        "publishTimeMs": pl.Int64,
+        "marketId": pl.Utf8,
+        "selectionId": pl.Int64,
+        "ltp": pl.Float64,
+        "p_now": pl.Float64,
+        "p_pred": pl.Float64,
+        "delta_pred": pl.Float64,
+        "side": pl.Utf8,
+        "ev_per_1": pl.Float64,
+        "stake_req": pl.Float64,
+        "stake_filled": pl.Float64,
+        "fill_frac": pl.Float64,
+        "exec_odds": pl.Float64,
+        "exp_pnl": pl.Float64,
+        "stake_mode": pl.Utf8,
+    }
+
+    aligned = []
+    for p in trades_parts:
+        dfp = pl.read_parquet(p)
+        # add any missing columns as nulls, cast present ones
+        for col, dtype in TARGET_SCHEMA.items():
+            if col not in dfp.columns:
+                dfp = dfp.with_columns(pl.lit(None, dtype=dtype).alias(col))
+            else:
+                dfp = dfp.with_columns(pl.col(col).cast(dtype, strict=False))
+        # drop any extra columns and order consistently
+        dfp = dfp.select(list(TARGET_SCHEMA.keys()))
+        aligned.append(dfp)
+
+    trades = pl.concat(aligned, how="vertical_relaxed")
+
     for p in trades_parts: p.unlink(missing_ok=True)
 
     # EXIT at t+H (asof join, forward)
