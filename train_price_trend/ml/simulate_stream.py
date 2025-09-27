@@ -36,7 +36,7 @@ FEATURES_WITH_COUNTRY = BASE_FEATS + ["is_gb","country_freq"]
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Streaming backtest with per-market portfolioing, EV rescaling, liquidity VWAP, and MTM/settlement P&L."
+        description="Streaming backtest with portfolioing, liquidity VWAP, contra leg, MTM/settlement P&L, and daily ROI."
     )
     # Data/time
     p.add_argument("--curated", required=True)
@@ -73,12 +73,20 @@ def parse_args():
     p.add_argument("--min-fill-frac", type=float, default=0.0)
 
     # Per-market portfolioing (price-move dutching)
-    p.add_argument("--per-market-topk", type=int, default=2, help="Max runners per market per decision time (side-aware).")
-    p.add_argument("--per-market-budget", type=float, default=50.0, help="£ cap across chosen runners in a market at a timestamp.")
+    p.add_argument("--per-market-topk", type=int, default=2, help="Max runners per market/time (side-aware).")
+    p.add_argument("--per-market-budget", type=float, default=50.0, help="£ cap across chosen runners in a market/time.")
     p.add_argument("--basket-sizing", choices=["equal_ev","inverse_ev","fractional_kelly"], default="equal_ev",
                    help="How to allocate the per-market budget across chosen runners.")
     p.add_argument("--exit-on-move-ticks", type=int, default=0,
-                   help="If >0, exit early when price moves N ticks in the predicted direction; else fixed horizon exit.")
+                   help="If >0, mark if price moved N ticks in the profitable direction before horizon.")
+
+    # Contra leg controls
+    p.add_argument("--contra-mode", choices=["off","prob","always"], default="off",
+                   help="off=no contra; prob=place contra only if swing_prob≥thresh; always=always place contra.")
+    p.add_argument("--contra-frac", type=float, default=0.25, help="Stake fraction for contra vs primary filled stake.")
+    p.add_argument("--contra-hold-secs", type=int, default=300, help="Extra holding time for contra leg.")
+    p.add_argument("--contra-prob-thresh", type=float, default=0.65, help="Swing probability threshold for contra.")
+    p.add_argument("--contra-beta", type=float, default=80.0, help="Sensitivity for swing prob: swing_prob=exp(-beta*|dp|).")
 
     # Runtime / model / output
     p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
@@ -227,6 +235,11 @@ def _basket_weights(cands: List[Dict[str, Any]], mode: str) -> List[float]:
     if s <= 0: return [1.0 / len(cands)] * len(cands)
     return list(w / s)
 
+def _swing_prob(dp: float, beta: float) -> float:
+    # Heuristic: larger |dp| -> lower swing probability; small |dp| -> more likely to oscillate
+    # swing_prob in (0,1): exp(-beta * |dp|)
+    return float(np.exp(-float(beta) * abs(float(dp))))
+
 def main():
     args = parse_args()
     outdir = Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
@@ -339,34 +352,28 @@ def main():
             cand_buf.pop(key, None)
             return []
 
-        # Compute Kelly fraction only if needed for sizing
+        # Kelly fraction only if needed
         need_kelly = (args.stake_mode == "kelly") or (args.basket_sizing == "fractional_kelly")
         if need_kelly:
             for c in picks:
-                if c["side"] == "back":
-                    kf = kelly_fraction_back(c["p_pred"], c["ltp"], args.commission)
-                else:
-                    kf = kelly_fraction_lay(c["p_pred"], c["ltp"], args.commission)
+                kf = kelly_fraction_back(c["p_pred"], c["ltp"], args.commission) if c["side"] == "back" \
+                     else kelly_fraction_lay (c["p_pred"], c["ltp"], args.commission)
                 c["kelly_frac"] = max(args.kelly_floor, min(args.kelly_cap, kf))
         else:
-            for c in picks:
-                c["kelly_frac"] = 0.0
+            for c in picks: c["kelly_frac"] = 0.0
 
         # Basket sizing
         budget = float(args.per_market_budget)
         weights = _basket_weights(picks, args.basket_sizing)
 
         # Stakes requested
-        if args.stake_mode == "kelly":
-            stakes_req = [budget * w for w in weights]
-        else:
-            stakes_req = [budget * w for w in weights]
+        stakes_req = [budget * w for w in weights]  # both flat and kelly use market budget distribution
 
-        # Liquidity-aware execution per pick
         realized = []
         for c, stake_req in zip(picks, stakes_req):
             if stake_req <= 0:
                 continue
+            # Execute primary
             if effective_enforce and c["has_book"]:
                 avail_ticks = c["backTicks"] if c["side"] == "back" else c["layTicks"]
                 avail_sizes = c["backSizes"] if c["side"] == "back" else c["laySizes"]
@@ -387,7 +394,7 @@ def main():
             exp_pnl_raw = c["ev_raw"] * stake_filled
             exp_pnl     = c["ev_per_1"] * stake_filled
 
-            realized.append({
+            primary_rec = {
                 "publishTimeMs": c["ts_ms"],
                 "marketId": c["marketId"],
                 "selectionId": c["selectionId"],
@@ -396,6 +403,7 @@ def main():
                 "p_pred": c["p_pred"],
                 "delta_pred": c["dp"],
                 "side": c["side"],
+                "is_contra": 0,
                 "ev_per_1": c["ev_per_1"],
                 "stake_req": float(stake_req),
                 "stake_filled": float(stake_filled),
@@ -404,7 +412,55 @@ def main():
                 "exp_pnl": float(exp_pnl),
                 "exp_pnl_raw": float(exp_pnl_raw),
                 "stake_mode": args.stake_mode,
-            })
+                # Primary exit at main horizon:
+                "ts_exit_ms": int(c["ts_ms"] + args.horizon_secs * 1000),
+            }
+            realized.append(primary_rec)
+
+            # Optionally place contra
+            place_contra = False
+            if args.contra_mode == "always":
+                place_contra = True
+            elif args.contra_mode == "prob":
+                sp = _swing_prob(c["dp"], args.contra_beta)
+                place_contra = (sp >= float(args.contra_prob_thresh))
+
+            if place_contra:
+                contra_side = "lay" if c["side"] == "back" else "back"
+                contra_req  = float(args.contra_frac) * float(stake_filled)
+                if contra_req > 0:
+                    if effective_enforce and c["has_book"]:
+                        avail_ticks = c["layTicks"] if contra_side == "lay" else c["backTicks"]
+                        avail_sizes = c["laySizes"] if contra_side == "lay" else c["backSizes"]
+                        contra_filled, contra_vwap = _vwap_fill(contra_side, avail_ticks, avail_sizes, contra_req, args.liquidity_levels)
+                    elif args.enforce_liquidity and args.require_book:
+                        contra_filled, contra_vwap = 0.0, None
+                    else:
+                        contra_filled, contra_vwap = contra_req, float(c["ltp"])
+
+                    if contra_filled > 0 and contra_vwap is not None:
+                        contra_rec = {
+                            "publishTimeMs": c["ts_ms"],
+                            "marketId": c["marketId"],
+                            "selectionId": c["selectionId"],
+                            "ltp": c["ltp"],
+                            "p_now": c["p_now"],
+                            "p_pred": c["p_pred"],
+                            "delta_pred": c["dp"],
+                            "side": contra_side,
+                            "is_contra": 1,
+                            "ev_per_1": c["ev_per_1"],  # reported; EV applies to primary signal context
+                            "stake_req": float(contra_req),
+                            "stake_filled": float(contra_filled),
+                            "fill_frac": float(contra_filled/contra_req if contra_req>1e-9 else 1.0),
+                            "exec_odds": float(contra_vwap),
+                            "exp_pnl": 0.0,           # neutral: we don't add EV for contra (pure swing expression)
+                            "exp_pnl_raw": 0.0,
+                            "stake_mode": args.stake_mode,
+                            # Contra exit at extended horizon:
+                            "ts_exit_ms": int(c["ts_ms"] + (args.horizon_secs + args.contra_hold_secs) * 1000),
+                        }
+                        realized.append(contra_rec)
 
         cand_buf.pop(key, None)
         return realized
@@ -440,9 +496,6 @@ def main():
         p_now = 1.0 / max(1e-12, float(r["ltp"]))
         p_pred = p_now + dp
         p_pred = 0.0 if p_pred < 0.0 else (1.0 if p_pred > 1.0 else p_pred)
-
-        # (optional) calibrator
-        # if calibrator is not None: p_pred = float(calibrator.transform(np.array([p_pred]))[0])
 
         side = "back" if dp > 0 else ("lay" if dp < 0 else "none")
         if side == "none":
@@ -500,13 +553,18 @@ def main():
 
     trades = pl.concat(trades_records, how="vertical_relaxed")
 
-    # Exit price joining
+    # Exit price joining (use per-row ts_exit_ms if present, else default horizon)
+    if "ts_exit_ms" not in trades.columns:
+        trades = trades.with_columns(
+            (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit_ms")
+        )
+
     trades = trades.with_columns([
-        (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit_ms"),
         pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64)), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_dt"),
-        pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_exit_dt"),
+        pl.from_epoch(pl.col("ts_exit_ms").cast(pl.Int64), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_exit_dt"),
     ])
-    exit_df = exit_df.sort(["marketId","selectionId","ts_dt"])
+
+    exit_df = _prepare_exit_prices(df).sort(["marketId","selectionId","ts_dt"])
     trades_sorted = trades.sort(["marketId","selectionId","ts_exit_dt"])
     trades2 = trades_sorted.join_asof(
         exit_df,
@@ -520,7 +578,7 @@ def main():
         pl.col("exit_odds").is_not_null() & (pl.col("exit_odds") > 1.01)
     )
 
-    # Optional tick-target annotation
+    # Optional tick-target annotation on primary only
     if int(args.exit_on_move_ticks) > 0:
         n_ticks = int(args.exit_on_move_ticks)
         trades2 = trades2.with_columns([
@@ -573,7 +631,7 @@ def main():
         trades_path = Path(args.output_dir) / f"trades_{args.asof}.parquet"
         trades2.write_parquet(trades_path)
 
-    # Daily summary with ROI
+    # Daily summary with ROI (primary and contra combined)
     daily = (
         trades2
         .with_columns(
@@ -589,6 +647,7 @@ def main():
             pl.mean("fill_frac").alias("avg_fill_frac"),
             pl.sum("real_mtm_pnl").alias("real_mtm_profit"),
             pl.sum("real_settle_pnl").alias("real_settle_profit"),
+            pl.mean("is_contra").alias("share_contra"),
         ])
         .with_columns([
             (pl.col("exp_profit")        / pl.lit(float(args.bankroll_nom))).alias("roi_exp"),
@@ -611,11 +670,10 @@ def main():
     roi_real_settle = (total_real_settle / float(args.bankroll_nom)) if args.bankroll_nom else None
 
     raw_exp_sum = float(trades2["exp_pnl_raw"].fill_null(0.0).sum()) if "exp_pnl_raw" in trades2.columns else None
+    suggested_scale = None
     if raw_exp_sum and abs(raw_exp_sum) > 1e-9:
         target_real = total_real_mtm if args.ev_mode == "mtm" else total_real_settle
         suggested_scale = target_real / raw_exp_sum
-    else:
-        suggested_scale = None
 
     summ = {
         "asof": args.asof,
@@ -643,6 +701,12 @@ def main():
         "per_market_budget": args.per_market_budget,
         "basket_sizing": args.basket_sizing,
         "exit_on_move_ticks": args.exit_on_move_ticks,
+        "contra_mode": args.contra_mode,
+        "contra_frac": args.contra_frac,
+        "contra_hold_secs": args.contra_hold_secs,
+        "contra_prob_thresh": args.contra_prob_thres
+        if hasattr(args,"contra_prob_thres") else args.contra_prob_thresh,
+        "contra_beta": args.contra_beta,
         "n_trades": int(trades2.height),
         "total_exp_profit": total_exp_profit,
         "avg_ev_per_1": avg_ev,
@@ -679,6 +743,7 @@ def _to_df(records: List[Dict[str, Any]]) -> pl.DataFrame:
             "p_pred": pl.Float64,
             "delta_pred": pl.Float64,
             "side": pl.Utf8,
+            "is_contra": pl.Int8,
             "ev_per_1": pl.Float64,
             "stake_req": pl.Float64,
             "stake_filled": pl.Float64,
@@ -687,6 +752,7 @@ def _to_df(records: List[Dict[str, Any]]) -> pl.DataFrame:
             "exp_pnl": pl.Float64,
             "exp_pnl_raw": pl.Float64,
             "stake_mode": pl.Utf8,
+            "ts_exit_ms": pl.Int64,
         },
         orient="row",
     )
@@ -694,12 +760,14 @@ def _to_df(records: List[Dict[str, Any]]) -> pl.DataFrame:
 def _write_empty(outdir: Path, args):
     daily = pl.DataFrame({"day": [], "stake_mode": [], "n_trades": [], "exp_profit": [], "avg_ev": [],
                           "avg_stake_filled": [], "avg_fill_frac": [], "real_mtm_profit": [], "real_settle_profit": [],
-                          "roi_exp": [], "roi_real_mtm": [], "roi_real_settle": []})
+                          "roi_exp": [], "roi_real_mtm": [], "roi_real_settle": [], "share_contra": []})
     daily.write_csv(outdir / f"daily_{args.asof}.csv")
     write_json(outdir / f"summary_{args.asof}.json", {
         "asof": args.asof, "n_trades": 0, "ev_scale_used": args.ev_scale,
         "per_market_topk": args.per_market_topk, "per_market_budget": args.per_market_budget,
         "basket_sizing": args.basket_sizing, "exit_on_move_ticks": args.exit_on_move_ticks,
+        "contra_mode": args.contra_mode, "contra_frac": args.contra_frac,
+        "contra_hold_secs": args.contra_hold_secs, "contra_prob_thresh": args.contra_prob_thresh,
         "enforce_liquidity_requested": bool(args.enforce_liquidity),
         "require_book": bool(args.require_book),
         "features_used": FEATURES_WITH_COUNTRY,
