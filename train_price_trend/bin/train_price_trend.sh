@@ -1,58 +1,63 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------- ASOF date (defaults to yesterday) ----------
+# ---------- ASOF (default: yesterday) ----------
 if [[ $# -ge 1 ]]; then
   ASOF="$1"
 else
-  # Linux (GNU date)
   if date -d "yesterday" +%Y-%m-%d >/dev/null 2>&1; then
     ASOF="$(date -d "yesterday" +%Y-%m-%d)"
-  # macOS / BSD date
   elif date -v-1d +%Y-%m-%d >/dev/null 2>&1; then
     ASOF="$(date -v-1d +%Y-%m-%d)"
-  # GNU coreutils 'gdate' (sometimes on mac via brew)
   elif command -v gdate >/dev/null 2>&1; then
     ASOF="$(gdate -d "yesterday" +%Y-%m-%d)"
   else
-    echo "ERROR: can't compute 'yesterday' (need GNU date or BSD date). Provide ASOF explicitly." >&2
+    echo "ERROR: cannot compute yesterday. Pass YYYY-MM-DD." >&2
     exit 1
   fi
 fi
 
 CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
 
+# ---------- Paths ----------
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(cd "$BIN_DIR/.." && pwd)"
 
-# ---------- Defaults (override via env) ----------
+# ---------- Defaults / env knobs ----------
 START_DATE="${START_DATE:-2025-09-05}"
 VALID_DAYS="${VALID_DAYS:-7}"
 SPORT="${SPORT:-horse-racing}"
-DEVICE="${DEVICE:-cuda}"
+
+DEVICE="${DEVICE:-cuda}"        # training device
+SIM_DEVICE="${SIM_DEVICE:-cpu}" # simulate on cpu by default (avoids xgboost device mismatch warnings)
 
 HORIZON_SECS="${HORIZON_SECS:-120}"
 PREOFF_MAX="${PREOFF_MAX:-30}"
 COMMISSION="${COMMISSION:-0.02}"
+EV_MODE="${EV_MODE:-mtm}"
 
-EDGE_THRESH="${EDGE_THRESH:-0.002}"
+EDGE_THRESH="${EDGE_THRESH:-0.0}"
 STAKE="${STAKE:-kelly}"
 KELLY_CAP="${KELLY_CAP:-0.02}"
 KELLY_FLOOR="${KELLY_FLOOR:-0.001}"
 BANKROLL_NOM="${BANKROLL_NOM:-5000}"
 
-EV_MODE="${EV_MODE:-mtm}"
+# NEW: EV rescaling + liquidity strictness
+EV_SCALE="${EV_SCALE:-1.0}"              # multiply EV/£ before thresholding
+REQUIRE_BOOK="${REQUIRE_BOOK:-0}"        # 1 => drop trades if depth arrays missing
+MIN_FILL_FRAC="${MIN_FILL_FRAC:-0.0}"    # e.g. 0.25 to require at least 25% fill
 
-# Optional odds band + liquidity (off by default)
+# Odds band (optional)
 ODDS_MIN="${ODDS_MIN:-}"
 ODDS_MAX="${ODDS_MAX:-}"
-ENFORCE_LIQUIDITY="${ENFORCE_LIQUIDITY:-0}"     # set to 1 to enable
+
+# Liquidity enforcement
+ENFORCE_LIQUIDITY="${ENFORCE_LIQUIDITY:-0}"
 LIQUIDITY_LEVELS="${LIQUIDITY_LEVELS:-1}"
 
 OUTDIR="${OUTDIR:-$BASE_DIR/output}"
 
-MODEL_PATH="$OUTDIR/models/xgb_trend_reg.json"
-
+# ---------- Header ----------
 echo "=== Price Trend Training ==="
 echo "Curated root:    $CURATED_ROOT"
 echo "ASOF:            $ASOF"
@@ -62,43 +67,45 @@ echo "Horizon (secs):  $HORIZON_SECS"
 echo "Pre-off max (m): $PREOFF_MAX"
 echo "Stake mode:      $STAKE (cap=$KELLY_CAP floor=$KELLY_FLOOR)"
 echo "EV mode:         $EV_MODE"
-echo "Odds band:       ${ODDS_MIN:--} .. ${ODDS_MAX:--}"
-echo "Liquidity:       enforce=${ENFORCE_LIQUIDITY} levels=${LIQUIDITY_LEVELS}"
-echo "Device:          $DEVICE"
+if [[ -n "$ODDS_MIN" || -n "$ODDS_MAX" ]]; then
+  echo "Odds band:       ${ODDS_MIN:--} .. ${ODDS_MAX:--}"
+else
+  echo "Odds band:       - .. -"
+fi
+echo "Liquidity:       enforce=$ENFORCE_LIQUIDITY levels=$LIQUIDITY_LEVELS require_book=$REQUIRE_BOOK min_fill_frac=$MIN_FILL_FRAC"
+echo "EV scaling:      ev_scale=$EV_SCALE"
+echo "Devices:         train=$DEVICE  simulate=$SIM_DEVICE"
 echo "Output dir:      $OUTDIR"
 
-# ---------- Train (skip if model exists and FORCE_TRAIN!=1) ----------
-if [[ "${FORCE_TRAIN:-0}" == "1" || ! -f "$MODEL_PATH" ]]; then
-  python3 "$BASE_DIR/ml/train_price_trend.py" \
-    --curated "$CURATED_ROOT" \
-    --asof "$ASOF" \
-    --start-date "$START_DATE" \
-    --valid-days "$VALID_DAYS" \
-    --sport "$SPORT" \
-    --device "$DEVICE" \
-    --horizon-secs "$HORIZON_SECS" \
-    --preoff-max "$PREOFF_MAX" \
-    --commission "$COMMISSION" \
-    --stake-mode "$STAKE" \
-    --kelly-cap "$KELLY_CAP" \
-    --kelly-floor "$KELLY_FLOOR" \
-    --bankroll-nom "$BANKROLL_NOM" \
-    --ev-mode "$EV_MODE" \
-    --output-dir "$OUTDIR"
-else
-  echo "Model exists at $MODEL_PATH — skipping training (set FORCE_TRAIN=1 to retrain)."
-fi
+# ---------- Train (idempotent) ----------
+python3 "$BASE_DIR/ml/train_price_trend.py" \
+  --curated "$CURATED_ROOT" \
+  --asof "$ASOF" \
+  --start-date "$START_DATE" \
+  --valid-days "$VALID_DAYS" \
+  --sport "$SPORT" \
+  --device "$DEVICE" \
+  --horizon-secs "$HORIZON_SECS" \
+  --preoff-max "$PREOFF_MAX" \
+  --commission "$COMMISSION" \
+  --stake-mode "$STAKE" \
+  --kelly-cap "$KELLY_CAP" \
+  --kelly-floor "$KELLY_FLOOR" \
+  --bankroll-nom "$BANKROLL_NOM" \
+  --ev-mode "$EV_MODE" \
+  --output-dir "$OUTDIR"
 
-# ---------- Simulate (stream backtest) ----------
 echo "=== Streaming Backtest ==="
 echo "EV threshold:    $EDGE_THRESH per £1"
 
+# ---------- Simulate (always runs) ----------
 SIM_ARGS=(
   --curated "$CURATED_ROOT"
   --asof "$ASOF"
   --start-date "$START_DATE"
   --valid-days "$VALID_DAYS"
   --sport "$SPORT"
+  --horizon-secs "$HORIZON_SECS"
   --preoff-max "$PREOFF_MAX"
   --commission "$COMMISSION"
   --edge-thresh "$EDGE_THRESH"
@@ -107,19 +114,22 @@ SIM_ARGS=(
   --kelly-floor "$KELLY_FLOOR"
   --bankroll-nom "$BANKROLL_NOM"
   --ev-mode "$EV_MODE"
-  --model-path "$MODEL_PATH"
+  --ev-scale "$EV_SCALE"               # <-- forward EV_SCALE
+  --min-fill-frac "$MIN_FILL_FRAC"     # <-- forward MIN_FILL_FRAC
+  --device "$SIM_DEVICE"
   --output-dir "$OUTDIR/stream"
-  --device "$DEVICE"
-  --horizon-secs "$HORIZON_SECS"
 )
 
 # Optional odds band
-[[ -n "${ODDS_MIN}" ]] && SIM_ARGS+=( --odds-min "$ODDS_MIN" )
-[[ -n "${ODDS_MAX}" ]] && SIM_ARGS+=( --odds-max "$ODDS_MAX" )
+if [[ -n "$ODDS_MIN" ]]; then SIM_ARGS+=( --odds-min "$ODDS_MIN" ); fi
+if [[ -n "$ODDS_MAX" ]]; then SIM_ARGS+=( --odds-max "$ODDS_MAX" ); fi
 
-# Optional liquidity enforcement
+# Liquidity flags
 if [[ "$ENFORCE_LIQUIDITY" == "1" ]]; then
   SIM_ARGS+=( --enforce-liquidity --liquidity-levels "$LIQUIDITY_LEVELS" )
+fi
+if [[ "$REQUIRE_BOOK" == "1" ]]; then
+  SIM_ARGS+=( --require-book )         # <-- forward REQUIRE_BOOK
 fi
 
 python3 "$BASE_DIR/ml/simulate_stream.py" "${SIM_ARGS[@]}"
