@@ -11,16 +11,16 @@ import xgboost as xgb
 import pickle
 import json
 
-# --- local imports you already have ---
+# local utils from your repo
 from utils import (
-    parse_date, read_snapshots,  # we will column-prune below
+    parse_date, read_snapshots,
     time_to_off_minutes_expr, filter_preoff,
     write_json, kelly_fraction_back, kelly_fraction_lay
 )
 
 UTC = timezone.utc
 
-# 5s cadence lags (match your features)
+# 5s cadence lags (match feature build)
 LAG_30S = 6
 LAG_60S = 12
 LAG_120S = 24
@@ -36,7 +36,7 @@ NUMERIC_FEATS = [
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Streaming backtest (column-pruned scans, VWAP+liquidity with graceful fallback, MTM exit & settlement)."
+        description="Streaming backtest (column-pruned scans, VWAP/liquidity with fallback, MTM/settlement P&L)."
     )
     # Core
     p.add_argument("--curated", required=True)
@@ -51,6 +51,7 @@ def parse_args():
     p.add_argument("--commission", type=float, default=0.02)
     p.add_argument("--edge-thresh", type=float, default=0.002)
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
+    p.add_argument("--ev-cap", type=float, default=1.0, help="clip EV per £1 to [-cap,+cap] to avoid outliers in ranking")
 
     # Staking
     p.add_argument("--stake-mode", choices=["flat","kelly"], default="kelly")
@@ -71,7 +72,7 @@ def parse_args():
     p.add_argument("--calib-path", default="")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
     p.add_argument("--device", choices=["cuda","cpu"], default="cuda")
-    p.add_argument("--batch-size", type=int, default=100_000, help="rows per inference batch")
+    p.add_argument("--batch-size", type=int, default=75_000, help="rows per inference batch")
     p.add_argument("--write-trades", type=int, default=0, help="1=write trades_*.csv; 0=summary/daily only")
     return p.parse_args()
 
@@ -92,16 +93,13 @@ def _make_features_row(bufs, last_row):
     vol_prev = bufs["vol"][-1] if len(bufs["vol"])>=1 else None
     ltp_diff_5s = (ltp_now - ltp_prev) if ltp_prev is not None else 0.0
     vol_diff_5s = (vol_now - vol_prev) if vol_prev is not None else 0.0
-
     def safe_div(a, b): return (a / b) if (b is not None and abs(b) > 1e-12) else None
-
     feats = {
         "ltp": ltp_now, "tradedVolume": vol_now,
         "spreadTicks": last_row.get("spreadTicks", 0.0) or 0.0,
         "imbalanceBest1": last_row.get("imbalanceBest1", 0.0) or 0.0,
         "mins_to_off": last_row["mins_to_off"],
         "__p_now": 1.0 / max(ltp_now, 1e-12),
-
         "ltp_diff_5s": ltp_diff_5s, "vol_diff_5s": vol_diff_5s,
         "ltp_lag30s": ltp_l30, "ltp_lag60s": ltp_l60, "ltp_lag120s": ltp_l120,
         "tradedVolume_lag30s": vol_l30, "tradedVolume_lag60s": vol_l60, "tradedVolume_lag120s": vol_l120,
@@ -183,10 +181,11 @@ def _load_results(curated_root: Path, sport: str, start_dt, end_dt) -> pl.DataFr
         )
     if not lfs:
         return pl.DataFrame({"marketId": [], "selectionId": [], "winLabel": []})
-    return pl.concat(lfs, how="vertical_relaxed").unique().collect(streaming=True)
+    # no deprecated streaming flag
+    return pl.concat(lfs, how="vertical_relaxed").unique().collect()
 
 def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
-    """Build exit lookup (Datetime key for safe timedelta tolerance)."""
+    """Build exit lookup (Datetime key; drop invalid ltp)."""
     select_exprs = [
         pl.col("marketId").cast(pl.Utf8),
         pl.col("selectionId").cast(pl.Int64),
@@ -196,7 +195,12 @@ def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
     ]
     if _has_book_columns(df_snap):
         select_exprs += [pl.col("backTicks"), pl.col("backSizes"), pl.col("layTicks"), pl.col("laySizes")]
-    return df_snap.select(select_exprs).sort(["marketId","selectionId","ts_dt"])
+    return (
+        df_snap
+        .filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
+        .select(select_exprs)
+        .sort(["marketId","selectionId","ts_dt"])
+    )
 
 def main():
     args = parse_args()
@@ -213,16 +217,16 @@ def main():
     if need_book:
         cols += ["backTicks","backSizes","layTicks","laySizes"]
 
-    # Use your read_snapshots but column-prune immediately
     lf = read_snapshots(curated, start_dt, valid_end, args.sport)
-    # If some columns may be missing in files, select only those present to avoid scan failures
-    present = [c for c in cols if c in lf.columns]
+    # cheap schema list; avoids PerformanceWarning
+    schema_names = set(lf.collect_schema().names())
+    present = [c for c in cols if c in schema_names]
     lf = lf.select(present).with_columns([ time_to_off_minutes_expr() ])
 
-    # Collect → preoff filter → odds band
-    df = lf.collect(streaming=True)
+    # Collect → preoff filter → odds band → ltp sanity
+    df = lf.collect()
     df = filter_preoff(df, args.preoff_max)
-    df = df.filter(pl.col("ltp").is_not_null())
+    df = df.filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
     if args.odds_min is not None:
         df = df.filter(pl.col("ltp") >= float(args.odds_min))
     if args.odds_max is not None:
@@ -237,15 +241,15 @@ def main():
     print(f"[simulate] Liquidity: requested={'on' if args.enforce_liquidity else 'off'}, "
           f"effective={'on' if effective_enforce else 'off'}")
 
-    # Sort minimally for streaming loop and exit table
+    # Sort for streaming + build exit table
     df = df.sort(["marketId","selectionId","publishTimeMs"])
     exit_df = _prepare_exit_prices(df)
 
     # ----- Model (+ optional calibrator) -----
     bst = xgb.Booster(); bst.load_model(args.model_path)
+    # prediction device hint; ignore if unused
     try:
         bst.set_param({"device": args.device})
-        bst.set_param({"predictor": "gpu_predictor" if args.device == "cuda" else "cpu_predictor"})
     except Exception:
         pass
     calibrator = None
@@ -257,9 +261,8 @@ def main():
     bufs_ltp = defaultdict(lambda: deque(maxlen=LAG_120S))
     bufs_vol = defaultdict(lambda: deque(maxlen=LAG_120S))
 
-    # We'll accumulate trades in-memory batches; no parquet temp writes.
-    batch_records = []
-    all_records = []  # appended per batch then cleared to control peak memory
+    # accumulate in memory (no parquet temp writes)
+    all_records: list[pl.DataFrame] = []
     rows = df.iter_rows(named=True)
     feature_rows, meta_rows = [], []
 
@@ -298,7 +301,6 @@ def main():
 
     if not all_records:
         print("[simulate] no trades generated.")
-        # still write an empty daily + summary for consistency
         daily = pl.DataFrame({"day": [], "stake_mode": [], "n_trades": [], "exp_profit": [], "avg_ev": [],
                               "avg_stake_filled": [], "avg_fill_frac": [], "real_mtm_profit": [], "real_settle_profit": [],
                               "roi_exp": [], "roi_real_mtm": [], "roi_real_settle": []})
@@ -306,41 +308,42 @@ def main():
         write_json(Path(args.output_dir) / f"summary_{args.asof}.json", {"n_trades": 0})
         return
 
-    # Concatenate batch records in-memory (not written to disk)
     trades = pl.concat(all_records, how="vertical_relaxed")
 
-    # Exit at t+H via asof join on Datetime keys (no parquet)
+    # Exit at t+H via asof join on Datetime keys; drop invalid exits (ltp<=1.01)
     trades = trades.with_columns([
-        pl.col("publishTimeMs").cast(pl.Int64).alias("ts_ms"),
         (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit_ms"),
-        pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
-          .dt.replace_time_zone("UTC").alias("ts_dt"),
-        pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000), time_unit="ms")
-          .dt.replace_time_zone("UTC").alias("ts_exit_dt"),
+        pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64)), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_dt"),
+        pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_exit_dt"),
     ])
     trades_sorted = trades.sort(["marketId","selectionId","ts_exit_dt"])
-    exit_sorted = exit_df  # already sorted
 
     trades2 = trades_sorted.join_asof(
-        exit_sorted,
+        exit_df,
         left_on="ts_exit_dt", right_on="ts_dt",
         by=["marketId","selectionId"],
         strategy="forward",
         tolerance=timedelta(minutes=10),
     ).with_columns(
         pl.col("ltp_exit_proxy").alias("exit_odds")
-    ).drop(["ts_ms","ts_dt","ts_exit_ms","ts_exit_dt","ltp_exit_proxy"])
+    ).drop(["ts_dt","ts_exit_dt","ltp_exit_proxy"]).filter(
+        # keep only valid exits to avoid inf/NaN MTM
+        pl.col("exit_odds").is_not_null() & (pl.col("exit_odds") > 1.01)
+    )
 
-    # Realised MTM P&L
+    # Clip EV to avoid dominance by outliers
+    EV_CAP = float(args.ev_cap)
+    trades2 = trades2.with_columns(pl.col("ev_per_1").clip(-EV_CAP, EV_CAP))
+
+    # Realised MTM P&L (guarded)
     trades2 = trades2.with_columns([
-        pl.when((pl.col("side") == "back") & pl.col("exit_odds").is_not_null())
+        pl.when(pl.col("side") == "back")
           .then(((pl.col("exec_odds") / pl.col("exit_odds")) - 1.0) * pl.col("stake_filled"))
-          .otherwise(
-              pl.when((pl.col("side") == "lay") & pl.col("exit_odds").is_not_null())
-               .then((1.0 - (pl.col("exit_odds") / pl.col("exec_odds"))) * pl.col("stake_filled"))
-               .otherwise(pl.lit(None))
-          ).alias("real_mtm_pnl")
-    ])
+          .otherwise(1.0 - (pl.col("exit_odds") / pl.col("exec_odds")) * pl.col("stake_filled"))
+          .alias("real_mtm_pnl_raw")
+    ]).with_columns(
+        pl.when(pl.col("real_mtm_pnl_raw").is_finite()).then(pl.col("real_mtm_pnl_raw")).otherwise(pl.lit(None)).alias("real_mtm_pnl")
+    ).drop("real_mtm_pnl_raw")
 
     # Settlement P&L (if results exist)
     results_df = _load_results(curated, args.sport, start_dt, valid_end)
@@ -366,7 +369,7 @@ def main():
         trades_csv = Path(args.output_dir) / f"trades_{args.asof}.csv"
         trades2.write_csv(trades_csv)
 
-    # Daily summary (compact)
+    # Daily summary
     daily = (
         trades2
         .with_columns(
@@ -393,15 +396,22 @@ def main():
     daily_csv = Path(args.output_dir) / f"daily_{args.asof}.csv"
     daily.write_csv(daily_csv)
 
-    # Summary + ROI for the run
-    total_exp_profit   = float(trades2["exp_pnl"].sum())
+    # Summary + ROI for the run (finite-safe)
+    def _finite_sum(s):
+        try:
+            v = float(pl.when(pl.col(s).is_finite()).then(pl.col(s)).otherwise(None).alias("_").fill_null(0.0).select(pl.col("_").sum()).to_numpy()[0][0])
+        except Exception:
+            v = float(trades2[s].fill_null(0.0).sum())
+        return v
+
+    total_exp_profit   = float(trades2["exp_pnl"].fill_null(0.0).sum())
     avg_ev             = float(trades2["ev_per_1"].mean())
-    total_real_mtm     = float(trades2["real_mtm_pnl"].sum()) if trades2["real_mtm_pnl"].dtype != pl.Null else None
-    total_real_settle  = float(trades2["real_settle_pnl"].sum()) if trades2["real_settle_pnl"].dtype != pl.Null else None
+    total_real_mtm     = _finite_sum("real_mtm_pnl")
+    total_real_settle  = _finite_sum("real_settle_pnl")
 
     roi_exp = (total_exp_profit / float(args.bankroll_nom)) if args.bankroll_nom else None
-    roi_real_mtm = (total_real_mtm / float(args.bankroll_nom)) if (args.bankroll_nom and total_real_mtm is not None) else None
-    roi_real_settle = (total_real_settle / float(args.bankroll_nom)) if (args.bankroll_nom and total_real_settle is not None) else None
+    roi_real_mtm = (total_real_mtm / float(args.bankroll_nom)) if args.bankroll_nom else None
+    roi_real_settle = (total_real_settle / float(args.bankroll_nom)) if args.bankroll_nom else None
 
     summ = {
         "asof": args.asof,
@@ -433,7 +443,7 @@ def main():
     write_json(Path(args.output_dir) / f"summary_{args.asof}.json", summ)
 
     # Console prints
-    def _fmt(x): return "n/a" if x is None else f"{x:.6f}"
+    def _fmt(x): return "n/a" if x is None or (isinstance(x,float) and (np.isnan(x) or np.isinf(x))) else f"{x:.6f}"
     print(f"[simulate] ROI (exp)        : {_fmt(roi_exp)}")
     print(f"[simulate] ROI (real MTM)   : {_fmt(roi_real_mtm)}")
     print(f"[simulate] ROI (settlement) : {_fmt(roi_real_settle)}")
@@ -441,8 +451,12 @@ def main():
 
 def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce: bool) -> pl.DataFrame:
     X = np.asarray(feature_rows, dtype=np.float32)
-    dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
-    delta_pred = bst.predict(dm)
+    # lower-memory predict path
+    try:
+        delta_pred = bst.inplace_predict(X, validate_features=False)
+    except Exception:
+        dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
+        delta_pred = bst.predict(dm)
 
     out = []
     commission = float(args.commission)
@@ -503,7 +517,6 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
         ))
 
     if not out:
-        # Return empty DF with correct schema to keep concat cheap
         return pl.DataFrame(schema={
             "publishTimeMs": pl.Int64, "marketId": pl.Utf8, "selectionId": pl.Int64,
             "ltp": pl.Float64, "p_now": pl.Float64, "p_pred": pl.Float64, "delta_pred": pl.Float64,

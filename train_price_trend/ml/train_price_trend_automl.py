@@ -6,11 +6,8 @@ from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import polars as pl
 
-# ------------- CLI -------------
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="AutoML/sweep for price-trend project: train once then parallel-simulate best config on CPU."
-    )
+    p = argparse.ArgumentParser(description="AutoML for price-trend: train once, parallel CPU sims, robust ranking.")
     # Core data/time
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
@@ -22,42 +19,42 @@ def parse_args():
     p.add_argument("--commission", type=float, default=0.02)
 
     # Devices
-    p.add_argument("--train-device", choices=["cuda","cpu"], default="cuda",
-                   help="Device for model training (XGBoost). GPU is usually faster.")
-    p.add_argument("--sim-device", choices=["cuda","cpu"], default="cpu",
-                   help="Device for simulation inference. CPU is recommended for many parallel trials.")
+    p.add_argument("--train-device", choices=["cuda","cpu"], default="cuda")
+    p.add_argument("--sim-device", choices=["cuda","cpu"], default="cpu")
 
     # Output / runtime
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output")
-    p.add_argument("--force-train", action="store_true", help="force retrain even if model exists")
+    p.add_argument("--force-train", action="store_true")
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
-    p.add_argument("--batch-size", type=int, default=200_000, help="simulate_stream batch size")
+    p.add_argument("--batch-size", type=int, default=75_000)
+    p.add_argument("--ev-cap", type=float, default=1.0)
 
     # Staking
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
-    p.add_argument("--kelly-cap", type=float, default=0.01)
+    p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
 
     # Sweep grids
     p.add_argument("--edge-grid", default="0.0005,0.001,0.0015,0.002,0.003")
     p.add_argument("--stake-grid", default="flat,kelly")
-    p.add_argument("--odds-grid", default="none,2.2:3.6,1.5:5.0")
+    p.add_argument("--odds-grid", default="2.2:3.6,1.5:5.0,none",
+                   help="include 'none' last if you want a diagnostic run without band")
 
-    # Liquidity (off by default; turn on to include liq sweeps)
-    p.add_argument("--enforce-liquidity", action="store_true",
-                   help="Include liquidity-enforced runs in the sweep.")
+    # Liquidity
+    p.add_argument("--enforce-liquidity", action="store_true")
     p.add_argument("--liquidity-levels-grid", default="1,3")
 
     # Parallelism
     default_workers = max(1, (os.cpu_count() or 2) - 1)
-    p.add_argument("--max-parallel", type=int, default=default_workers,
-                   help="Concurrent simulation trials (CPU processes).")
+    p.add_argument("--max-parallel", type=int, default=default_workers)
 
-    # Tag for results
+    # Ranking safety
+    p.add_argument("--min-trades", type=int, default=20_000, help="min trades to consider a trial valid")
+    p.add_argument("--prefer", choices=["settlement","mtm","expected"], default="settlement",
+                   help="primary metric preference for ranking")
     p.add_argument("--tag", default="automl")
     return p.parse_args()
 
-# ------------- Utils -------------
 def _parse_floats(csv: str) -> list[float]:
     return [float(x.strip()) for x in csv.split(",") if x.strip()]
 
@@ -78,7 +75,6 @@ def _run(cmd: list[str], cwd: str | None = None) -> tuple[int,str,str]:
     res = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     return res.returncode, res.stdout, res.stderr
 
-# ------------- Train once -------------
 def maybe_train(args, base_dir: Path, model_path: Path):
     if model_path.exists() and not args.force_train:
         print(f"[automl] Model exists at {model_path} — skipping training (use --force-train to retrain).")
@@ -113,11 +109,7 @@ def maybe_train(args, base_dir: Path, model_path: Path):
         print(err, file=sys.stderr)
         raise RuntimeError("Training failed")
 
-# ------------- One simulation (child process safe) -------------
 def simulate_one(sim_args: dict) -> tuple[str, dict | None, str]:
-    """
-    Returns (run_id, result_dict_or_None, error_message_or_empty)
-    """
     base_dir = Path(sim_args["base_dir"])
     outdir = Path(sim_args["outdir"])
     outdir.mkdir(parents=True, exist_ok=True)
@@ -138,11 +130,13 @@ def simulate_one(sim_args: dict) -> tuple[str, dict | None, str]:
         "--kelly-floor", str(sim_args["kelly_floor"]),
         "--bankroll-nom", str(sim_args["bankroll_nom"]),
         "--ev-mode", sim_args["ev_mode"],
+        "--ev-cap", str(sim_args["ev_cap"]),
         "--model-path", sim_args["model_path"],
         "--output-dir", str(outdir),
         "--device", sim_args["sim_device"],
         "--horizon-secs", str(sim_args["horizon_secs"]),
         "--batch-size", str(sim_args["batch_size"]),
+        "--write-trades", "0",
     ]
     if sim_args["odds_min"] is not None:
         cmd += ["--odds-min", str(sim_args["odds_min"])]
@@ -181,7 +175,6 @@ def simulate_one(sim_args: dict) -> tuple[str, dict | None, str]:
         return sim_args["run_id"], res, ""
     return sim_args["run_id"], None, "no summary json"
 
-# ------------- Main -------------
 def main():
     args = parse_args()
     base_dir = Path("/opt/BetfairBotML/train_price_trend")
@@ -190,7 +183,7 @@ def main():
     # 1) Train once
     maybe_train(args, base_dir, model_path)
 
-    # 2) Sweep grid
+    # 2) Build sweep grid
     edges = _parse_floats(args.edge_grid)
     stakes = _parse_strs(args.stake_grid)
     bands  = _parse_bands(args.odds_grid)
@@ -200,7 +193,6 @@ def main():
     automl_root = Path(args.output_dir) / "automl" / args.asof / args.tag
     automl_root.mkdir(parents=True, exist_ok=True)
 
-    # Build sim tasks
     tasks: list[dict] = []
     for edge, stake, (odds_min, odds_max, band_name), enforce in product(edges, stakes, bands, enforce_opts):
         if enforce:
@@ -222,6 +214,7 @@ def main():
                     kelly_floor=args.kelly_floor,
                     bankroll_nom=args.bankroll_nom,
                     ev_mode=args.ev_mode,
+                    ev_cap=args.ev_cap,
                     model_path=str(model_path),
                     outdir=str(outdir),
                     sim_device=args.sim_device,
@@ -251,6 +244,7 @@ def main():
                 kelly_floor=args.kelly_floor,
                 bankroll_nom=args.bankroll_nom,
                 ev_mode=args.ev_mode,
+                ev_cap=args.ev_cap,
                 model_path=str(model_path),
                 outdir=str(outdir),
                 sim_device=args.sim_device,
@@ -298,23 +292,48 @@ def main():
 
     df = pl.DataFrame(rows)
 
-    # 4) Rank trials: realised MTM ROI, then realised settle ROI, then expected ROI, then expected profit
-    score_cols = []
-    if "overall_roi_real_mtm" in df.columns:
-        score_cols.append("overall_roi_real_mtm")
-    if "overall_roi_real_settle" in df.columns:
-        score_cols.append("overall_roi_real_settle")
-    score_cols.append("overall_roi_exp")
-    score_cols.append("total_exp_profit")
+    # 4) Robust filtering before ranking
+    # require finite ROI values where present; allow nulls (will be down-weighted)
+    def _finite_or_null(col: str) -> pl.Expr:
+        return pl.col(col).is_null() | pl.col(col).is_finite()
 
-    # Normalize None → very small to sort properly
-    for c in score_cols:
-        if c in df.columns:
-            df = df.with_columns(
-                pl.when(pl.col(c).is_null()).then(pl.lit(-1e18)).otherwise(pl.col(c)).alias(f"_{c}_score")
-            )
-    sort_by = [f"_{c}_score" for c in score_cols if f"_{c}_score" in df.columns]
-    df = df.sort(by=sort_by, descending=[True]*len(sort_by))
+    df = df.filter(
+        (pl.col("n_trades") >= args.min_trades) &
+        _finite_or_null("overall_roi_real_mtm") &
+        _finite_or_null("overall_roi_real_settle") &
+        _finite_or_null("overall_roi_exp")
+    )
+
+    if df.height == 0:
+        print("[automl] No trials passed sanity filters.")
+        return
+
+    # 5) Ranking: prefer settlement ROI, fallback to MTM, then expected, then exp profit
+    # Build sorted score columns (nulls -> very small)
+    def scoreify(col: str) -> str:
+        sc = f"_{col}_score"
+        df_trans = df.with_columns(
+            pl.when(pl.col(col).is_null()).then(pl.lit(-1e18)).otherwise(pl.col(col)).alias(sc)
+        )
+        nonlocal df
+        df = df_trans
+        return sc
+
+    order = []
+    if args.prefer == "settlement" and "overall_roi_real_settle" in df.columns:
+        order.append(scoreify("overall_roi_real_settle"))
+        if "overall_roi_real_mtm" in df.columns: order.append(scoreify("overall_roi_real_mtm"))
+    elif args.prefer == "mtm" and "overall_roi_real_mtm" in df.columns:
+        order.append(scoreify("overall_roi_real_mtm"))
+        if "overall_roi_real_settle" in df.columns: order.append(scoreify("overall_roi_real_settle"))
+    else:
+        if "overall_roi_real_settle" in df.columns: order.append(scoreify("overall_roi_real_settle"))
+        if "overall_roi_real_mtm" in df.columns: order.append(scoreify("overall_roi_real_mtm"))
+
+    order.append(scoreify("overall_roi_exp"))
+    order.append(scoreify("total_exp_profit"))
+
+    df = df.sort(by=order, descending=[True]*len(order))
 
     trials_path = automl_root / f"trials_{args.asof}.csv"
     df.write_csv(trials_path)
@@ -328,7 +347,7 @@ def main():
         "preoff_max": args.preoff_max,
         "horizon_secs": args.horizon_secs,
         "commission": args.commission,
-        "device": args.train_device,          # device used for training
+        "device": args.train_device,
         "ev_mode": args.ev_mode,
         "bankroll_nom": args.bankroll_nom,
         "kelly_cap": args.kelly_cap,
@@ -358,7 +377,7 @@ def main():
         f"[automl] Best config: edge≥{best_cfg['edge_thresh']}  stake={best_cfg['stake_mode']}  "
         f"odds=[{best_cfg['odds_min']},{best_cfg['odds_max']}]  "
         f"liq_enf={best_cfg['enforce_liquidity']}@L={best_cfg['liquidity_levels']}  "
-        f"ROI_real_mtm={best_cfg.get('overall_roi_real_mtm')}"
+        f"ROI_settle={best_cfg.get('overall_roi_real_settle')}  ROI_mtm={best_cfg.get('overall_roi_real_mtm')}"
     )
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ export POLARS_MAX_THREADS=4
 export OMP_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
-MAX_PARALLEL=12 /opt/BetfairBotML/train_price_trend/bin/run_best_trend.sh
+MAX_PARALLEL=4 /opt/BetfairBotML/train_price_trend/bin/run_best_trend.sh
 
 
 # Use yesterday automatically
