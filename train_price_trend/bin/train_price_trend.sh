@@ -29,7 +29,7 @@ VALID_DAYS="${VALID_DAYS:-7}"
 SPORT="${SPORT:-horse-racing}"
 
 DEVICE="${DEVICE:-cuda}"        # training device
-SIM_DEVICE="${SIM_DEVICE:-cpu}" # simulate on cpu by default (avoids xgboost device mismatch warnings)
+SIM_DEVICE="${SIM_DEVICE:-cpu}" # simulate device (default cpu to avoid xgb device mismatch msg)
 
 HORIZON_SECS="${HORIZON_SECS:-120}"
 PREOFF_MAX="${PREOFF_MAX:-30}"
@@ -42,10 +42,10 @@ KELLY_CAP="${KELLY_CAP:-0.02}"
 KELLY_FLOOR="${KELLY_FLOOR:-0.001}"
 BANKROLL_NOM="${BANKROLL_NOM:-5000}"
 
-# NEW: EV rescaling + liquidity strictness
-EV_SCALE="${EV_SCALE:-1.0}"              # multiply EV/£ before thresholding
-REQUIRE_BOOK="${REQUIRE_BOOK:-0}"        # 1 => drop trades if depth arrays missing
-MIN_FILL_FRAC="${MIN_FILL_FRAC:-0.0}"    # e.g. 0.25 to require at least 25% fill
+# NEW: EV rescaling + liquidity strictness passed to simulator only
+EV_SCALE="${EV_SCALE:-1.0}"
+REQUIRE_BOOK="${REQUIRE_BOOK:-0}"
+MIN_FILL_FRAC="${MIN_FILL_FRAC:-0.0}"
 
 # Odds band (optional)
 ODDS_MIN="${ODDS_MIN:-}"
@@ -77,7 +77,7 @@ echo "EV scaling:      ev_scale=$EV_SCALE"
 echo "Devices:         train=$DEVICE  simulate=$SIM_DEVICE"
 echo "Output dir:      $OUTDIR"
 
-# ---------- Train (idempotent) ----------
+# ---------- Train (idempotent, only training-supported args) ----------
 python3 "$BASE_DIR/ml/train_price_trend.py" \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF" \
@@ -88,17 +88,12 @@ python3 "$BASE_DIR/ml/train_price_trend.py" \
   --horizon-secs "$HORIZON_SECS" \
   --preoff-max "$PREOFF_MAX" \
   --commission "$COMMISSION" \
-  --stake-mode "$STAKE" \
-  --kelly-cap "$KELLY_CAP" \
-  --kelly-floor "$KELLY_FLOOR" \
-  --bankroll-nom "$BANKROLL_NOM" \
-  --ev-mode "$EV_MODE" \
   --output-dir "$OUTDIR"
 
 echo "=== Streaming Backtest ==="
 echo "EV threshold:    $EDGE_THRESH per £1"
 
-# ---------- Simulate (always runs) ----------
+# ---------- Simulate (all trading knobs forwarded here) ----------
 SIM_ARGS=(
   --curated "$CURATED_ROOT"
   --asof "$ASOF"
@@ -114,8 +109,8 @@ SIM_ARGS=(
   --kelly-floor "$KELLY_FLOOR"
   --bankroll-nom "$BANKROLL_NOM"
   --ev-mode "$EV_MODE"
-  --ev-scale "$EV_SCALE"               # <-- forward EV_SCALE
-  --min-fill-frac "$MIN_FILL_FRAC"     # <-- forward MIN_FILL_FRAC
+  --ev-scale "$EV_SCALE"
+  --min-fill-frac "$MIN_FILL_FRAC"
   --device "$SIM_DEVICE"
   --output-dir "$OUTDIR/stream"
 )
@@ -129,7 +124,7 @@ if [[ "$ENFORCE_LIQUIDITY" == "1" ]]; then
   SIM_ARGS+=( --enforce-liquidity --liquidity-levels "$LIQUIDITY_LEVELS" )
 fi
 if [[ "$REQUIRE_BOOK" == "1" ]]; then
-  SIM_ARGS+=( --require-book )         # <-- forward REQUIRE_BOOK
+  SIM_ARGS+=( --require-book )
 fi
 
 python3 "$BASE_DIR/ml/simulate_stream.py" "${SIM_ARGS[@]}"
