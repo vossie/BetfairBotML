@@ -1,65 +1,101 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ---------- ASOF (default: yesterday) ----------
-if [[ $# -ge 1 ]]; then
-  ASOF="$1"
-else
+# ------------- helpers -------------
+_yesterday() {
   if date -d "yesterday" +%Y-%m-%d >/dev/null 2>&1; then
-    ASOF="$(date -d "yesterday" +%Y-%m-%d)"
+    date -d "yesterday" +%Y-%m-%d
   elif date -v-1d +%Y-%m-%d >/dev/null 2>&1; then
-    ASOF="$(date -v-1d +%Y-%m-%d)"
+    date -v-1d +%Y-%m-%d
   elif command -v gdate >/dev/null 2>&1; then
-    ASOF="$(gdate -d "yesterday" +%Y-%m-%d)"
+    gdate -d "yesterday" +%Y-%m-%d
   else
-    echo "ERROR: cannot compute yesterday. Pass YYYY-MM-DD." >&2
+    echo ""
+  fi
+}
+
+_is_date() {
+  [[ "${1:-}" =~ ^20[0-9]{2}-[01][0-9]-[0-3][0-9]$ ]]
+}
+
+# ------------- locate dirs -------------
+BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "$BIN_DIR/.." && pwd)"
+
+# ------------- parse args -------------
+ASOF=""
+EXTRA_SIM_ARGS=()
+
+if [[ $# -gt 0 ]]; then
+  if [[ "$1" == "--" ]]; then
+    # no explicit date; pass-through starts after --
+    shift
+    EXTRA_SIM_ARGS=("$@")
+  elif _is_date "$1"; then
+    ASOF="$1"
+    shift
+    if [[ "${1:-}" == "--" ]]; then
+      shift
+      EXTRA_SIM_ARGS=("$@")
+    fi
+  else
+    echo "ERROR: first arg must be YYYY-MM-DD or '--'. Got: $1" >&2
     exit 1
   fi
 fi
 
+if [[ -z "${ASOF}" ]]; then
+  ASOF="$(_yesterday)"
+  if [[ -z "$ASOF" ]]; then
+    echo "ERROR: cannot compute yesterday; pass ASOF YYYY-MM-DD." >&2
+    exit 1
+  fi
+fi
+
+# ------------- required env -------------
 CURATED_ROOT="${CURATED_ROOT:?must set CURATED_ROOT}"
 
-# ---------- Paths ----------
-BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="$(cd "$BIN_DIR/.." && pwd)"
-
-# ---------- Defaults / env knobs ----------
+# ------------- knobs (env) -------------
 START_DATE="${START_DATE:-2025-09-05}"
 VALID_DAYS="${VALID_DAYS:-7}"
 SPORT="${SPORT:-horse-racing}"
 
-DEVICE="${DEVICE:-cuda}"        # XGBoost training device
-SIM_DEVICE="${SIM_DEVICE:-cpu}" # Simulator device (default cpu to avoid device mismatch warnings)
+DEVICE="${DEVICE:-cuda}"        # XGB train device
+SIM_DEVICE="${SIM_DEVICE:-cpu}" # simulate device (avoid device mismatch warnings)
 
 HORIZON_SECS="${HORIZON_SECS:-120}"
 PREOFF_MAX="${PREOFF_MAX:-30}"
 COMMISSION="${COMMISSION:-0.02}"
-
-# Simulation/trading knobs (NOT used by the trainer)
 EV_MODE="${EV_MODE:-mtm}"
+
 EDGE_THRESH="${EDGE_THRESH:-0.0}"
 STAKE="${STAKE:-kelly}"
 KELLY_CAP="${KELLY_CAP:-0.02}"
 KELLY_FLOOR="${KELLY_FLOOR:-0.001}"
 BANKROLL_NOM="${BANKROLL_NOM:-5000}"
 
-# EV rescaling + liquidity strictness (sim only)
+# EV rescaling + liquidity
 EV_SCALE="${EV_SCALE:-1.0}"
 REQUIRE_BOOK="${REQUIRE_BOOK:-0}"
 MIN_FILL_FRAC="${MIN_FILL_FRAC:-0.0}"
 
-# Odds band (optional)
+# Odds band
 ODDS_MIN="${ODDS_MIN:-}"
 ODDS_MAX="${ODDS_MAX:-}"
 
-# Liquidity enforcement
+# Liquidity
 ENFORCE_LIQUIDITY="${ENFORCE_LIQUIDITY:-0}"
 LIQUIDITY_LEVELS="${LIQUIDITY_LEVELS:-1}"
 
-OUTDIR="${OUTDIR:-$BASE_DIR/output}"
-mkdir -p "$OUTDIR" "$OUTDIR/stream"
+# Portfolio sizing
+PER_MARKET_TOPK="${PER_MARKET_TOPK:-1}"
+PER_MARKET_BUDGET="${PER_MARKET_BUDGET:-10}"
+BASKET_SIZING="${BASKET_SIZING:-equal_ev}"
+EXIT_ON_MOVE_TICKS="${EXIT_ON_MOVE_TICKS:-0}"
 
-# ---------- Training header ----------
+OUTDIR="${OUTDIR:-$BASE_DIR/output}"
+
+# ------------- headers -------------
 echo "=== Price Trend: TRAIN ==="
 echo "Curated root:    $CURATED_ROOT"
 echo "ASOF:            $ASOF"
@@ -71,20 +107,20 @@ echo "Commission:      $COMMISSION"
 echo "XGBoost device:  $DEVICE"
 echo "Model dir:       $OUTDIR/models"
 
-# ---------- Train (only training-supported args) ----------
+# ------------- TRAIN (only train-supported args) -------------
 python3 "$BASE_DIR/ml/train_price_trend.py" \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF" \
   --start-date "$START_DATE" \
   --valid-days "$VALID_DAYS" \
   --sport "$SPORT" \
-  --device "$DEVICE" \
   --horizon-secs "$HORIZON_SECS" \
   --preoff-max "$PREOFF_MAX" \
   --commission "$COMMISSION" \
+  --device "$DEVICE" \
   --output-dir "$OUTDIR"
 
-# ---------- Simulation header ----------
+# ------------- SIM header -------------
 echo "=== Price Trend: SIMULATE ==="
 echo "EV threshold:    $EDGE_THRESH per £1"
 echo "EV mode:         $EV_MODE    (scale=$EV_SCALE, cap not shown)"
@@ -95,10 +131,11 @@ else
 fi
 echo "Stake mode:      $STAKE (cap=$KELLY_CAP floor=$KELLY_FLOOR)  bankroll=$BANKROLL_NOM"
 echo "Liquidity:       enforce=$ENFORCE_LIQUIDITY levels=$LIQUIDITY_LEVELS require_book=$REQUIRE_BOOK min_fill_frac=$MIN_FILL_FRAC"
+echo "Portfolio:       topK=$PER_MARKET_TOPK budget=$PER_MARKET_BUDGET sizing=$BASKET_SIZING exit_ticks=$EXIT_ON_MOVE_TICKS"
 echo "Sim device:      $SIM_DEVICE"
 echo "Output dir:      $OUTDIR/stream"
 
-# ---------- Simulate (all trading knobs forwarded here) ----------
+# ------------- SIM args -------------
 SIM_ARGS=(
   --curated "$CURATED_ROOT"
   --asof "$ASOF"
@@ -108,31 +145,35 @@ SIM_ARGS=(
   --horizon-secs "$HORIZON_SECS"
   --preoff-max "$PREOFF_MAX"
   --commission "$COMMISSION"
-
   --edge-thresh "$EDGE_THRESH"
   --stake-mode "$STAKE"
   --kelly-cap "$KELLY_CAP"
   --kelly-floor "$KELLY_FLOOR"
   --bankroll-nom "$BANKROLL_NOM"
-
   --ev-mode "$EV_MODE"
   --ev-scale "$EV_SCALE"
   --min-fill-frac "$MIN_FILL_FRAC"
-
+  --per-market-topk "$PER_MARKET_TOPK"
+  --per-market-budget "$PER_MARKET_BUDGET"
+  --basket-sizing "$BASKET_SIZING"
+  --exit-on-move-ticks "$EXIT_ON_MOVE_TICKS"
   --device "$SIM_DEVICE"
   --output-dir "$OUTDIR/stream"
 )
 
 # Optional odds band
-if [[ -n "$ODDS_MIN" ]]; then SIM_ARGS+=( --odds-min "$ODDS_MIN" ); fi
-if [[ -n "$ODDS_MAX" ]]; then SIM_ARGS+=( --odds-max "$ODDS_MAX" ); fi
+[[ -n "$ODDS_MIN" ]] && SIM_ARGS+=( --odds-min "$ODDS_MIN" )
+[[ -n "$ODDS_MAX" ]] && SIM_ARGS+=( --odds-max "$ODDS_MAX" )
 
 # Liquidity flags
 if [[ "$ENFORCE_LIQUIDITY" == "1" ]]; then
   SIM_ARGS+=( --enforce-liquidity --liquidity-levels "$LIQUIDITY_LEVELS" )
 fi
-if [[ "$REQUIRE_BOOK" == "1" ]]; then
-  SIM_ARGS+=( --require-book )
+[[ "$REQUIRE_BOOK" == "1" ]] && SIM_ARGS+=( --require-book )
+
+# Append any extra simulator-only args after '--'
+if [[ ${#EXTRA_SIM_ARGS[@]} -gt 0 ]]; then
+  SIM_ARGS+=("${EXTRA_SIM_ARGS[@]}")
 fi
 
 python3 "$BASE_DIR/ml/simulate_stream.py" "${SIM_ARGS[@]}"
