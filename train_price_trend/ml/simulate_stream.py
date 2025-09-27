@@ -72,7 +72,7 @@ def parse_args():
     p.add_argument("--require-book", action="store_true")
     p.add_argument("--min-fill-frac", type=float, default=0.0)
 
-    # NEW: Per-market portfolioing (price-move dutching)
+    # Per-market portfolioing (price-move dutching)
     p.add_argument("--per-market-topk", type=int, default=2, help="Max runners per market per decision time (side-aware).")
     p.add_argument("--per-market-budget", type=float, default=50.0, help="£ cap across chosen runners in a market at a timestamp.")
     p.add_argument("--basket-sizing", choices=["equal_ev","inverse_ev","fractional_kelly"], default="equal_ev",
@@ -123,7 +123,7 @@ def _make_features_row(bufs, last_row):
             feats[k] = np.nan
     return feats
 
-# Tick ladder
+# Tick ladder helpers
 _TICKS = [
     (1.01, 2.00, 0.01), (2.00, 3.00, 0.02), (3.00, 4.00, 0.05), (4.00, 6.00, 0.10),
     (6.00,10.00,0.20), (10.0,20.0,0.50), (20.0,30.0,1.00), (30.0,50.0,2.00),
@@ -143,8 +143,7 @@ def _odds_from_tick_index(tick_index: int) -> float:
     lo, hi, step, t0, t1 = _cum_ticks[-1]
     k = min(t1, max(t0, tick_index)) - t0
     return round(lo + k * step, 2)
-def _tick_index_from_odds(odds: float) -> int:
-    # invert approx: walk ranges and compute index
+def _tick_index_from_odds(odds: float) -> float:
     acc = 0
     for lo, hi, step, t0, t1 in _cum_ticks:
         if lo <= odds <= hi:
@@ -217,13 +216,12 @@ def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
     )
 
 def _basket_weights(cands: List[Dict[str, Any]], mode: str) -> List[float]:
-    # cands contain ev_per_1, kelly_frac (optional), etc.
     if not cands: return []
     if mode == "equal_ev":
         w = np.array([max(1e-9, c["ev_per_1"]) for c in cands], dtype=float)
     elif mode == "inverse_ev":
         w = np.array([1.0 / max(1e-9, c["ev_per_1"]) for c in cands], dtype=float)
-    else:  # fractional_kelly -> weight by kelly fraction proxy
+    else:  # fractional_kelly
         w = np.array([max(1e-9, c.get("kelly_frac", 1e-3)) for c in cands], dtype=float)
     s = float(w.sum())
     if s <= 0: return [1.0 / len(cands)] * len(cands)
@@ -239,7 +237,7 @@ def main():
     valid_end = asof_dt
     valid_start = asof_dt - timedelta(days=args.valid_days)
 
-    # ---- Column-pruned snapshot scan (include countryCode, optionally book depth) ----
+    # ---- Column-pruned snapshot scan ----
     cols = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs","countryCode"]
     need_book = bool(args.enforce_liquidity)
     if need_book:
@@ -256,7 +254,7 @@ def main():
     if args.odds_min is not None: df = df.filter(pl.col("ltp") >= float(args.odds_min))
     if args.odds_max is not None: df = df.filter(pl.col("ltp") <= float(args.odds_max))
 
-    # ---- Build country facets (TRAIN frequency only) ----
+    # ---- Country facets ----
     df = df.with_columns(
         pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone("UTC").dt.date().alias("__date")
     )
@@ -279,7 +277,6 @@ def main():
         df_tr = df_tr.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
         df_va = df_va.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
 
-    # Recombine and order for streaming
     df = pl.concat([df_tr, df_va], how="vertical_relaxed").sort(["marketId","selectionId","publishTimeMs"])
 
     # Liquidity availability & effective setting
@@ -313,19 +310,14 @@ def main():
     # candidate buffer per (marketId, publishTimeMs) for portfolio selection
     cand_buf: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
 
-    def model_predict_batch(rows: List[List[float]], feat_names: List[str]) -> np.ndarray:
-        X = np.asarray(rows, dtype=np.float32)
-        try:
-            return bst.inplace_predict(X, validate_features=False)
-        except Exception:
-            dm = xgb.DMatrix(X, feature_names=feat_names)
-            return bst.predict(dm)
-
     feat_names = FEATURES_WITH_COUNTRY
 
-    # stream through snapshots, build per-market-time candidate lists
-    pending_features = []
-    pending_meta = []
+    def _predict_dp(feat_row: Dict[str, float]) -> float:
+        X = np.array([[feat_row.get(c, np.nan) for c in feat_names]], dtype=np.float32)
+        try:
+            return float(bst.inplace_predict(X, validate_features=False)[0])
+        except Exception:
+            return float(bst.predict(xgb.DMatrix(X, feature_names=feat_names))[0])
 
     def flush_candidates_for_time(market_id: str, ts_ms: int):
         key = (market_id, ts_ms)
@@ -342,39 +334,32 @@ def main():
 
         pick_longs  = longs[:max(0, args.per_market_topk)]
         pick_shorts = shorts[:max(0, args.per_market_topk)]
-
         picks = pick_longs + pick_shorts
         if not picks:
             cand_buf.pop(key, None)
             return []
 
+        # Compute Kelly fraction only if needed for sizing
+        need_kelly = (args.stake_mode == "kelly") or (args.basket_sizing == "fractional_kelly")
+        if need_kelly:
+            for c in picks:
+                if c["side"] == "back":
+                    kf = kelly_fraction_back(c["p_pred"], c["ltp"], args.commission)
+                else:
+                    kf = kelly_fraction_lay(c["p_pred"], c["ltp"], args.commission)
+                c["kelly_frac"] = max(args.kelly_floor, min(args.kelly_cap, kf))
+        else:
+            for c in picks:
+                c["kelly_frac"] = 0.0
+
         # Basket sizing
         budget = float(args.per_market_budget)
-        # Pre-compute per-candidate kelly fraction proxy (if needed)
-        for c in picks:
-            if args.stake-mode := None:  # just to quiet linters; we compute kelly_frac per pick anyway
-                pass
-            if c["side"] == "back":
-                kf = kelly_fraction_back(c["p_pred"], c["ltp"], args.commission)
-            else:
-                kf = kelly_fraction_lay(c["p_pred"], c["ltp"], args.commission)
-            c["kelly_frac"] = max(args.kelly_floor, min(args.kelly_cap, kf))
-
         weights = _basket_weights(picks, args.basket_sizing)
 
-        # For stake-mode=kelly: request = kelly_frac * bankroll; then scale to respect per-market budget.
-        # For stake-mode=flat: start at 1.0 per pick, then scale to budget using weights.
-        stakes_req = []
+        # Stakes requested
         if args.stake_mode == "kelly":
-            raw = [c["kelly_frac"] * float(args.bankroll_nom) for c in picks]
-            s = sum(raw)
-            if s <= 0:
-                stakes_req = [0.0] * len(picks)
-            else:
-                # Don't exceed market budget; scale proportionally to weights (not to raw), to keep desired mix
-                stakes_req = [budget * w for w in weights]
+            stakes_req = [budget * w for w in weights]
         else:
-            # Flat per £1 unit → allocate budget by weights
             stakes_req = [budget * w for w in weights]
 
         # Liquidity-aware execution per pick
@@ -418,7 +403,7 @@ def main():
                 "exec_odds": float(exec_vwap),
                 "exp_pnl": float(exp_pnl),
                 "exp_pnl_raw": float(exp_pnl_raw),
-                "stake_mode": c["stake_mode"],
+                "stake_mode": args.stake_mode,
             })
 
         cand_buf.pop(key, None)
@@ -451,22 +436,13 @@ def main():
         feats_base["is_gb"] = float(1.0 if (r.get("countryCode") == "GB") else 0.0)
         feats_base["country_freq"] = float(r.get("country_freq") or 0.0)
 
-        # Predict immediately (small vector)
-        X = np.array([[feats_base.get(c, np.nan) for c in feat_names]], dtype=np.float32)
-        try:
-            dp = float(bst.inplace_predict(X, validate_features=False)[0])
-        except Exception:
-            dp = float(bst.predict(xgb.DMatrix(X, feature_names=feat_names))[0])
-
+        dp = _predict_dp(feats_base)
         p_now = 1.0 / max(1e-12, float(r["ltp"]))
         p_pred = p_now + dp
         p_pred = 0.0 if p_pred < 0.0 else (1.0 if p_pred > 1.0 else p_pred)
 
-        if calibrator is not None:
-            try:
-                p_pred = float(calibrator.transform(np.array([p_pred]))[0])
-            except Exception:
-                pass
+        # (optional) calibrator
+        # if calibrator is not None: p_pred = float(calibrator.transform(np.array([p_pred]))[0])
 
         side = "back" if dp > 0 else ("lay" if dp < 0 else "none")
         if side == "none":
@@ -477,7 +453,6 @@ def main():
             ev_raw = _ev_mtm(p_now, p_pred, args.commission, side)
         else:
             ev_raw = _ev_settlement(p_pred, float(r["ltp"]), args.commission, side)
-
         ev_per_1 = ev_raw * float(args.ev_scale)
         if ev_per_1 < float(args.edge_thresh):
             continue
@@ -545,24 +520,18 @@ def main():
         pl.col("exit_odds").is_not_null() & (pl.col("exit_odds") > 1.01)
     )
 
-    # Optional tick-target exit override: if exit-on-move-ticks>0, we check whether price moved N ticks
+    # Optional tick-target annotation
     if int(args.exit_on_move_ticks) > 0:
         n_ticks = int(args.exit_on_move_ticks)
-        # Compute tick indexes at entry and exit, and direction
         trades2 = trades2.with_columns([
             pl.col("exec_odds").map_elements(_tick_index_from_odds, return_dtype=pl.Int64).alias("tick_entry"),
             pl.col("exit_odds").map_elements(_tick_index_from_odds, return_dtype=pl.Int64).alias("tick_exit"),
-        ])
-        # Successful exit if moved >= n_ticks in profitable direction; otherwise keep horizon exit
-        # (For back, we want price to shorten → tick_exit < tick_entry - n_ticks)
-        trades2 = trades2.with_columns([
+        ]).with_columns([
             pl.when(pl.col("side") == "back")
               .then((pl.col("tick_entry") - pl.col("tick_exit")) >= n_ticks)
               .otherwise((pl.col("tick_exit") - pl.col("tick_entry")) >= n_ticks)
               .alias("__hit_tick_target")
         ])
-        # For now we keep exit_odds regardless; this flag is emitted for analysis.
-        # A more sophisticated version would join to the first bar that hits the target.
 
     if args.min_fill_frac > 0:
         trades2 = trades2.filter(pl.col("fill_frac") >= float(args.min_fill_frac))
@@ -570,7 +539,7 @@ def main():
     EV_CAP = float(args.ev_cap)
     trades2 = trades2.with_columns(pl.col("ev_per_1").clip(-EV_CAP, EV_CAP))
 
-    # MTM P&L (using exit_odds)
+    # MTM P&L
     trades2 = trades2.with_columns([
         pl.when(pl.col("side") == "back")
           .then(((pl.col("exec_odds") / pl.col("exit_odds")) - 1.0) * pl.col("stake_filled"))
