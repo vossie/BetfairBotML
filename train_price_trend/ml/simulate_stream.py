@@ -69,7 +69,7 @@ def _has_book_columns(df: pl.DataFrame) -> bool:
     need = {"backTicks", "backSizes", "layTicks", "laySizes"}
     return need.issubset(cols)
 
-# ---------- feature builder (inline, minimal) ----------
+# ---------- feature builder ----------
 def _make_features_row(bufs, last_row):
     if len(bufs["ltp"]) < LAG_120S or len(bufs["vol"]) < LAG_120S:
         return None
@@ -120,7 +120,6 @@ def _make_features_row(bufs, last_row):
         "ltp_ret_60s": safe_div(ltp_now - ltp_l60, ltp_l60),
         "ltp_ret_120s": safe_div(ltp_now - ltp_l120, ltp_l120),
     }
-    # sanitize
     for k, v in feats.items():
         if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
             feats[k] = np.nan
@@ -224,7 +223,10 @@ def _prepare_exit_prices(df_snap: pl.DataFrame, horizon_secs: int) -> pl.DataFra
     select_exprs = [
         pl.col("marketId").cast(pl.Utf8),
         pl.col("selectionId").cast(pl.Int64),
-        pl.col("publishTimeMs").cast(pl.Int64).alias("ts"),
+        # store both ms int and Datetime for safe join_asof
+        pl.col("publishTimeMs").cast(pl.Int64).alias("ts_ms"),
+        pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
+          .dt.replace_time_zone("UTC").alias("ts_dt"),
         pl.col("ltp").cast(pl.Float64).alias("ltp_exit_proxy"),
     ]
     if _has_book_columns(df_snap):
@@ -234,18 +236,16 @@ def _prepare_exit_prices(df_snap: pl.DataFrame, horizon_secs: int) -> pl.DataFra
             pl.col("layTicks"),
             pl.col("laySizes"),
         ]
-    return df_snap.select(select_exprs).sort(["marketId","selectionId","ts"])
+    return df_snap.select(select_exprs).sort(["marketId","selectionId","ts_dt"])
 
 def main():
     args = parse_args()
     outdir = Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
 
-    # NEW: ensure no stale parts from previous schema versions
+    # purge stale parts from prior schema versions
     for _p in outdir.glob("trades_part_*.parquet"):
-        try:
-            _p.unlink()
-        except Exception:
-            pass
+        try: _p.unlink()
+        except Exception: pass
 
     curated = Path(args.curated)
 
@@ -316,7 +316,7 @@ def main():
             continue
 
         meta_rows.append((
-            r["publishTimeMs"],                    # 0 ts
+            r["publishTimeMs"],                    # 0 ts_ms
             r["marketId"],                         # 1
             int(r["selectionId"]),                 # 2
             float(r["ltp"]),                       # 3 ltp_now
@@ -340,8 +340,7 @@ def main():
     if not trades_parts:
         print("[simulate] no trades generated.")
         return
-
-    # target schema (must match what you write in process_batch)
+    # align schemas to avoid concat issues
     TARGET_SCHEMA = {
         "publishTimeMs": pl.Int64,
         "marketId": pl.Utf8,
@@ -359,39 +358,42 @@ def main():
         "exp_pnl": pl.Float64,
         "stake_mode": pl.Utf8,
     }
-
     aligned = []
     for p in trades_parts:
         dfp = pl.read_parquet(p)
-        # add any missing columns as nulls, cast present ones
         for col, dtype in TARGET_SCHEMA.items():
             if col not in dfp.columns:
                 dfp = dfp.with_columns(pl.lit(None, dtype=dtype).alias(col))
             else:
                 dfp = dfp.with_columns(pl.col(col).cast(dtype, strict=False))
-        # drop any extra columns and order consistently
         dfp = dfp.select(list(TARGET_SCHEMA.keys()))
         aligned.append(dfp)
-
     trades = pl.concat(aligned, how="vertical_relaxed")
+    for p in trades_parts:
+        try: p.unlink()
+        except Exception: pass
 
-    for p in trades_parts: p.unlink(missing_ok=True)
+    # EXIT at t+H: add Datetime keys and join_asof with timedelta tolerance
+    trades = trades.with_columns([
+        pl.col("publishTimeMs").cast(pl.Int64).alias("ts_ms"),
+        (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit_ms"),
+        pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
+          .dt.replace_time_zone("UTC").alias("ts_dt"),
+        pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000), time_unit="ms")
+          .dt.replace_time_zone("UTC").alias("ts_exit_dt"),
+    ])
+    trades_sorted = trades.sort(["marketId","selectionId","ts_exit_dt"])
+    exit_sorted = exit_df  # already sorted on ts_dt
 
-    # EXIT at t+H (asof join, forward)
-    trades = trades.with_columns(
-        (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit")
-    )
-    trades_sorted = trades.sort(["marketId","selectionId","ts_exit"])
-    exit_sorted = exit_df  # already sorted
     trades2 = trades_sorted.join_asof(
         exit_sorted,
-        left_on="ts_exit", right_on="ts",
+        left_on="ts_exit_dt", right_on="ts_dt",
         by=["marketId","selectionId"],
         strategy="forward",
-        tolerance=timedelta(minutes=10)
+        tolerance=timedelta(minutes=10),  # now valid since keys are Datetime
     ).with_columns(
         pl.col("ltp_exit_proxy").alias("exit_odds")
-    ).drop(["ts","ltp_exit_proxy"])
+    ).drop(["ts_ms","ts_dt","ts_exit_ms","ts_exit_dt","ltp_exit_proxy"])
 
     # Realised MTM P&L at exit (uses VWAP exec + exit LTP proxy)
     trades2 = trades2.with_columns([
@@ -513,7 +515,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path, 
     out = []
     commission = float(args.commission)
     for i, meta in enumerate(meta_rows):
-        ts, mid, sid, ltp_now, p_now, back_ticks, back_sizes, lay_ticks, lay_sizes = meta
+        ts_ms, mid, sid, ltp_now, p_now, back_ticks, back_sizes, lay_ticks, lay_sizes = meta
 
         dp = float(delta_pred[i])
         p_pred = p_now + dp
@@ -564,7 +566,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, outdir: Path, 
         exp_pnl = ev_per_1 * stake_filled
 
         out.append((
-            ts, mid, sid, ltp_now, p_now, p_pred, dp, side, ev_per_1,
+            ts_ms, mid, sid, ltp_now, p_now, p_pred, dp, side, ev_per_1,
             stake_req, stake_filled, fill_frac, float(exec_vwap), exp_pnl, args.stake_mode
         ))
 
