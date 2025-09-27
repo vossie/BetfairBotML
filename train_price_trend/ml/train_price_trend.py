@@ -43,27 +43,54 @@ def parse_args():
     return p.parse_args()
 
 def _build_features(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Window-expression implementation (Polars 1.33+), no GroupBy.apply.
+    Assumes ~5s cadence snapshots; lags are N rows within (marketId, selectionId).
+    """
     df = df.sort(["marketId","selectionId","publishTimeMs"])
-    def add_group_feats(g: pl.DataFrame) -> pl.DataFrame:
-        g = g.with_columns([
-            (pl.col("ltp") - pl.col("ltp").shift(1)).alias("ltp_diff_5s"),
-            (pl.col("tradedVolume") - pl.col("tradedVolume").shift(1)).alias("vol_diff_5s"),
-            pl.col("ltp").shift(LAG_30S).alias("ltp_lag30s"),
-            pl.col("ltp").shift(LAG_60S).alias("ltp_lag60s"),
-            pl.col("ltp").shift(LAG_120S).alias("ltp_lag120s"),
-            pl.col("tradedVolume").shift(LAG_30S).alias("tradedVolume_lag30s"),
-            pl.col("tradedVolume").shift(LAG_60S).alias("tradedVolume_lag60s"),
-            pl.col("tradedVolume").shift(LAG_120S).alias("tradedVolume_lag120s"),
-            (pl.col("ltp") - pl.col("ltp").shift(LAG_30S)).alias("ltp_mom_30s"),
-            (pl.col("ltp") - pl.col("ltp").shift(LAG_60S)).alias("ltp_mom_60s"),
-            (pl.col("ltp") - pl.col("ltp").shift(LAG_120S)).alias("ltp_mom_120s"),
-            ((pl.col("ltp") - pl.col("ltp").shift(LAG_30S)) / pl.col("ltp").shift(LAG_30S)).alias("ltp_ret_30s"),
-            ((pl.col("ltp") - pl.col("ltp").shift(LAG_60S)) / pl.col("ltp").shift(LAG_60S)).alias("ltp_ret_60s"),
-            ((pl.col("ltp") - pl.col("ltp").shift(LAG_120S)) / pl.col("ltp").shift(LAG_120S)).alias("ltp_ret_120s"),
-            (1.0 / pl.col("ltp")).alias("__p_now"),
-        ])
-        return g
-    return df.group_by(["marketId","selectionId"], maintain_order=True).apply(add_group_feats)
+
+    part = ["marketId","selectionId"]
+
+    ltp_shift_1   = pl.col("ltp").shift(1).over(part)
+    vol_shift_1   = pl.col("tradedVolume").shift(1).over(part)
+
+    ltp_lag30     = pl.col("ltp").shift(LAG_30S).over(part)
+    ltp_lag60     = pl.col("ltp").shift(LAG_60S).over(part)
+    ltp_lag120    = pl.col("ltp").shift(LAG_120S).over(part)
+
+    vol_lag30     = pl.col("tradedVolume").shift(LAG_30S).over(part)
+    vol_lag60     = pl.col("tradedVolume").shift(LAG_60S).over(part)
+    vol_lag120    = pl.col("tradedVolume").shift(LAG_120S).over(part)
+
+    def safe_ret(cur, lag):
+        return (cur - lag) / lag
+
+    df = df.with_columns([
+        # current
+        pl.col("ltp").cast(pl.Float64),
+        pl.col("tradedVolume").cast(pl.Float64),
+        # diffs
+        (pl.col("ltp") - ltp_shift_1).alias("ltp_diff_5s"),
+        (pl.col("tradedVolume") - vol_shift_1).alias("vol_diff_5s"),
+        # lags
+        ltp_lag30.alias("ltp_lag30s"),
+        ltp_lag60.alias("ltp_lag60s"),
+        ltp_lag120.alias("ltp_lag120s"),
+        vol_lag30.alias("tradedVolume_lag30s"),
+        vol_lag60.alias("tradedVolume_lag60s"),
+        vol_lag120.alias("tradedVolume_lag120s"),
+        # momentum
+        (pl.col("ltp") - ltp_lag30).alias("ltp_mom_30s"),
+        (pl.col("ltp") - ltp_lag60).alias("ltp_mom_60s"),
+        (pl.col("ltp") - ltp_lag120).alias("ltp_mom_120s"),
+        # returns
+        safe_ret(pl.col("ltp"), ltp_lag30).alias("ltp_ret_30s"),
+        safe_ret(pl.col("ltp"), ltp_lag60).alias("ltp_ret_60s"),
+        safe_ret(pl.col("ltp"), ltp_lag120).alias("ltp_ret_120s"),
+        # prob now
+        (1.0 / pl.col("ltp")).alias("__p_now"),
+    ])
+    return df
 
 def _future_join(df: pl.DataFrame, horizon_secs: int) -> pl.DataFrame:
     df2 = df.with_columns([
@@ -116,16 +143,20 @@ def main():
     print(f"XGBoost device:  {args.device}")
     print(f"EV mode:         mtm")
 
+    # columns to fetch (include countryCode for facet)
     cols = ["marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs","countryCode"]
+
     lf = read_snapshots(curated, start_dt, valid_end, args.sport)
     schema = lf.collect_schema().names()
     present = [c for c in cols if c in schema]
     lf = lf.select(present).with_columns([ time_to_off_minutes_expr() ])
 
     df = lf.collect()
+    # Sanity
     df = df.filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
     df = filter_preoff(df, args.preoff_max)
 
+    # Split train/valid
     df = df.with_columns(
         pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone(UTC_TZ).dt.date().alias("__date")
     )
@@ -135,6 +166,7 @@ def main():
     df_tr = df.filter(pl.col("__date") < valid_start)
     df_va = df.filter((pl.col("__date") >= valid_start) & (pl.col("__date") <= valid_end))
 
+    # Build features + target
     def prep(df_in: pl.DataFrame) -> pl.DataFrame:
         f = _build_features(df_in)
         f = _future_join(f, args.horizon_secs)
@@ -149,14 +181,15 @@ def main():
     df_tr_f = prep(df_tr)
     df_va_f = prep(df_va)
 
+    # Country facets: is_gb + frequency (computed on TRAIN only)
     feat_extra: list[str] = []
     if args.country_facet and "countryCode" in df_tr_f.columns:
         df_tr_f = df_tr_f.with_columns((pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb"))
         df_va_f = df_va_f.with_columns((pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb"))
         freq = (
             df_tr_f.group_by("countryCode").agg(pl.len().alias("cnt"))
-            .with_columns((pl.col("cnt") / pl.col("cnt").sum()).alias("freq"))
-            .select(["countryCode","freq"])
+                   .with_columns((pl.col("cnt") / pl.col("cnt").sum()).alias("freq"))
+                   .select(["countryCode","freq"])
         )
         df_tr_f = df_tr_f.join(freq, on="countryCode", how="left").with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
         df_va_f = df_va_f.join(freq, on="countryCode", how="left").with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
@@ -172,6 +205,7 @@ def main():
     X_tr, y_tr = to_xy(df_tr_f)
     X_va, y_va = to_xy(df_va_f)
 
+    # Train XGB (GPU/CPU)
     params = {
         "max_depth": 6,
         "n_estimators": 400,
@@ -187,6 +221,7 @@ def main():
     bst = xgb.XGBRegressor(**params)
     bst.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
+    # Validation EV diagnostic (MTM style)
     dp_pred = bst.predict(X_va)
     p_now = df_va_f["p_now"].to_numpy()
     p_pred = np.clip(p_now + dp_pred, 1e-6, 1.0-1e-6)
@@ -195,6 +230,8 @@ def main():
 
     print(f"[trend] rows train={len(y_tr):,}  valid={len(y_va):,}")
     print(f"[trend] valid EV per £1: mean={ev.mean():.5f}  p>0 share={(ev>0).mean():.3f}")
+
+    # Save model (core Booster for simulator)
     model_dir = Path(args.output_dir) / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / "xgb_trend_reg.json"
