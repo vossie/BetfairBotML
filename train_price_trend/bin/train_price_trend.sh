@@ -28,21 +28,22 @@ START_DATE="${START_DATE:-2025-09-05}"
 VALID_DAYS="${VALID_DAYS:-7}"
 SPORT="${SPORT:-horse-racing}"
 
-DEVICE="${DEVICE:-cuda}"        # training device
-SIM_DEVICE="${SIM_DEVICE:-cpu}" # simulate device (default cpu to avoid xgb device mismatch msg)
+DEVICE="${DEVICE:-cuda}"        # XGBoost training device
+SIM_DEVICE="${SIM_DEVICE:-cpu}" # Simulator device (default cpu to avoid device mismatch warnings)
 
 HORIZON_SECS="${HORIZON_SECS:-120}"
 PREOFF_MAX="${PREOFF_MAX:-30}"
 COMMISSION="${COMMISSION:-0.02}"
-EV_MODE="${EV_MODE:-mtm}"
 
+# Simulation/trading knobs (NOT used by the trainer)
+EV_MODE="${EV_MODE:-mtm}"
 EDGE_THRESH="${EDGE_THRESH:-0.0}"
 STAKE="${STAKE:-kelly}"
 KELLY_CAP="${KELLY_CAP:-0.02}"
 KELLY_FLOOR="${KELLY_FLOOR:-0.001}"
 BANKROLL_NOM="${BANKROLL_NOM:-5000}"
 
-# NEW: EV rescaling + liquidity strictness passed to simulator only
+# EV rescaling + liquidity strictness (sim only)
 EV_SCALE="${EV_SCALE:-1.0}"
 REQUIRE_BOOK="${REQUIRE_BOOK:-0}"
 MIN_FILL_FRAC="${MIN_FILL_FRAC:-0.0}"
@@ -56,28 +57,21 @@ ENFORCE_LIQUIDITY="${ENFORCE_LIQUIDITY:-0}"
 LIQUIDITY_LEVELS="${LIQUIDITY_LEVELS:-1}"
 
 OUTDIR="${OUTDIR:-$BASE_DIR/output}"
+mkdir -p "$OUTDIR" "$OUTDIR/stream"
 
-# ---------- Header ----------
-echo "=== Price Trend Training ==="
+# ---------- Training header ----------
+echo "=== Price Trend: TRAIN ==="
 echo "Curated root:    $CURATED_ROOT"
 echo "ASOF:            $ASOF"
 echo "Start date:      $START_DATE"
 echo "Valid days:      $VALID_DAYS"
 echo "Horizon (secs):  $HORIZON_SECS"
 echo "Pre-off max (m): $PREOFF_MAX"
-echo "Stake mode:      $STAKE (cap=$KELLY_CAP floor=$KELLY_FLOOR)"
-echo "EV mode:         $EV_MODE"
-if [[ -n "$ODDS_MIN" || -n "$ODDS_MAX" ]]; then
-  echo "Odds band:       ${ODDS_MIN:--} .. ${ODDS_MAX:--}"
-else
-  echo "Odds band:       - .. -"
-fi
-echo "Liquidity:       enforce=$ENFORCE_LIQUIDITY levels=$LIQUIDITY_LEVELS require_book=$REQUIRE_BOOK min_fill_frac=$MIN_FILL_FRAC"
-echo "EV scaling:      ev_scale=$EV_SCALE"
-echo "Devices:         train=$DEVICE  simulate=$SIM_DEVICE"
-echo "Output dir:      $OUTDIR"
+echo "Commission:      $COMMISSION"
+echo "XGBoost device:  $DEVICE"
+echo "Model dir:       $OUTDIR/models"
 
-# ---------- Train (idempotent, only training-supported args) ----------
+# ---------- Train (only training-supported args) ----------
 python3 "$BASE_DIR/ml/train_price_trend.py" \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF" \
@@ -90,8 +84,19 @@ python3 "$BASE_DIR/ml/train_price_trend.py" \
   --commission "$COMMISSION" \
   --output-dir "$OUTDIR"
 
-echo "=== Streaming Backtest ==="
+# ---------- Simulation header ----------
+echo "=== Price Trend: SIMULATE ==="
 echo "EV threshold:    $EDGE_THRESH per £1"
+echo "EV mode:         $EV_MODE    (scale=$EV_SCALE, cap not shown)"
+if [[ -n "$ODDS_MIN" || -n "$ODDS_MAX" ]]; then
+  echo "Odds band:       ${ODDS_MIN:--} .. ${ODDS_MAX:--}"
+else
+  echo "Odds band:       - .. -"
+fi
+echo "Stake mode:      $STAKE (cap=$KELLY_CAP floor=$KELLY_FLOOR)  bankroll=$BANKROLL_NOM"
+echo "Liquidity:       enforce=$ENFORCE_LIQUIDITY levels=$LIQUIDITY_LEVELS require_book=$REQUIRE_BOOK min_fill_frac=$MIN_FILL_FRAC"
+echo "Sim device:      $SIM_DEVICE"
+echo "Output dir:      $OUTDIR/stream"
 
 # ---------- Simulate (all trading knobs forwarded here) ----------
 SIM_ARGS=(
@@ -103,14 +108,17 @@ SIM_ARGS=(
   --horizon-secs "$HORIZON_SECS"
   --preoff-max "$PREOFF_MAX"
   --commission "$COMMISSION"
+
   --edge-thresh "$EDGE_THRESH"
   --stake-mode "$STAKE"
   --kelly-cap "$KELLY_CAP"
   --kelly-floor "$KELLY_FLOOR"
   --bankroll-nom "$BANKROLL_NOM"
+
   --ev-mode "$EV_MODE"
   --ev-scale "$EV_SCALE"
   --min-fill-frac "$MIN_FILL_FRAC"
+
   --device "$SIM_DEVICE"
   --output-dir "$OUTDIR/stream"
 )
