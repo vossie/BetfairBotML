@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from datetime import timedelta, timezone
 from collections import defaultdict, deque
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import polars as pl
@@ -31,39 +32,55 @@ BASE_FEATS = [
     "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
     "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
 ]
-# country facets added at runtime: ["is_gb","country_freq"]
+FEATURES_WITH_COUNTRY = BASE_FEATS + ["is_gb","country_freq"]
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Streaming backtest with EV rescaling, liquidity VWAP, MTM/settlement P&L, and country facets."
+        description="Streaming backtest with per-market portfolioing, EV rescaling, liquidity VWAP, and MTM/settlement P&L."
     )
+    # Data/time
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
     p.add_argument("--valid-days", type=int, default=7)
     p.add_argument("--sport", default="horse-racing")
 
+    # Modeling horizon / window
     p.add_argument("--horizon-secs", type=int, default=120)
     p.add_argument("--preoff-max", type=int, default=30)
+
+    # Trading economics
     p.add_argument("--commission", type=float, default=0.02)
-    p.add_argument("--edge-thresh", type=float, default=0.002)
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
     p.add_argument("--ev-cap", type=float, default=1.0)
     p.add_argument("--ev-scale", type=float, default=1.0)
+    p.add_argument("--edge-thresh", type=float, default=0.002)
 
+    # Staking / bankroll
     p.add_argument("--stake-mode", choices=["flat","kelly"], default="kelly")
     p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
 
+    # Odds filter
     p.add_argument("--odds-min", type=float, default=None)
     p.add_argument("--odds-max", type=float, default=None)
 
+    # Liquidity enforcement
     p.add_argument("--liquidity-levels", type=int, default=1)
     p.add_argument("--enforce-liquidity", action="store_true")
     p.add_argument("--require-book", action="store_true")
     p.add_argument("--min-fill-frac", type=float, default=0.0)
 
+    # NEW: Per-market portfolioing (price-move dutching)
+    p.add_argument("--per-market-topk", type=int, default=2, help="Max runners per market per decision time (side-aware).")
+    p.add_argument("--per-market-budget", type=float, default=50.0, help="£ cap across chosen runners in a market at a timestamp.")
+    p.add_argument("--basket-sizing", choices=["equal_ev","inverse_ev","fractional_kelly"], default="equal_ev",
+                   help="How to allocate the per-market budget across chosen runners.")
+    p.add_argument("--exit-on-move-ticks", type=int, default=0,
+                   help="If >0, exit early when price moves N ticks in the predicted direction; else fixed horizon exit.")
+
+    # Runtime / model / output
     p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
     p.add_argument("--calib-path", default="")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
@@ -126,6 +143,15 @@ def _odds_from_tick_index(tick_index: int) -> float:
     lo, hi, step, t0, t1 = _cum_ticks[-1]
     k = min(t1, max(t0, tick_index)) - t0
     return round(lo + k * step, 2)
+def _tick_index_from_odds(odds: float) -> int:
+    # invert approx: walk ranges and compute index
+    acc = 0
+    for lo, hi, step, t0, t1 in _cum_ticks:
+        if lo <= odds <= hi:
+            k = int(round((odds - lo) / step))
+            return t0 + k
+        acc = t1 + 1
+    return acc
 
 def _vwap_fill(side: str, ticks: list[int], sizes: list[float], need: float, levels: int) -> tuple[float,float]:
     if not ticks or not sizes or need <= 0.0: return 0.0, None
@@ -190,6 +216,19 @@ def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
         .sort(["marketId","selectionId","ts_dt"])
     )
 
+def _basket_weights(cands: List[Dict[str, Any]], mode: str) -> List[float]:
+    # cands contain ev_per_1, kelly_frac (optional), etc.
+    if not cands: return []
+    if mode == "equal_ev":
+        w = np.array([max(1e-9, c["ev_per_1"]) for c in cands], dtype=float)
+    elif mode == "inverse_ev":
+        w = np.array([1.0 / max(1e-9, c["ev_per_1"]) for c in cands], dtype=float)
+    else:  # fractional_kelly -> weight by kelly fraction proxy
+        w = np.array([max(1e-9, c.get("kelly_frac", 1e-3)) for c in cands], dtype=float)
+    s = float(w.sum())
+    if s <= 0: return [1.0 / len(cands)] * len(cands)
+    return list(w / s)
+
 def main():
     args = parse_args()
     outdir = Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
@@ -200,7 +239,7 @@ def main():
     valid_end = asof_dt
     valid_start = asof_dt - timedelta(days=args.valid_days)
 
-    # ---- Column-pruned snapshot scan (include countryCode) ----
+    # ---- Column-pruned snapshot scan (include countryCode, optionally book depth) ----
     cols = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs","countryCode"]
     need_book = bool(args.enforce_liquidity)
     if need_book:
@@ -224,7 +263,6 @@ def main():
     df_tr = df.filter(pl.col("__date") < valid_start)
     df_va = df.filter(pl.col("__date") >= valid_start)
 
-    # frequency from TRAIN only
     if "countryCode" in df.columns:
         freq = (
             df_tr.group_by("countryCode").agg(pl.len().alias("cnt"))
@@ -241,7 +279,7 @@ def main():
         df_tr = df_tr.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
         df_va = df_va.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
 
-    # recombine for streaming order
+    # Recombine and order for streaming
     df = pl.concat([df_tr, df_va], how="vertical_relaxed").sort(["marketId","selectionId","publishTimeMs"])
 
     # Liquidity availability & effective setting
@@ -272,15 +310,135 @@ def main():
     bufs_ltp = defaultdict(lambda: deque(maxlen=LAG_120S))
     bufs_vol = defaultdict(lambda: deque(maxlen=LAG_120S))
 
-    all_records: list[pl.DataFrame] = []
-    feature_rows, meta_rows = [], []
+    # candidate buffer per (marketId, publishTimeMs) for portfolio selection
+    cand_buf: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
+
+    def model_predict_batch(rows: List[List[float]], feat_names: List[str]) -> np.ndarray:
+        X = np.asarray(rows, dtype=np.float32)
+        try:
+            return bst.inplace_predict(X, validate_features=False)
+        except Exception:
+            dm = xgb.DMatrix(X, feature_names=feat_names)
+            return bst.predict(dm)
+
+    feat_names = FEATURES_WITH_COUNTRY
+
+    # stream through snapshots, build per-market-time candidate lists
+    pending_features = []
+    pending_meta = []
+
+    def flush_candidates_for_time(market_id: str, ts_ms: int):
+        key = (market_id, ts_ms)
+        cands = cand_buf.get(key, [])
+        if not cands:
+            return []
+
+        # Split by side and rank
+        longs  = [c for c in cands if c["side"] == "back"]
+        shorts = [c for c in cands if c["side"] == "lay"]
+
+        longs.sort(key=lambda c: c["ev_per_1"], reverse=True)
+        shorts.sort(key=lambda c: c["ev_per_1"], reverse=True)
+
+        pick_longs  = longs[:max(0, args.per_market_topk)]
+        pick_shorts = shorts[:max(0, args.per_market_topk)]
+
+        picks = pick_longs + pick_shorts
+        if not picks:
+            cand_buf.pop(key, None)
+            return []
+
+        # Basket sizing
+        budget = float(args.per_market_budget)
+        # Pre-compute per-candidate kelly fraction proxy (if needed)
+        for c in picks:
+            if args.stake-mode := None:  # just to quiet linters; we compute kelly_frac per pick anyway
+                pass
+            if c["side"] == "back":
+                kf = kelly_fraction_back(c["p_pred"], c["ltp"], args.commission)
+            else:
+                kf = kelly_fraction_lay(c["p_pred"], c["ltp"], args.commission)
+            c["kelly_frac"] = max(args.kelly_floor, min(args.kelly_cap, kf))
+
+        weights = _basket_weights(picks, args.basket_sizing)
+
+        # For stake-mode=kelly: request = kelly_frac * bankroll; then scale to respect per-market budget.
+        # For stake-mode=flat: start at 1.0 per pick, then scale to budget using weights.
+        stakes_req = []
+        if args.stake_mode == "kelly":
+            raw = [c["kelly_frac"] * float(args.bankroll_nom) for c in picks]
+            s = sum(raw)
+            if s <= 0:
+                stakes_req = [0.0] * len(picks)
+            else:
+                # Don't exceed market budget; scale proportionally to weights (not to raw), to keep desired mix
+                stakes_req = [budget * w for w in weights]
+        else:
+            # Flat per £1 unit → allocate budget by weights
+            stakes_req = [budget * w for w in weights]
+
+        # Liquidity-aware execution per pick
+        realized = []
+        for c, stake_req in zip(picks, stakes_req):
+            if stake_req <= 0:
+                continue
+            if effective_enforce and c["has_book"]:
+                avail_ticks = c["backTicks"] if c["side"] == "back" else c["layTicks"]
+                avail_sizes = c["backSizes"] if c["side"] == "back" else c["laySizes"]
+                stake_filled, exec_vwap = _vwap_fill(c["side"], avail_ticks, avail_sizes, stake_req, args.liquidity_levels)
+            elif args.enforce_liquidity and args.require_book:
+                continue
+            else:
+                stake_filled = stake_req
+                exec_vwap = float(c["ltp"])
+
+            if stake_filled <= 0 or exec_vwap is None:
+                continue
+
+            fill_frac = stake_filled / stake_req if stake_req > 1e-9 else 1.0
+            if fill_frac < float(args.min_fill_frac):
+                continue
+
+            exp_pnl_raw = c["ev_raw"] * stake_filled
+            exp_pnl     = c["ev_per_1"] * stake_filled
+
+            realized.append({
+                "publishTimeMs": c["ts_ms"],
+                "marketId": c["marketId"],
+                "selectionId": c["selectionId"],
+                "ltp": c["ltp"],
+                "p_now": c["p_now"],
+                "p_pred": c["p_pred"],
+                "delta_pred": c["dp"],
+                "side": c["side"],
+                "ev_per_1": c["ev_per_1"],
+                "stake_req": float(stake_req),
+                "stake_filled": float(stake_filled),
+                "fill_frac": float(fill_frac),
+                "exec_odds": float(exec_vwap),
+                "exp_pnl": float(exp_pnl),
+                "exp_pnl_raw": float(exp_pnl_raw),
+                "stake_mode": c["stake_mode"],
+            })
+
+        cand_buf.pop(key, None)
+        return realized
+
+    # Stream rows and build features + candidates
+    trades_records: List[pl.DataFrame] = []
+    last_key = None
 
     for r in df.iter_rows(named=True):
-        key = (r["marketId"], int(r["selectionId"]))
-        bufs_ltp[key].append(float(r["ltp"]))
-        bufs_vol[key].append(float(r["tradedVolume"]))
+        mkt = r["marketId"]; sel = int(r["selectionId"])
+        ts_ms = int(r["publishTimeMs"])
+        key = (mkt, ts_ms)
 
-        feats_base = _make_features_row({"ltp": bufs_ltp[key], "vol": bufs_vol[key]}, {
+        # Maintain per-runner buffers
+        runner_key = (mkt, sel)
+        bufs_ltp[runner_key].append(float(r["ltp"]))
+        bufs_vol[runner_key].append(float(r["tradedVolume"]))
+
+        feats_base = _make_features_row({"ltp": bufs_ltp[runner_key], "vol": bufs_vol[runner_key]}, {
             "ltp": float(r["ltp"]),
             "tradedVolume": float(r["tradedVolume"]),
             "spreadTicks": float(r.get("spreadTicks") or 0.0),
@@ -290,46 +448,91 @@ def main():
         if feats_base is None:
             continue
 
-        # append country facets
         feats_base["is_gb"] = float(1.0 if (r.get("countryCode") == "GB") else 0.0)
         feats_base["country_freq"] = float(r.get("country_freq") or 0.0)
 
-        # meta
-        meta_rows.append((
-            r["publishTimeMs"], r["marketId"], int(r["selectionId"]),
-            float(r["ltp"]), float(feats_base["__p_now"]),
-            (r.get("backTicks") or []) if book_available else [],
-            (r.get("backSizes") or []) if book_available else [],
-            (r.get("layTicks") or []) if book_available else [],
-            (r.get("laySizes") or []) if book_available else [],
-        ))
-        # features (order must match model training)
-        feat_names = BASE_FEATS + ["is_gb","country_freq"]
-        feature_rows.append([feats_base.get(c, np.nan) for c in feat_names])
+        # Predict immediately (small vector)
+        X = np.array([[feats_base.get(c, np.nan) for c in feat_names]], dtype=np.float32)
+        try:
+            dp = float(bst.inplace_predict(X, validate_features=False)[0])
+        except Exception:
+            dp = float(bst.predict(xgb.DMatrix(X, feature_names=feat_names))[0])
 
-        if len(feature_rows) >= args.batch_size:
-            all_records.append(process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce, feat_names))
-            feature_rows.clear(); meta_rows.clear()
+        p_now = 1.0 / max(1e-12, float(r["ltp"]))
+        p_pred = p_now + dp
+        p_pred = 0.0 if p_pred < 0.0 else (1.0 if p_pred > 1.0 else p_pred)
 
-    if feature_rows:
-        all_records.append(process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce, feat_names))
-        feature_rows.clear(); meta_rows.clear()
+        if calibrator is not None:
+            try:
+                p_pred = float(calibrator.transform(np.array([p_pred]))[0])
+            except Exception:
+                pass
 
-    if not all_records:
+        side = "back" if dp > 0 else ("lay" if dp < 0 else "none")
+        if side == "none":
+            continue
+
+        # EV computation (raw and scaled)
+        if args.ev_mode == "mtm":
+            ev_raw = _ev_mtm(p_now, p_pred, args.commission, side)
+        else:
+            ev_raw = _ev_settlement(p_pred, float(r["ltp"]), args.commission, side)
+
+        ev_per_1 = ev_raw * float(args.ev_scale)
+        if ev_per_1 < float(args.edge_thresh):
+            continue
+
+        # Add to candidate buffer
+        has_book = book_available and (r.get("backTicks") is not None or r.get("layTicks") is not None)
+        cand_buf[key].append({
+            "ts_ms": ts_ms,
+            "marketId": mkt,
+            "selectionId": sel,
+            "ltp": float(r["ltp"]),
+            "p_now": float(p_now),
+            "p_pred": float(p_pred),
+            "dp": float(dp),
+            "side": side,
+            "ev_raw": float(ev_raw),
+            "ev_per_1": float(ev_per_1),
+            "stake_mode": args.stake_mode,
+            "has_book": bool(has_book),
+            "backTicks": r.get("backTicks") or [],
+            "backSizes": r.get("backSizes") or [],
+            "layTicks": r.get("layTicks") or [],
+            "laySizes": r.get("laySizes") or [],
+        })
+
+        # Whenever market/time changes, flush previous key
+        if last_key is None:
+            last_key = key
+        elif key != last_key:
+            realized = flush_candidates_for_time(last_key[0], last_key[1])
+            if realized:
+                trades_records.append(_to_df(realized))
+            last_key = key
+
+    # Flush final batch
+    if last_key is not None:
+        realized = flush_candidates_for_time(last_key[0], last_key[1])
+        if realized:
+            trades_records.append(_to_df(realized))
+
+    if not trades_records:
         print("[simulate] no trades generated.")
         _write_empty(outdir, args)
         return
 
-    trades = pl.concat(all_records, how="vertical_relaxed")
+    trades = pl.concat(trades_records, how="vertical_relaxed")
 
+    # Exit price joining
     trades = trades.with_columns([
         (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit_ms"),
         pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64)), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_dt"),
         pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_exit_dt"),
     ])
-    trades_sorted = trades.sort(["marketId","selectionId","ts_exit_dt"])
-
     exit_df = exit_df.sort(["marketId","selectionId","ts_dt"])
+    trades_sorted = trades.sort(["marketId","selectionId","ts_exit_dt"])
     trades2 = trades_sorted.join_asof(
         exit_df,
         left_on="ts_exit_dt", right_on="ts_dt",
@@ -342,12 +545,32 @@ def main():
         pl.col("exit_odds").is_not_null() & (pl.col("exit_odds") > 1.01)
     )
 
+    # Optional tick-target exit override: if exit-on-move-ticks>0, we check whether price moved N ticks
+    if int(args.exit_on_move_ticks) > 0:
+        n_ticks = int(args.exit_on_move_ticks)
+        # Compute tick indexes at entry and exit, and direction
+        trades2 = trades2.with_columns([
+            pl.col("exec_odds").map_elements(_tick_index_from_odds, return_dtype=pl.Int64).alias("tick_entry"),
+            pl.col("exit_odds").map_elements(_tick_index_from_odds, return_dtype=pl.Int64).alias("tick_exit"),
+        ])
+        # Successful exit if moved >= n_ticks in profitable direction; otherwise keep horizon exit
+        # (For back, we want price to shorten → tick_exit < tick_entry - n_ticks)
+        trades2 = trades2.with_columns([
+            pl.when(pl.col("side") == "back")
+              .then((pl.col("tick_entry") - pl.col("tick_exit")) >= n_ticks)
+              .otherwise((pl.col("tick_exit") - pl.col("tick_entry")) >= n_ticks)
+              .alias("__hit_tick_target")
+        ])
+        # For now we keep exit_odds regardless; this flag is emitted for analysis.
+        # A more sophisticated version would join to the first bar that hits the target.
+
     if args.min_fill_frac > 0:
         trades2 = trades2.filter(pl.col("fill_frac") >= float(args.min_fill_frac))
 
     EV_CAP = float(args.ev_cap)
     trades2 = trades2.with_columns(pl.col("ev_per_1").clip(-EV_CAP, EV_CAP))
 
+    # MTM P&L (using exit_odds)
     trades2 = trades2.with_columns([
         pl.when(pl.col("side") == "back")
           .then(((pl.col("exec_odds") / pl.col("exit_odds")) - 1.0) * pl.col("stake_filled"))
@@ -357,6 +580,7 @@ def main():
         pl.when(pl.col("real_mtm_pnl_raw").is_finite()).then(pl.col("real_mtm_pnl_raw")).otherwise(pl.lit(None)).alias("real_mtm_pnl")
     ).drop("real_mtm_pnl_raw")
 
+    # Settlement P&L (requires results)
     results_df = _load_results(curated, args.sport, start_dt, valid_end)
     if results_df.height > 0:
         comm = float(args.commission)
@@ -375,9 +599,12 @@ def main():
     else:
         trades2 = trades2.with_columns(pl.lit(None, dtype=pl.Float64).alias("real_settle_pnl"))
 
-    if args.write_trades:
-        (Path(args.output_dir) / f"trades_{args.asof}.csv").write_text(trades2.write_csv())
+    # Persist trades (optional)
+    if int(args.write_trades) == 1:
+        trades_path = Path(args.output_dir) / f"trades_{args.asof}.parquet"
+        trades2.write_parquet(trades_path)
 
+    # Daily summary with ROI
     daily = (
         trades2
         .with_columns(
@@ -404,6 +631,7 @@ def main():
     daily_csv = Path(args.output_dir) / f"daily_{args.asof}.csv"
     daily.write_csv(daily_csv)
 
+    # Overall summary
     total_exp_profit   = float(trades2["exp_pnl"].fill_null(0.0).sum())
     avg_ev             = float(trades2["ev_per_1"].mean())
     total_real_mtm     = float(trades2["real_mtm_pnl"].fill_null(0.0).sum())
@@ -442,6 +670,10 @@ def main():
         "enforce_liquidity_effective": bool(effective_enforce),
         "require_book": bool(args.require_book),
         "min_fill_frac": args.min_fill_frac,
+        "per_market_topk": args.per_market_topk,
+        "per_market_budget": args.per_market_budget,
+        "basket_sizing": args.basket_sizing,
+        "exit_on_move_ticks": args.exit_on_move_ticks,
         "n_trades": int(trades2.height),
         "total_exp_profit": total_exp_profit,
         "avg_ev_per_1": avg_ev,
@@ -451,7 +683,7 @@ def main():
         "overall_roi_real_mtm": roi_real_mtm,
         "overall_roi_real_settle": roi_real_settle,
         "ev_scale_suggested": suggested_scale,
-        "features_used": BASE_FEATS + ["is_gb","country_freq"],
+        "features_used": FEATURES_WITH_COUNTRY,
     }
     write_json(Path(args.output_dir) / f"summary_{args.asof}.json", summ)
 
@@ -466,84 +698,9 @@ def main():
     if suggested_scale is not None:
         print(f"[simulate] Suggested --ev-scale ≈ {suggested_scale:.6g} (based on {args.ev_mode} PnL)")
 
-def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce: bool, feat_names: list[str]) -> pl.DataFrame:
-    X = np.asarray(feature_rows, dtype=np.float32)
-    try:
-        delta_pred = bst.inplace_predict(X, validate_features=False)
-    except Exception:
-        dm = xgb.DMatrix(X, feature_names=feat_names)
-        delta_pred = bst.predict(dm)
-
-    out = []
-    commission = float(args.commission)
-    scale = float(args.ev_scale)
-
-    for i, meta in enumerate(meta_rows):
-        ts_ms, mid, sid, ltp_now, p_now, back_ticks, back_sizes, lay_ticks, lay_sizes = meta
-
-        dp = float(delta_pred[i])
-        p_pred = p_now + dp
-        p_pred = 0.0 if p_pred < 0.0 else (1.0 if p_pred > 1.0 else p_pred)
-        if calibrator:
-            try: p_pred = float(calibrator.transform(np.array([p_pred]))[0])
-            except Exception: pass
-
-        side = "back" if dp > 0 else ("lay" if dp < 0 else "none")
-        if side == "none": continue
-
-        ev_raw = _ev_mtm(p_now, p_pred, commission, side) if args.ev_mode == "mtm" \
-                 else _ev_settlement(p_pred, ltp_now, commission, side)
-
-        ev_per_1 = ev_raw * scale
-        if ev_per_1 < args.edge_thresh:
-            continue
-
-        if args.stake_mode == "flat":
-            stake_req = 1.0
-        else:
-            if side == "back":
-                f = kelly_fraction_back(p_pred, ltp_now, commission)
-            else:
-                f = kelly_fraction_lay(p_pred, ltp_now, commission)
-            f = max(args.kelly_floor, min(args.kelly_cap, f))
-            stake_req = f * float(args.bankroll_nom)
-
-        has_book = bool(back_ticks or lay_ticks)
-        if effective_enforce and has_book:
-            avail_sizes = back_sizes if side == "back" else lay_sizes
-            avail_ticks = back_ticks if side == "back" else lay_ticks
-            stake_filled, exec_vwap = _vwap_fill(side, avail_ticks, avail_sizes, stake_req, args.liquidity_levels)
-        elif args.enforce_liquidity and args.require_book:
-            continue
-        else:
-            stake_filled = stake_req
-            exec_vwap = float(ltp_now)
-
-        if stake_filled <= 0.0 or exec_vwap is None:
-            continue
-
-        fill_frac = stake_filled / stake_req if stake_req > 0 else 1.0
-        exp_pnl_raw = ev_raw * stake_filled
-        exp_pnl = ev_per_1 * stake_filled
-
-        out.append((
-            int(ts_ms), str(mid), int(sid),
-            float(ltp_now), float(p_now), float(p_pred), float(dp), str(side), float(ev_per_1),
-            float(stake_req), float(stake_filled), float(fill_frac), float(exec_vwap),
-            float(exp_pnl), float(exp_pnl_raw), str(args.stake_mode),
-        ))
-
-    if not out:
-        return pl.DataFrame(schema={
-            "publishTimeMs": pl.Int64, "marketId": pl.Utf8, "selectionId": pl.Int64,
-            "ltp": pl.Float64, "p_now": pl.Float64, "p_pred": pl.Float64, "delta_pred": pl.Float64,
-            "side": pl.Utf8, "ev_per_1": pl.Float64,
-            "stake_req": pl.Float64, "stake_filled": pl.Float64, "fill_frac": pl.Float64,
-            "exec_odds": pl.Float64, "exp_pnl": pl.Float64, "exp_pnl_raw": pl.Float64, "stake_mode": pl.Utf8
-        })
-
+def _to_df(records: List[Dict[str, Any]]) -> pl.DataFrame:
     return pl.DataFrame(
-        out,
+        records,
         schema={
             "publishTimeMs": pl.Int64,
             "marketId": pl.Utf8,
@@ -572,9 +729,11 @@ def _write_empty(outdir: Path, args):
     daily.write_csv(outdir / f"daily_{args.asof}.csv")
     write_json(outdir / f"summary_{args.asof}.json", {
         "asof": args.asof, "n_trades": 0, "ev_scale_used": args.ev_scale,
+        "per_market_topk": args.per_market_topk, "per_market_budget": args.per_market_budget,
+        "basket_sizing": args.basket_sizing, "exit_on_move_ticks": args.exit_on_move_ticks,
         "enforce_liquidity_requested": bool(args.enforce_liquidity),
         "require_book": bool(args.require_book),
-        "features_used": BASE_FEATS + ["is_gb","country_freq"],
+        "features_used": FEATURES_WITH_COUNTRY,
     })
 
 if __name__ == "__main__":
