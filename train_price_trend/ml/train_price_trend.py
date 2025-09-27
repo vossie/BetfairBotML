@@ -18,18 +18,17 @@ LAG_30S = 6
 LAG_60S = 12
 LAG_120S = 24
 
-NUMERIC_FEATS = [
+BASE_FEATS = [
     "ltp","tradedVolume","spreadTicks","imbalanceBest1","mins_to_off","__p_now",
     "ltp_diff_5s","vol_diff_5s",
     "ltp_lag30s","ltp_lag60s","ltp_lag120s",
     "tradedVolume_lag30s","tradedVolume_lag60s","tradedVolume_lag120s",
     "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
     "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
-    # country facets appended later
 ]
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train price-trend delta model (regression) with country facet")
+    p = argparse.ArgumentParser(description="Train price-trend delta model (regression) with country facets")
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
@@ -44,9 +43,7 @@ def parse_args():
     return p.parse_args()
 
 def _build_features(df: pl.DataFrame) -> pl.DataFrame:
-    # ensure sorted
     df = df.sort(["marketId","selectionId","publishTimeMs"])
-    # group rolling features by runner
     def add_group_feats(g: pl.DataFrame) -> pl.DataFrame:
         g = g.with_columns([
             (pl.col("ltp") - pl.col("ltp").shift(1)).alias("ltp_diff_5s"),
@@ -66,11 +63,9 @@ def _build_features(df: pl.DataFrame) -> pl.DataFrame:
             (1.0 / pl.col("ltp")).alias("__p_now"),
         ])
         return g
-    df = df.group_by(["marketId","selectionId"], maintain_order=True).apply(add_group_feats)
-    return df
+    return df.group_by(["marketId","selectionId"], maintain_order=True).apply(add_group_feats)
 
 def _future_join(df: pl.DataFrame, horizon_secs: int) -> pl.DataFrame:
-    # As-of join to get future ltp at t+H
     df2 = df.with_columns([
         (pl.col("publishTimeMs").cast(pl.Int64) + horizon_secs * 1000).alias("ts_exit_ms"),
         pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone(UTC_TZ).alias("ts_dt"),
@@ -118,24 +113,19 @@ def main():
     print(f"Valid days:      {args.valid_days}")
     print(f"Horizon (secs):  {args.horizon_secs}")
     print(f"Pre-off max (m): {args.preoff_max}")
-    print(f"Stake mode:      kelly (cap={0.02} floor={0.001})")
     print(f"XGBoost device:  {args.device}")
     print(f"EV mode:         mtm")
 
-    # columns to fetch (include countryCode for facet)
     cols = ["marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs","countryCode"]
-
     lf = read_snapshots(curated, start_dt, valid_end, args.sport)
     schema = lf.collect_schema().names()
     present = [c for c in cols if c in schema]
     lf = lf.select(present).with_columns([ time_to_off_minutes_expr() ])
 
     df = lf.collect()
-    # sanity for ltp
     df = df.filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
     df = filter_preoff(df, args.preoff_max)
 
-    # split train/valid
     df = df.with_columns(
         pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone(UTC_TZ).dt.date().alias("__date")
     )
@@ -145,7 +135,6 @@ def main():
     df_tr = df.filter(pl.col("__date") < valid_start)
     df_va = df.filter((pl.col("__date") >= valid_start) & (pl.col("__date") <= valid_end))
 
-    # build features and target dp = p_future - p_now
     def prep(df_in: pl.DataFrame) -> pl.DataFrame:
         f = _build_features(df_in)
         f = _future_join(f, args.horizon_secs)
@@ -160,30 +149,20 @@ def main():
     df_tr_f = prep(df_tr)
     df_va_f = prep(df_va)
 
-    # country facets: is_gb and frequency encoding from TRAIN only
+    feat_extra: list[str] = []
     if args.country_facet and "countryCode" in df_tr_f.columns:
-        # derive is_gb
-        df_tr_f = df_tr_f.with_columns(
-            (pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb")
-        )
-        df_va_f = df_va_f.with_columns(
-            (pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb")
-        )
-        # frequency encoding
+        df_tr_f = df_tr_f.with_columns((pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb"))
+        df_va_f = df_va_f.with_columns((pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb"))
         freq = (
             df_tr_f.group_by("countryCode").agg(pl.len().alias("cnt"))
             .with_columns((pl.col("cnt") / pl.col("cnt").sum()).alias("freq"))
             .select(["countryCode","freq"])
         )
-        df_tr_f = df_tr_f.join(freq, on="countryCode", how="left")
-        df_va_f = df_va_f.join(freq, on="countryCode", how="left")
-        df_tr_f = df_tr_f.with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
-        df_va_f = df_va_f.with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
+        df_tr_f = df_tr_f.join(freq, on="countryCode", how="left").with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
+        df_va_f = df_va_f.join(freq, on="countryCode", how="left").with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
         feat_extra = ["is_gb","country_freq"]
-    else:
-        feat_extra = []
 
-    feature_cols = NUMERIC_FEATS + feat_extra
+    feature_cols = BASE_FEATS + feat_extra
 
     def to_xy(df_feat: pl.DataFrame):
         X = df_feat.select([pl.col(c).cast(pl.Float64) for c in feature_cols]).to_numpy()
@@ -193,7 +172,6 @@ def main():
     X_tr, y_tr = to_xy(df_tr_f)
     X_va, y_va = to_xy(df_va_f)
 
-    # train XGB regressor
     params = {
         "max_depth": 6,
         "n_estimators": 400,
@@ -209,7 +187,6 @@ def main():
     bst = xgb.XGBRegressor(**params)
     bst.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
 
-    # quick EV diagnostic on validation (mtm)
     dp_pred = bst.predict(X_va)
     p_now = df_va_f["p_now"].to_numpy()
     p_pred = np.clip(p_now + dp_pred, 1e-6, 1.0-1e-6)
@@ -218,12 +195,9 @@ def main():
 
     print(f"[trend] rows train={len(y_tr):,}  valid={len(y_va):,}")
     print(f"[trend] valid EV per £1: mean={ev.mean():.5f}  p>0 share={(ev>0).mean():.3f}")
-
-    # save model
     model_dir = Path(args.output_dir) / "models"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / "xgb_trend_reg.json"
-    # save as core Booster for simulate_stream
     bst.get_booster().save_model(str(model_path))
     print(f"[trend] saved model → {model_path}")
 

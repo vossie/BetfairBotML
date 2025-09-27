@@ -11,7 +11,6 @@ import xgboost as xgb
 import pickle
 import json
 
-# local utils from your repo
 from utils import (
     parse_date, read_snapshots,
     time_to_off_minutes_expr, filter_preoff,
@@ -20,77 +19,67 @@ from utils import (
 
 UTC = timezone.utc
 
-# 5s cadence lags (match feature build)
 LAG_30S = 6
 LAG_60S = 12
 LAG_120S = 24
 
-NUMERIC_FEATS = [
-    "ltp", "tradedVolume", "spreadTicks", "imbalanceBest1", "mins_to_off", "__p_now",
-    "ltp_diff_5s", "vol_diff_5s",
+BASE_FEATS = [
+    "ltp","tradedVolume","spreadTicks","imbalanceBest1","mins_to_off","__p_now",
+    "ltp_diff_5s","vol_diff_5s",
     "ltp_lag30s","ltp_lag60s","ltp_lag120s",
     "tradedVolume_lag30s","tradedVolume_lag60s","tradedVolume_lag120s",
     "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
     "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
 ]
+# country facets added at runtime: ["is_gb","country_freq"]
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Streaming backtest (EV rescaling, liquidity VWAP, MTM/settlement P&L; no temp parquet)."
+        description="Streaming backtest with EV rescaling, liquidity VWAP, MTM/settlement P&L, and country facets."
     )
-    # Core
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
     p.add_argument("--valid-days", type=int, default=7)
     p.add_argument("--sport", default="horse-racing")
 
-    # Sim settings
     p.add_argument("--horizon-secs", type=int, default=120)
     p.add_argument("--preoff-max", type=int, default=30)
     p.add_argument("--commission", type=float, default=0.02)
     p.add_argument("--edge-thresh", type=float, default=0.002)
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
-    p.add_argument("--ev-cap", type=float, default=1.0, help="clip EV per £1 to [-cap,+cap] to avoid outliers in ranking")
-    # EV rescaling (applied BEFORE threshold and P&L)
-    p.add_argument("--ev-scale", type=float, default=1.0, help="multiply EV per £1 by this factor pre-threshold; use auto-suggest to tune")
+    p.add_argument("--ev-cap", type=float, default=1.0)
+    p.add_argument("--ev-scale", type=float, default=1.0)
 
-    # Staking
     p.add_argument("--stake-mode", choices=["flat","kelly"], default="kelly")
     p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
 
-    # Filters
     p.add_argument("--odds-min", type=float, default=None)
     p.add_argument("--odds-max", type=float, default=None)
 
-    # Liquidity / VWAP
     p.add_argument("--liquidity-levels", type=int, default=1)
     p.add_argument("--enforce-liquidity", action="store_true")
-    p.add_argument("--require-book", action="store_true", help="if set w/ enforce-liquidity, drop trades when book arrays are missing")
-    p.add_argument("--min-fill-frac", type=float, default=0.0, help="drop trade if filled < this fraction (e.g., 0.25)")
+    p.add_argument("--require-book", action="store_true")
+    p.add_argument("--min-fill-frac", type=float, default=0.0)
 
-    # Runtime / I/O
     p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
     p.add_argument("--calib-path", default="")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
     p.add_argument("--device", choices=["cuda","cpu"], default="cuda")
-    p.add_argument("--batch-size", type=int, default=75_000, help="rows per inference batch")
-    p.add_argument("--write-trades", type=int, default=0, help="1=write trades_*.csv; 0=summary/daily only")
+    p.add_argument("--batch-size", type=int, default=75_000)
+    p.add_argument("--write-trades", type=int, default=0)
     return p.parse_args()
 
-# ---------- helpers ----------
 def _has_book_columns(df: pl.DataFrame) -> bool:
     cols = set(df.columns)
-    need = {"backTicks", "backSizes", "layTicks", "laySizes"}
-    return need.issubset(cols)
+    return {"backTicks","backSizes","layTicks","laySizes"}.issubset(cols)
 
 def _make_features_row(bufs, last_row):
     if len(bufs["ltp"]) < LAG_120S or len(bufs["vol"]) < LAG_120S:
         return None
-    ltp_now = last_row["ltp"]
-    vol_now = last_row["tradedVolume"]
+    ltp_now = last_row["ltp"]; vol_now = last_row["tradedVolume"]
     ltp_l30 = bufs["ltp"][-LAG_30S]; ltp_l60 = bufs["ltp"][-LAG_60S]; ltp_l120 = bufs["ltp"][-LAG_120S]
     vol_l30 = bufs["vol"][-LAG_30S]; vol_l60 = bufs["vol"][-LAG_60S]; vol_l120 = bufs["vol"][-LAG_120S]
     ltp_prev = bufs["ltp"][-1] if len(bufs["ltp"])>=1 else None
@@ -117,7 +106,7 @@ def _make_features_row(bufs, last_row):
             feats[k] = np.nan
     return feats
 
-# Betfair tick ladder → odds
+# Tick ladder
 _TICKS = [
     (1.01, 2.00, 0.01), (2.00, 3.00, 0.02), (3.00, 4.00, 0.05), (4.00, 6.00, 0.10),
     (6.00,10.00,0.20), (10.0,20.0,0.50), (20.0,30.0,1.00), (30.0,50.0,2.00),
@@ -151,7 +140,6 @@ def _vwap_fill(side: str, ticks: list[int], sizes: list[float], need: float, lev
     if filled <= 0.0: return 0.0, None
     return filled, float(notional / filled)
 
-# EV helpers
 def _ev_mtm(p_now: float, p_pred: float, commission: float, side: str) -> float:
     eps = 1e-6
     p_now_c  = max(eps, min(1.0 - eps, p_now))
@@ -167,10 +155,8 @@ def _ev_settlement(p_pred: float, ltp: float, commission: float, side: str) -> f
     else:
         return (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
 
-# Results loader (small & deduped)
 def _load_results(curated_root: Path, sport: str, start_dt, end_dt) -> pl.DataFrame:
-    days = []
-    d = start_dt
+    days = []; d = start_dt
     while d <= end_dt:
         days.append(d.strftime("%Y-%m-%d")); d += timedelta(days=1)
     lfs = []
@@ -188,8 +174,7 @@ def _load_results(curated_root: Path, sport: str, start_dt, end_dt) -> pl.DataFr
     return pl.concat(lfs, how="vertical_relaxed").unique().collect()
 
 def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
-    """Build exit lookup (Datetime key; drop invalid ltp)."""
-    select_exprs = [
+    exprs = [
         pl.col("marketId").cast(pl.Utf8),
         pl.col("selectionId").cast(pl.Int64),
         pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
@@ -197,11 +182,11 @@ def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
         pl.col("ltp").cast(pl.Float64).alias("ltp_exit_proxy"),
     ]
     if _has_book_columns(df_snap):
-        select_exprs += [pl.col("backTicks"), pl.col("backSizes"), pl.col("layTicks"), pl.col("laySizes")]
+        exprs += [pl.col("backTicks"), pl.col("backSizes"), pl.col("layTicks"), pl.col("laySizes")]
     return (
         df_snap
         .filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
-        .select(select_exprs)
+        .select(exprs)
         .sort(["marketId","selectionId","ts_dt"])
     )
 
@@ -211,11 +196,12 @@ def main():
     curated = Path(args.curated)
 
     asof_dt = parse_date(args.asof)
-    valid_end = asof_dt
     start_dt = parse_date(args.start_date)
+    valid_end = asof_dt
+    valid_start = asof_dt - timedelta(days=args.valid_days)
 
-    # -------- Column-pruned snapshot scan --------
-    cols = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs"]
+    # ---- Column-pruned snapshot scan (include countryCode) ----
+    cols = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs","countryCode"]
     need_book = bool(args.enforce_liquidity)
     if need_book:
         cols += ["backTicks","backSizes","layTicks","laySizes"]
@@ -225,88 +211,108 @@ def main():
     present = [c for c in cols if c in schema_names]
     lf = lf.select(present).with_columns([ time_to_off_minutes_expr() ])
 
-    # Collect → preoff filter → odds band → ltp sanity
     df = lf.collect()
     df = filter_preoff(df, args.preoff_max)
     df = df.filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
-    if args.odds_min is not None:
-        df = df.filter(pl.col("ltp") >= float(args.odds_min))
-    if args.odds_max is not None:
-        df = df.filter(pl.col("ltp") <= float(args.odds_max))
+    if args.odds_min is not None: df = df.filter(pl.col("ltp") >= float(args.odds_min))
+    if args.odds_max is not None: df = df.filter(pl.col("ltp") <= float(args.odds_max))
+
+    # ---- Build country facets (TRAIN frequency only) ----
+    df = df.with_columns(
+        pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone("UTC").dt.date().alias("__date")
+    )
+    df_tr = df.filter(pl.col("__date") < valid_start)
+    df_va = df.filter(pl.col("__date") >= valid_start)
+
+    # frequency from TRAIN only
+    if "countryCode" in df.columns:
+        freq = (
+            df_tr.group_by("countryCode").agg(pl.len().alias("cnt"))
+                 .with_columns((pl.col("cnt") / pl.col("cnt").sum()).alias("freq"))
+                 .select(["countryCode","freq"])
+        )
+        def add_country_feats(dfi: pl.DataFrame) -> pl.DataFrame:
+            dfi = dfi.with_columns((pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb"))
+            dfi = dfi.join(freq, on="countryCode", how="left").with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
+            return dfi
+        df_tr = add_country_feats(df_tr)
+        df_va = add_country_feats(df_va)
+    else:
+        df_tr = df_tr.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
+        df_va = df_va.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
+
+    # recombine for streaming order
+    df = pl.concat([df_tr, df_va], how="vertical_relaxed").sort(["marketId","selectionId","publishTimeMs"])
 
     # Liquidity availability & effective setting
     book_available = _has_book_columns(df)
     effective_enforce = bool(args.enforce_liquidity and book_available)
     if args.enforce_liquidity and not book_available:
         msg = "[simulate] NOTE: depth columns missing; "
-        if args.require_book:
-            msg += "require-book=on → dropping ALL trades (no liquidity info)."
-        else:
-            msg += "falling back to LTP exec/exit and disabling liquidity enforcement."
+        msg += "require-book=on → dropping ALL trades (no liquidity info)." if args.require_book else \
+               "falling back to LTP exec/exit and disabling liquidity enforcement."
         print(msg)
     print(f"[simulate] Liquidity: requested={'on' if args.enforce_liquidity else 'off'}, "
           f"effective={'on' if effective_enforce else 'off'}; require_book={'on' if args.require_book else 'off'}")
 
-    # If require-book and not available → empty run
     if args.enforce_liquidity and args.require_book and not book_available:
-        _write_empty(outdir, args)
-        return
+        _write_empty(outdir, args); return
 
-    # Sort for streaming + build exit table
-    df = df.sort(["marketId","selectionId","publishTimeMs"])
     exit_df = _prepare_exit_prices(df)
 
     # ----- Model (+ optional calibrator) -----
     bst = xgb.Booster(); bst.load_model(args.model_path)
-    try:
-        bst.set_param({"device": args.device})
-    except Exception:
-        pass
+    try: bst.set_param({"device": args.device})
+    except Exception: pass
     calibrator = None
     if args.calib_path:
-        with open(args.calib_path, "rb") as f:
-            calibrator = pickle.load(f)
+        with open(args.calib_path, "rb") as f: calibrator = pickle.load(f)
 
     # rolling buffers per runner
     bufs_ltp = defaultdict(lambda: deque(maxlen=LAG_120S))
     bufs_vol = defaultdict(lambda: deque(maxlen=LAG_120S))
 
-    # accumulate in memory (no parquet temp writes)
     all_records: list[pl.DataFrame] = []
-    rows = df.iter_rows(named=True)
     feature_rows, meta_rows = [], []
 
-    for r in rows:
+    for r in df.iter_rows(named=True):
         key = (r["marketId"], int(r["selectionId"]))
         bufs_ltp[key].append(float(r["ltp"]))
         bufs_vol[key].append(float(r["tradedVolume"]))
 
-        feats = _make_features_row({"ltp": bufs_ltp[key], "vol": bufs_vol[key]}, {
+        feats_base = _make_features_row({"ltp": bufs_ltp[key], "vol": bufs_vol[key]}, {
             "ltp": float(r["ltp"]),
             "tradedVolume": float(r["tradedVolume"]),
             "spreadTicks": float(r.get("spreadTicks") or 0.0),
             "imbalanceBest1": float(r.get("imbalanceBest1") or 0.0),
             "mins_to_off": float(r["mins_to_off"]),
         })
-        if feats is None:
+        if feats_base is None:
             continue
 
+        # append country facets
+        feats_base["is_gb"] = float(1.0 if (r.get("countryCode") == "GB") else 0.0)
+        feats_base["country_freq"] = float(r.get("country_freq") or 0.0)
+
+        # meta
         meta_rows.append((
             r["publishTimeMs"], r["marketId"], int(r["selectionId"]),
-            float(r["ltp"]), float(feats["__p_now"]),
+            float(r["ltp"]), float(feats_base["__p_now"]),
             (r.get("backTicks") or []) if book_available else [],
             (r.get("backSizes") or []) if book_available else [],
             (r.get("layTicks") or []) if book_available else [],
             (r.get("laySizes") or []) if book_available else [],
         ))
-        feature_rows.append([feats.get(c, np.nan) for c in NUMERIC_FEATS])
+        # features (order must match model training)
+        feat_names = BASE_FEATS + ["is_gb","country_freq"]
+        feature_rows.append([feats_base.get(c, np.nan) for c in feat_names])
 
         if len(feature_rows) >= args.batch_size:
-            all_records.append(process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce))
+            all_records.append(process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce, feat_names))
             feature_rows.clear(); meta_rows.clear()
 
     if feature_rows:
-        all_records.append(process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce))
+        all_records.append(process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce, feat_names))
         feature_rows.clear(); meta_rows.clear()
 
     if not all_records:
@@ -316,7 +322,6 @@ def main():
 
     trades = pl.concat(all_records, how="vertical_relaxed")
 
-    # Exit at t+H via asof join on Datetime keys; drop invalid exits (ltp<=1.01)
     trades = trades.with_columns([
         (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit_ms"),
         pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64)), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_dt"),
@@ -324,6 +329,7 @@ def main():
     ])
     trades_sorted = trades.sort(["marketId","selectionId","ts_exit_dt"])
 
+    exit_df = exit_df.sort(["marketId","selectionId","ts_dt"])
     trades2 = trades_sorted.join_asof(
         exit_df,
         left_on="ts_exit_dt", right_on="ts_dt",
@@ -336,15 +342,12 @@ def main():
         pl.col("exit_odds").is_not_null() & (pl.col("exit_odds") > 1.01)
     )
 
-    # Enforce min fill fraction if requested
     if args.min_fill_frac > 0:
         trades2 = trades2.filter(pl.col("fill_frac") >= float(args.min_fill_frac))
 
-    # Clip EV, then apply EV scaling (prethreshold already happened in process_batch)
     EV_CAP = float(args.ev_cap)
     trades2 = trades2.with_columns(pl.col("ev_per_1").clip(-EV_CAP, EV_CAP))
 
-    # Realised MTM P&L (finite guard)
     trades2 = trades2.with_columns([
         pl.when(pl.col("side") == "back")
           .then(((pl.col("exec_odds") / pl.col("exit_odds")) - 1.0) * pl.col("stake_filled"))
@@ -354,7 +357,6 @@ def main():
         pl.when(pl.col("real_mtm_pnl_raw").is_finite()).then(pl.col("real_mtm_pnl_raw")).otherwise(pl.lit(None)).alias("real_mtm_pnl")
     ).drop("real_mtm_pnl_raw")
 
-    # Settlement P&L (if results exist)
     results_df = _load_results(curated, args.sport, start_dt, valid_end)
     if results_df.height > 0:
         comm = float(args.commission)
@@ -373,12 +375,9 @@ def main():
     else:
         trades2 = trades2.with_columns(pl.lit(None, dtype=pl.Float64).alias("real_settle_pnl"))
 
-    # Optional: write full trades CSV (off by default)
     if args.write_trades:
-        trades_csv = Path(args.output_dir) / f"trades_{args.asof}.csv"
-        trades2.write_csv(trades_csv)
+        (Path(args.output_dir) / f"trades_{args.asof}.csv").write_text(trades2.write_csv())
 
-    # Daily summary
     daily = (
         trades2
         .with_columns(
@@ -405,7 +404,6 @@ def main():
     daily_csv = Path(args.output_dir) / f"daily_{args.asof}.csv"
     daily.write_csv(daily_csv)
 
-    # Summary + ROI for the run (finite-safe)
     total_exp_profit   = float(trades2["exp_pnl"].fill_null(0.0).sum())
     avg_ev             = float(trades2["ev_per_1"].mean())
     total_real_mtm     = float(trades2["real_mtm_pnl"].fill_null(0.0).sum())
@@ -415,7 +413,6 @@ def main():
     roi_real_mtm = (total_real_mtm / float(args.bankroll_nom)) if args.bankroll_nom else None
     roi_real_settle = (total_real_settle / float(args.bankroll_nom)) if args.bankroll_nom else None
 
-    # Auto-suggest EV scale α = real_pnl / expected_pnl_raw (using MTM/settlement depending on ev_mode)
     raw_exp_sum = float(trades2["exp_pnl_raw"].fill_null(0.0).sum()) if "exp_pnl_raw" in trades2.columns else None
     if raw_exp_sum and abs(raw_exp_sum) > 1e-9:
         target_real = total_real_mtm if args.ev_mode == "mtm" else total_real_settle
@@ -454,10 +451,10 @@ def main():
         "overall_roi_real_mtm": roi_real_mtm,
         "overall_roi_real_settle": roi_real_settle,
         "ev_scale_suggested": suggested_scale,
+        "features_used": BASE_FEATS + ["is_gb","country_freq"],
     }
     write_json(Path(args.output_dir) / f"summary_{args.asof}.json", summ)
 
-    # Console prints
     def _fmt(x):
         if x is None or (isinstance(x,float) and (np.isnan(x) or np.isinf(x))):
             return "n/a"
@@ -469,13 +466,12 @@ def main():
     if suggested_scale is not None:
         print(f"[simulate] Suggested --ev-scale ≈ {suggested_scale:.6g} (based on {args.ev_mode} PnL)")
 
-def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce: bool) -> pl.DataFrame:
+def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enforce: bool, feat_names: list[str]) -> pl.DataFrame:
     X = np.asarray(feature_rows, dtype=np.float32)
-    # lower-memory predict path
     try:
         delta_pred = bst.inplace_predict(X, validate_features=False)
     except Exception:
-        dm = xgb.DMatrix(X, feature_names=NUMERIC_FEATS)
+        dm = xgb.DMatrix(X, feature_names=feat_names)
         delta_pred = bst.predict(dm)
 
     out = []
@@ -489,25 +485,19 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
         p_pred = p_now + dp
         p_pred = 0.0 if p_pred < 0.0 else (1.0 if p_pred > 1.0 else p_pred)
         if calibrator:
-            try:
-                p_pred = float(calibrator.transform(np.array([p_pred]))[0])
-            except Exception:
-                pass
+            try: p_pred = float(calibrator.transform(np.array([p_pred]))[0])
+            except Exception: pass
 
         side = "back" if dp > 0 else ("lay" if dp < 0 else "none")
-        if side == "none":
-            continue
+        if side == "none": continue
 
-        # Raw EV per £1 (unscaled)
         ev_raw = _ev_mtm(p_now, p_pred, commission, side) if args.ev_mode == "mtm" \
                  else _ev_settlement(p_pred, ltp_now, commission, side)
 
-        # Apply EV scaling BEFORE thresholding
         ev_per_1 = ev_raw * scale
         if ev_per_1 < args.edge_thresh:
             continue
 
-        # Requested stake
         if args.stake_mode == "flat":
             stake_req = 1.0
         else:
@@ -518,14 +508,12 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             f = max(args.kelly_floor, min(args.kelly_cap, f))
             stake_req = f * float(args.bankroll_nom)
 
-        # Liquidity/VWAP if book present and enforcement effective; else LTP fallback
         has_book = bool(back_ticks or lay_ticks)
         if effective_enforce and has_book:
             avail_sizes = back_sizes if side == "back" else lay_sizes
             avail_ticks = back_ticks if side == "back" else lay_ticks
             stake_filled, exec_vwap = _vwap_fill(side, avail_ticks, avail_sizes, stake_req, args.liquidity_levels)
         elif args.enforce_liquidity and args.require_book:
-            # enforcement requested and book required, but not available here → drop
             continue
         else:
             stake_filled = stake_req
@@ -535,8 +523,8 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             continue
 
         fill_frac = stake_filled / stake_req if stake_req > 0 else 1.0
-        exp_pnl_raw = ev_raw * stake_filled   # for auto scale suggestion
-        exp_pnl = ev_per_1 * stake_filled     # scaled EV pnl used in summaries
+        exp_pnl_raw = ev_raw * stake_filled
+        exp_pnl = ev_per_1 * stake_filled
 
         out.append((
             int(ts_ms), str(mid), int(sid),
@@ -554,7 +542,7 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             "exec_odds": pl.Float64, "exp_pnl": pl.Float64, "exp_pnl_raw": pl.Float64, "stake_mode": pl.Utf8
         })
 
-    df = pl.DataFrame(
+    return pl.DataFrame(
         out,
         schema={
             "publishTimeMs": pl.Int64,
@@ -570,13 +558,12 @@ def process_batch(feature_rows, meta_rows, bst, calibrator, args, effective_enfo
             "stake_filled": pl.Float64,
             "fill_frac": pl.Float64,
             "exec_odds": pl.Float64,
-            "exp_pnl": pl.Float64,        # scaled
-            "exp_pnl_raw": pl.Float64,    # pre-scale
+            "exp_pnl": pl.Float64,
+            "exp_pnl_raw": pl.Float64,
             "stake_mode": pl.Utf8,
         },
         orient="row",
     )
-    return df
 
 def _write_empty(outdir: Path, args):
     daily = pl.DataFrame({"day": [], "stake_mode": [], "n_trades": [], "exp_profit": [], "avg_ev": [],
@@ -586,7 +573,8 @@ def _write_empty(outdir: Path, args):
     write_json(outdir / f"summary_{args.asof}.json", {
         "asof": args.asof, "n_trades": 0, "ev_scale_used": args.ev_scale,
         "enforce_liquidity_requested": bool(args.enforce_liquidity),
-        "require_book": bool(args.require_book)
+        "require_book": bool(args.require_book),
+        "features_used": BASE_FEATS + ["is_gb","country_freq"],
     })
 
 if __name__ == "__main__":
