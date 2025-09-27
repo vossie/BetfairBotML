@@ -40,10 +40,12 @@ def parse_args():
     p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
+    p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")  # <-- NEW (for quick snapshot)
     p.add_argument("--device", choices=["cuda","cpu"], default="cuda")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output")
     return p.parse_args()
 
+# simple rolling feature builder on a sorted DataFrame
 def build_features(df: pl.DataFrame) -> pl.DataFrame:
     w = ["marketId","selectionId"]
     df = (
@@ -72,6 +74,21 @@ def build_features(df: pl.DataFrame) -> pl.DataFrame:
     )
     return df
 
+def _ev_mtm_np(p_now: np.ndarray, p_pred: np.ndarray, commission: float, dp: np.ndarray) -> np.ndarray:
+    """Vectorized MTM EV snapshot using sign(dp) to choose side."""
+    eps = 1e-6
+    p_now_c  = np.clip(p_now,  eps, 1.0 - eps)
+    p_pred_c = np.clip(p_pred, eps, 1.0 - eps)
+    ev_back = ((p_pred_c / p_now_c) - 1.0) * (1.0 - commission)
+    ev_lay  = (1.0 - (p_now_c / p_pred_c)) * (1.0 - commission)
+    return np.where(dp >= 0.0, ev_back, ev_lay)
+
+def _ev_settlement_np(p_pred: np.ndarray, ltp: np.ndarray, commission: float, dp: np.ndarray) -> np.ndarray:
+    """Vectorized settlement EV snapshot using sign(dp) to choose side."""
+    ev_back = p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
+    ev_lay  = (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
+    return np.where(dp >= 0.0, ev_back, ev_lay)
+
 def main():
     args = parse_args()
     curated = Path(args.curated)
@@ -91,6 +108,7 @@ def main():
     print(f"Pre-off max (m): {args.preoff_max}")
     print(f"Stake mode:      {args.stake_mode} (cap={args.kelly_cap} floor={args.kelly_floor})")
     print(f"XGBoost device:  {args.device}")
+    print(f"EV mode:         {args.ev_mode}")
 
     print(f"[trend] TRAIN: {start_dt.date()} .. {(valid_start - timedelta(days=1)).date()}")
     print(f"[trend] VALID: {valid_start.date()} .. {valid_end.date()}")
@@ -156,19 +174,20 @@ def main():
     evallist = [(dtr, "train"), (dva, "valid")]
     bst = xgb.train(params, dtr, num_boost_round=500, evals=evallist, verbose_eval=False)
 
-    # quick validation EV snapshot (not a full sim) — FIXED EV formulas
+    # quick validation EV snapshot (not a full sim)
     p_now = df_valid["__p_now"].to_numpy()
     dp = bst.predict(dva)
     p_pred = np.clip(p_now + dp, 0.0, 1.0)
     ltp = df_valid["ltp"].to_numpy()
 
     commission = float(args.commission)
-    ev_back = p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
-    ev_lay  = (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
-    ev = np.where(dp >= 0.0, ev_back, ev_lay)
+    if args.ev_mode == "mtm":
+        ev = _ev_mtm_np(p_now, p_pred, commission, dp)
+    else:
+        ev = _ev_settlement_np(p_pred, ltp, commission, dp)
 
     print(f"[trend] rows train={len(y_tr):,}  valid={len(y_va):,}")
-    print(f"[trend] valid EV per £1: mean={ev.mean():.5f}  p>0 share={(ev>0).mean():.3f}")
+    print(f"[trend] valid EV per £1: mean={ev.mean():.6f}  p>0 share={(ev>0).mean():.3f}")
 
     # save model
     model_dir = Path(args.output_dir) / "models"
