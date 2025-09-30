@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, os, sys, json, math, itertools, subprocess, shlex
+import argparse, os, sys, json, math, itertools, subprocess, shlex, signal, time
 from pathlib import Path
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# ------------------------ Arg parsing ------------------------
+
 def parse_args():
-    p = argparse.ArgumentParser("AutoML for price-trend simulator (robust logging)")
+    p = argparse.ArgumentParser("AutoML for price-trend simulator (robust, with timeouts & logs)")
+    # Data window
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
@@ -16,10 +18,12 @@ def parse_args():
     p.add_argument("--horizon-secs", type=int, default=120)
     p.add_argument("--commission", type=float, default=0.02)
 
+    # Devices / parallel
     p.add_argument("--train-device", choices=["cuda","cpu"], default="cuda")
     p.add_argument("--sim-device", choices=["cuda","cpu"], default="cpu")
     p.add_argument("--max-parallel", type=int, default=4)
 
+    # Search grids
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
     p.add_argument("--edge-grid", default="0.0005,0.001,0.0015,0.002,0.003")
     p.add_argument("--stake-grid", default="flat,kelly")
@@ -30,40 +34,41 @@ def parse_args():
     p.add_argument("--per-market-topk-grid", default="1")
     p.add_argument("--per-market-budget-grid", default="5,10")
     p.add_argument("--exit-on-move-ticks-grid", default="0,1,2")
+    p.add_argument("--ev-scale-grid", default="1.0,0.01,0.005,0.001")
+    p.add_argument("--batch-size", type=int, default=75_000)
+    p.add_argument("--ev-cap", type=float, default=1.0)
 
+    # Scoring / constraints
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
     p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
-
-    p.add_argument("--batch-size", type=int, default=75_000)
-    p.add_argument("--ev-cap", type=float, default=1.0)
-    p.add_argument("--ev-scale-grid", default="1.0,0.01,0.005,0.001")
-
-    p.add_argument("--min-trades", type=int, default=20000)
+    p.add_argument("--min-trades", type=int, default=20_000)
     p.add_argument("--prefer", choices=["mtm","settlement"], default="settlement")
 
+    # IO / behavior
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output")
     p.add_argument("--tag", default="automl")
     p.add_argument("--force-train", action="store_true")
+
+    # Anti-hang
+    p.add_argument("--trial-timeout-secs", type=int, default=1800, help="Kill a trial if it exceeds this time.")
+    p.add_argument("--tail-stderr-lines", type=int, default=40)
     return p.parse_args()
 
+# ------------------------ Helpers ------------------------
+
 def parse_float_list(s: str) -> list[float]:
-    out=[]
-    for x in s.split(","):
-        x=x.strip()
-        if not x: continue
-        out.append(float(x))
-    return out
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
 
 def parse_int_list(s: str) -> list[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 def parse_odds_item(item: str):
-    item=item.strip()
-    if item=="none":
+    item = item.strip()
+    if item == "none":
         return (None, None)
     if ":" in item:
-        a,b=item.split(":",1)
+        a, b = item.split(":", 1)
         return (float(a), float(b))
     raise ValueError(f"bad odds item: {item}")
 
@@ -76,12 +81,10 @@ def ensure_dirs(base_out: Path, asof: str, tag: str):
 def model_exists(models_dir: Path) -> bool:
     return (models_dir / "xgb_trend_reg.json").exists()
 
-def train_if_needed(args, out_root: Path):
-    models_dir = args.output_dir + "/models"
-    if model_exists(Path(models_dir)) and not args.force_train:
+def train_if_needed(args, models_dir: Path):
+    if model_exists(models_dir) and not args.force_train:
         print(f"[automl] Model exists at {models_dir}/xgb_trend_reg.json — skipping training (use --force-train to retrain).")
         return
-    # call trainer with training-only args
     cmd = [
         sys.executable, "/opt/BetfairBotML/train_price_trend/ml/train_price_trend.py",
         "--curated", args.curated,
@@ -93,59 +96,121 @@ def train_if_needed(args, out_root: Path):
         "--preoff-max", str(args.preoff_max),
         "--commission", str(args.commission),
         "--device", args.train_device,
-        "--output-dir", args.output_dir,
+        "--output-dir", str(models_dir.parent),
     ]
     print("[automl] Training…")
     subprocess.run(cmd, check=True)
 
-def run_trial(sim_cmd: list[str], env: dict, log_out: Path, log_err: Path) -> tuple[int, dict]:
-    with open(log_out, "wb") as fo, open(log_err, "wb") as fe:
-        rc = subprocess.Popen(sim_cmd, stdout=fo, stderr=fe, env=env).wait()
-    # parse summary json if present
-    summary = {}
-    outdir = None
-    for i, tok in enumerate(sim_cmd):
-        if tok == "--output-dir" and i+1 < len(sim_cmd):
-            outdir = Path(sim_cmd[i+1]); break
-    if outdir:
-        summ_path = outdir / f"summary_{env.get('ASOF_OVERRIDE','') or ''}.json"
-        # fallback: scan for any summary_<asof>.json in outdir
-        if not summ_path.exists():
-            for p in outdir.glob("summary_*.json"):
-                summ_path = p; break
-        if summ_path.exists():
-            try:
-                summary = json.loads(summ_path.read_text())
-            except Exception:
-                summary = {}
-    return rc, summary
+def tail_file(p: Path, n: int) -> str:
+    try:
+        data = p.read_text(errors="ignore").splitlines()
+        return "\n".join(data[-n:])
+    except Exception:
+        return ""
 
-def score(summary: dict, prefer: str, min_trades: int) -> float:
+def score_summary(summary: dict, prefer: str, min_trades: int) -> float:
     n = int(summary.get("n_trades", 0))
     if n < min_trades:
-        # treat as valid (but bad) instead of crashing the run
+        # Valid but bad score (don’t fail the whole AutoML)
         return -1e12 + n
-    key = "overall_roi_real_mtm" if prefer=="mtm" else "overall_roi_real_settle"
+    key = "overall_roi_real_mtm" if prefer == "mtm" else "overall_roi_real_settle"
     val = summary.get(key, None)
-    if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
+    try:
+        val = float(val)
+    except Exception:
         return -1e11
-    return float(val)
+    if math.isnan(val) or math.isinf(val):
+        return -1e11
+    return val
+
+# ------------------------ Trial runner with timeout ------------------------
+
+def run_trial_with_timeout(sim_cmd: list[str], env: dict, log_out: Path, log_err: Path, timeout: int) -> tuple[int, dict]:
+    """
+    Runs a single simulate command with:
+      - stdout/stderr redirected to files
+      - process group created; if timeout, kill -TERM, then -KILL
+      - returns (rc, parsed_summary_dict|{})
+    """
+    # Ensure output dir known to read summary later
+    out_dir = None
+    for i, tok in enumerate(sim_cmd):
+        if tok == "--output-dir" and i + 1 < len(sim_cmd):
+            out_dir = Path(sim_cmd[i + 1])
+            break
+
+    # Spawn child in its own process group so we can kill the whole tree
+    with open(log_out, "wb") as fo, open(log_err, "wb") as fe:
+        proc = subprocess.Popen(
+            sim_cmd,
+            stdout=fo,
+            stderr=fe,
+            env=env,
+            preexec_fn=os.setsid  # new process group (POSIX)
+        )
+        start = time.time()
+        rc = None
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if timeout and (time.time() - start) > timeout:
+                # soft kill
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except Exception:
+                    pass
+                # wait a bit
+                for _ in range(20):
+                    rc = proc.poll()
+                    if rc is not None:
+                        break
+                    time.sleep(0.1)
+                if rc is None:
+                    # hard kill
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except Exception:
+                        pass
+                    rc = 124  # timeout code
+                break
+            time.sleep(0.25)
+
+    # Parse summary if present
+    summary = {}
+    if out_dir and out_dir.exists():
+        # Prefer exact ASOF summary, else any summary_*.json in that out_dir
+        asof = env.get("ASOF_OVERRIDE", "")
+        cand = out_dir / f"summary_{asof}.json" if asof else None
+        try_paths = []
+        if cand:
+            try_paths.append(cand)
+        try_paths.extend(sorted(out_dir.glob("summary_*.json")))
+        for p in try_paths:
+            if p.exists():
+                try:
+                    summary = json.loads(p.read_text())
+                    break
+                except Exception:
+                    pass
+    return rc, summary
+
+# ------------------------ Main ------------------------
 
 def main():
     a = parse_args()
 
-    # Output structure
-    root = ensure_dirs(Path(a.output_dir), a.asof, "automl")
+    root = ensure_dirs(Path(a.output_dir), a.asof, a.tag)
     automl_dir = root / "automl"
     logs_dir   = root / "logs"
     trials_csv = automl_dir / f"trials_{a.asof}.csv"
     failures   = automl_dir / "failures.txt"
     best_json  = automl_dir / "best_config.json"
 
-    # Train (or skip)
-    train_if_needed(a, root)
+    models_dir = Path(a.output_dir) / "models"
+    train_if_needed(a, models_dir)
 
-    # Grids
+    # Build grids
     edges   = parse_float_list(a.edge_grid)
     stakes  = [s.strip() for s in a.stake_grid.split(",") if s.strip()]
     odds_bands = [parse_odds_item(x) for x in a.odds_grid.split(",") if x.strip()]
@@ -156,102 +221,137 @@ def main():
     exit_ticks_grid = parse_int_list(a.exit_on_move_ticks_grid)
     ev_scales = parse_float_list(a.ev_scale_grid)
 
-    # Fixed env for sims
+    # Environment for child sims
     env = os.environ.copy()
-    env["POLARS_MAX_THREADS"] = env.get("POLARS_MAX_THREADS", "4")
-    env["XGB_FORCE_NTHREADS"] = env.get("XGB_FORCE_NTHREADS", "4")
-    env["ASOF_OVERRIDE"] = a.asof  # used to locate summary files safely
+    env.setdefault("POLARS_MAX_THREADS", str(max(1, a.max_parallel * 2)))
+    env.setdefault("XGB_FORCE_NTHREADS", str(max(1, a.max_parallel * 2)))
+    env["ASOF_OVERRIDE"] = a.asof
 
+    # Compose trials
     trials = []
-    for edge, stake, (omin,omax), liq, mff, topk, bud, xticks, evs in itertools.product(
-        edges, stakes, odds_bands, liq_levels, min_fill_fracs, topk_grid, budget_grid, exit_ticks_grid, ev_scales
-    ):
-        tag = f"edge{edge}_{stake}_odds{('none' if omin is None else f'{omin}:{omax}')}_liq{liq}_mff{mff}_k{topk}_b{bud}_xt{xticks}_evs{evs}"
-        out_dir = root / tag
-        out_dir.mkdir(parents=True, exist_ok=True)
+    for edge in edges:
+        for stake in stakes:
+            for (omin, omax) in odds_bands:
+                for liq in liq_levels:
+                    for mff in min_fill_fracs:
+                        for topk in topk_grid:
+                            for bud in budget_grid:
+                                for xticks in exit_ticks_grid:
+                                    for evs in ev_scales:
+                                        tag = f"edge{edge}_{stake}_odds{('none' if omin is None else f'{omin}:{omax}')}_liq{liq}_mff{mff}_k{topk}_b{bud}_xt{xticks}_evs{evs}"
+                                        out_dir = root / tag
+                                        out_dir.mkdir(parents=True, exist_ok=True)
+                                        sim = [
+                                            sys.executable, "/opt/BetfairBotML/train_price_trend/ml/simulate_stream.py",
+                                            "--curated", a.curated,
+                                            "--asof", a.asof,
+                                            "--start-date", a.start_date,
+                                            "--valid-days", str(a.valid_days),
+                                            "--sport", a.sport,
+                                            "--horizon-secs", str(a.horizon_secs),
+                                            "--preoff-max", str(a.preoff_max),
+                                            "--commission", str(a.commission),
+                                            "--edge-thresh", str(edge),
+                                            "--stake-mode", stake,
+                                            "--bankroll-nom", str(a.bankroll_nom),
+                                            "--kelly-cap", str(a.kelly_cap),
+                                            "--kelly-floor", str(a.kelly_floor),
+                                            "--device", a.sim_device,
+                                            "--ev-mode", a.ev_mode,
+                                            "--ev-scale", str(evs),
+                                            "--output-dir", str(out_dir),
+                                            "--per-market-topk", str(topk),
+                                            "--per-market-budget", str(bud),
+                                            "--exit-on-move-ticks", str(xticks),
+                                            "--batch-size", str(a.batch_size),
+                                            "--ev-cap", str(a.ev_cap),
+                                        ]
+                                        # Liquidity flags
+                                        if a.enforce_liquidity_only or liq > 0:
+                                            sim += ["--enforce-liquidity", "--liquidity-levels", str(liq), "--min-fill-frac", str(mff)]
+                                        # Odds
+                                        if omin is not None: sim += ["--odds-min", str(omin)]
+                                        if omax is not None: sim += ["--odds-max", str(omax)]
+                                        trials.append((tag, sim, out_dir))
 
-        sim = [
-            sys.executable, "/opt/BetfairBotML/train_price_trend/ml/simulate_stream.py",
-            "--curated", a.curated,
-            "--asof", a.asof,
-            "--start-date", a.start_date,
-            "--valid-days", str(a.valid_days),
-            "--sport", a.sport,
-            "--horizon-secs", str(a.horizon_secs),
-            "--preoff-max", str(a.preoff_max),
-            "--commission", str(a.commission),
-            "--edge-thresh", str(edge),
-            "--stake-mode", stake,
-            "--bankroll-nom", str(a.bankroll_nom),
-            "--kelly-cap", str(a.kelly_cap),
-            "--kelly-floor", str(a.kelly_floor),
-            "--device", a.sim_device,
-            "--ev-mode", a.ev_mode,
-            "--ev-scale", str(evs),
-            "--output-dir", str(out_dir),
-            "--per-market-topk", str(topk),
-            "--per-market-budget", str(bud),
-            "--exit-on-move-ticks", str(xticks),
-            "--batch-size", str(a.batch_size),
-            "--ev-cap", str(a.ev_cap),
+    total = len(trials)
+    print(f"[automl] Running {total} trials with max_parallel={a.max_parallel} on sim_device={a.sim_device} …")
+
+    # Run trials with timeouts
+    failures_lines = []
+    results_rows = []
+    best = None  # (score, tag, summary, out_dir)
+    completed = 0
+
+    def row_from_summary(tag: str, summ: dict) -> list:
+        return [
+            tag,
+            summ.get("edge_thresh"),
+            summ.get("stake_mode"),
+            summ.get("odds_min"),
+            summ.get("odds_max"),
+            summ.get("enforce_liquidity_effective"),
+            summ.get("liquidity_levels"),
+            summ.get("min_fill_frac"),
+            summ.get("per_market_topk"),
+            summ.get("per_market_budget"),
+            summ.get("exit_on_move_ticks"),
+            summ.get("ev_scale_used"),
+            summ.get("n_trades"),
+            summ.get("overall_roi_exp"),
+            summ.get("overall_roi_real_mtm"),
+            summ.get("overall_roi_real_settle"),
+            summ.get("avg_ev_per_1"),
         ]
-        # liquidity
-        if a.enforce_liquidity_only:
-            sim += ["--enforce-liquidity", "--liquidity-levels", str(liq)]
-            sim += ["--min-fill-frac", str(mff)]
-        else:
-            # allow liq=0 by skipping flag; liq>0 enforces
-            if liq > 0:
-                sim += ["--enforce-liquidity", "--liquidity-levels", str(liq)]
-                sim += ["--min-fill-frac", str(mff)]
-        # odds
-        if omin is not None: sim += ["--odds-min", str(omin)]
-        if omax is not None: sim += ["--odds-max", str(omax)]
 
-        trials.append((tag, sim, out_dir))
-
-    print(f"[automl] Running {len(trials)} trials with max_parallel={a.max_parallel} on sim_device={a.sim_device} …")
-    failures_lines=[]
-    scored=[]
     with ThreadPoolExecutor(max_workers=a.max_parallel) as ex:
-        fut2tag={}
+        fut2info = {}
         for tag, sim, out_dir in trials:
-            log_out = (root / "logs" / f"{tag}.out")
-            log_err = (root / "logs" / f"{tag}.err")
-            fut = ex.submit(run_trial, sim, env, log_out, log_err)
-            fut2tag[fut]=(tag, sim, out_dir, log_out, log_err)
+            log_out = (logs_dir / f"{tag}.out")
+            log_err = (logs_dir / f"{tag}.err")
+            fut = ex.submit(run_trial_with_timeout, sim, env, log_out, log_err, a.trial_timeout_secs)
+            fut2info[fut] = (tag, sim, out_dir, log_out, log_err)
 
-        for fut in as_completed(fut2tag):
-            tag, sim, out_dir, log_out, log_err = fut2tag[fut]
+        for fut in as_completed(fut2info):
+            tag, sim, out_dir, log_out, log_err = fut2info[fut]
             rc, summ = fut.result()
+            completed += 1
             if rc != 0:
-                # capture tail of stderr for quick debugging
-                tail = ""
-                try:
-                    with open(log_err, "rb") as fe:
-                        data = fe.read().decode("utf-8", errors="ignore")
-                        tail = "\n".join(data.strip().splitlines()[-5:])
-                except Exception:
-                    pass
+                tail = tail_file(log_err, a.tail_stderr_lines)
                 failures_lines.append(f"{tag}\trc={rc}\n{tail}\nCMD: {' '.join(shlex.quote(t) for t in sim)}\n")
+                print(f"[automl] ✗ {tag} (rc={rc})  [{completed}/{total}]")
                 continue
-            sc = score(summ, a.prefer, a.min_trades)
-            scored.append((sc, tag, summ))
 
-    # write failures
+            sc = score_summary(summ, a.prefer, a.min_trades)
+            results_rows.append(row_from_summary(tag, summ))
+            if (best is None) or (sc > best[0]):
+                best = (sc, tag, summ, out_dir)
+            print(f"[automl] ✓ {tag}  score={sc:.6g}  n={summ.get('n_trades',0)}  [{completed}/{total}]")
+
+    # Write failures, trials CSV, and best config
     if failures_lines:
-        with open(failures, "w") as f:
-            f.write("\n\n".join(failures_lines))
+        failures.write_text("\n\n".join(failures_lines))
         print(f"[automl] {len(failures_lines)} failures logged to {failures}")
 
-    if not scored:
-        print("[automl] No successful runs.")
-        sys.exit(0)
+    # Minimal CSV writer (no pandas dependency)
+    if results_rows:
+        header = [
+            "tag","edge_thresh","stake_mode","odds_min","odds_max",
+            "enforce_liquidity","liquidity_levels","min_fill_frac",
+            "per_market_topk","per_market_budget","exit_on_move_ticks",
+            "ev_scale","n_trades","roi_exp","roi_real_mtm","roi_real_settle","avg_ev_per_1"
+        ]
+        with open(trials_csv, "w") as f:
+            f.write(",".join(header) + "\n")
+            for r in results_rows:
+                f.write(",".join("" if v is None else str(v) for v in r) + "\n")
+        print(f"[automl] Wrote {trials_csv}")
 
-    # pick best
-    scored.sort(key=lambda x: x[0], reverse=True)
-    best = scored[0]
-    _, tag, summ = best
+    if best is None:
+        print("[automl] No successful runs.")
+        return
+
+    sc, tag, summ, out_dir = best
     best_cfg = {
         "asof": a.asof,
         "start_date": a.start_date,
@@ -265,18 +365,18 @@ def main():
         "bankroll_nom": a.bankroll_nom,
         "kelly_cap": a.kelly_cap,
         "kelly_floor": a.kelly_floor,
-        "edge_thresh": float(summ.get("edge_thresh", "nan")) if "edge_thresh" in summ else None,
+        "edge_thresh": float(summ.get("edge_thresh")) if summ.get("edge_thresh") is not None else None,
         "stake_mode": summ.get("stake_mode"),
         "odds_min": summ.get("odds_min"),
         "odds_max": summ.get("odds_max"),
         "enforce_liquidity": bool(summ.get("enforce_liquidity_effective", False)),
-        "liquidity_levels": int(summ.get("liquidity_levels", 0)),
-        "min_fill_frac": float(summ.get("min_fill_frac", 0.0)),
-        "per_market_topk": int(summ.get("per_market_topk", 1)),
-        "per_market_budget": float(summ.get("per_market_budget", 10.0)),
-        "exit_on_move_ticks": int(summ.get("exit_on_move_ticks", 0)),
-        "ev_scale": float(summ.get("ev_scale_used", 1.0)),
-        "n_trades": int(summ.get("n_trades", 0)),
+        "liquidity_levels": int(summ.get("liquidity_levels", 0) or 0),
+        "min_fill_frac": float(summ.get("min_fill_frac", 0.0) or 0.0),
+        "per_market_topk": int(summ.get("per_market_topk", 1) or 1),
+        "per_market_budget": float(summ.get("per_market_budget", 10.0) or 10.0),
+        "exit_on_move_ticks": int(summ.get("exit_on_move_ticks", 0) or 0),
+        "ev_scale": float(summ.get("ev_scale_used", 1.0) or 1.0),
+        "n_trades": int(summ.get("n_trades", 0) or 0),
         "overall_roi_exp": summ.get("overall_roi_exp"),
         "overall_roi_real_mtm": summ.get("overall_roi_real_mtm"),
         "overall_roi_real_settle": summ.get("overall_roi_real_settle"),
@@ -285,11 +385,12 @@ def main():
         "trials_csv": str(trials_csv),
         "sim_device": a.sim_device,
         "max_parallel": a.max_parallel,
+        "score_metric": a.prefer,
+        "score_value": sc,
     }
-    (automl_dir / "best_config.json").write_text(json.dumps(best_cfg, indent=2))
-    print(f"[automl] Wrote {trials_csv}")
-    print(f"[automl] Best → {automl_dir / 'best_config.json'}")
-    print(f"[automl] Best config: tag={tag}  ROI_{a.prefer}={best[0]:.6g}")
+    best_json.write_text(json.dumps(best_cfg, indent=2))
+    print(f"[automl] Best → {best_json}")
+    print(f"[automl] Best tag={tag}  score({a.prefer})={sc:.6g}")
 
 if __name__ == "__main__":
     main()
