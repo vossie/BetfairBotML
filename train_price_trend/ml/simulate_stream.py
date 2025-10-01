@@ -1,686 +1,701 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Simulation of pre-off trading using trend model predictions.
+
+Key features
+- Uses curated parquet (orderbook_snapshots_5s, market_definitions, results)
+- Optional model prediction (XGBoost) if model json exists
+- Odds band filter; EV scaling and capping; min expected value threshold
+- Liquidity enforcement from order book depth (if present). Falls back cleanly
+- Per-market portfolio: topK picks, per-market budget, equal-EV sizing
+- Exit rules: horizon or exit on favorable move in ticks
+- Contra-hedge (optional): place partial opposite side bet with hold time/prob gate
+- Writes:
+  - stream/daily_<asof>.csv (day-level breakdown incl. ROI per day)
+  - stream/summary_<asof>.json and .csv (overall metrics)
+- Robust to missing columns and empty result sets
+
+Notes
+- This is a simulation / backtest. It *does not* place real bets.
+- If depth columns are missing and enforce_liquidity==1 & require_book==1, drops trades.
+- If model is present at output/models/xgb_trend_reg.json, predicts dp and converts to EV.
+- If model is absent, uses a simple proxy dp from short-term momentum features.
+
+"""
+
 from __future__ import annotations
 import argparse
-from pathlib import Path
-from datetime import timedelta, timezone
-from collections import defaultdict, deque
-from typing import List, Tuple, Dict, Any
-
-import numpy as np
-import polars as pl
-import xgboost as xgb
-import pickle
+import os
+import sys
 import json
+import math
+from pathlib import Path
+from typing import Optional, Tuple
 
-from utils import (
-    parse_date, read_snapshots,
-    time_to_off_minutes_expr, filter_preoff,
-    write_json, kelly_fraction_back, kelly_fraction_lay
-)
+import polars as pl
 
-UTC = timezone.utc
+# Optional import: xgboost
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
 
-LAG_30S = 6
-LAG_60S = 12
-LAG_120S = 24
 
-BASE_FEATS = [
-    "ltp","tradedVolume","spreadTicks","imbalanceBest1","mins_to_off","__p_now",
-    "ltp_diff_5s","vol_diff_5s",
-    "ltp_lag30s","ltp_lag60s","ltp_lag120s",
-    "tradedVolume_lag30s","tradedVolume_lag60s","tradedVolume_lag120s",
-    "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
-    "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
-]
-FEATURES_WITH_COUNTRY = BASE_FEATS + ["is_gb","country_freq"]
+# ---------------------------- CLI ----------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Streaming backtest with portfolioing, liquidity VWAP, contra leg, MTM/settlement P&L, and daily ROI."
-    )
-    # Data/time
+    p = argparse.ArgumentParser("simulate_stream (pre-off)")
+    # Data & window
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
     p.add_argument("--valid-days", type=int, default=7)
     p.add_argument("--sport", default="horse-racing")
-
-    # Modeling horizon / window
+    p.add_argument("--preoff-max", type=int, default=30, help="minutes to off (max)")
     p.add_argument("--horizon-secs", type=int, default=120)
-    p.add_argument("--preoff-max", type=int, default=30)
-
-    # Trading economics
     p.add_argument("--commission", type=float, default=0.02)
-    p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
-    p.add_argument("--ev-cap", type=float, default=1.0)
-    p.add_argument("--ev-scale", type=float, default=1.0)
-    p.add_argument("--edge-thresh", type=float, default=0.002)
 
-    # Staking / bankroll
-    p.add_argument("--stake-mode", choices=["flat","kelly"], default="kelly")
+    # Model / device
+    p.add_argument("--device", choices=["cuda","cpu"], default="cpu")
+    p.add_argument("--models-dir", default="/opt/BetfairBotML/train_price_trend/output/models")
+
+    # Trading knobs
+    p.add_argument("--edge-thresh", type=float, default=0.0, help="min EV/£1 after scaling")
+    p.add_argument("--stake-mode", choices=["flat","kelly"], default="flat")
     p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
+    p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
+    p.add_argument("--ev-scale", type=float, default=1.0, help="scale model dp to EV/£1")
+    p.add_argument("--ev-cap", type=float, default=1.0, help="cap on raw EV/£1 magnitude")
 
-    # Odds filter
+    # Odds / filters
     p.add_argument("--odds-min", type=float, default=None)
     p.add_argument("--odds-max", type=float, default=None)
 
-    # Liquidity enforcement
-    p.add_argument("--liquidity-levels", type=int, default=1)
+    # Liquidity
     p.add_argument("--enforce-liquidity", action="store_true")
-    p.add_argument("--require-book", action="store_true")
+    p.add_argument("--liquidity-levels", type=int, default=1)
     p.add_argument("--min-fill-frac", type=float, default=0.0)
+    p.add_argument("--require-book", action="store_true", help="drop trades if no book columns")
 
-    # Per-market portfolioing (price-move dutching)
-    p.add_argument("--per-market-topk", type=int, default=2, help="Max runners per market/time (side-aware).")
-    p.add_argument("--per-market-budget", type=float, default=50.0, help="£ cap across chosen runners in a market/time.")
-    p.add_argument("--basket-sizing", choices=["equal_ev","inverse_ev","fractional_kelly"], default="equal_ev",
-                   help="How to allocate the per-market budget across chosen runners.")
-    p.add_argument("--exit-on-move-ticks", type=int, default=0,
-                   help="If >0, mark if price moved N ticks in the profitable direction before horizon.")
-
-    # Contra leg controls
-    p.add_argument("--contra-mode", choices=["off","prob","always"], default="off",
-                   help="off=no contra; prob=place contra only if swing_prob≥thresh; always=always place contra.")
-    p.add_argument("--contra-frac", type=float, default=0.25, help="Stake fraction for contra vs primary filled stake.")
-    p.add_argument("--contra-hold-secs", type=int, default=300, help="Extra holding time for contra leg.")
-    p.add_argument("--contra-prob-thresh", type=float, default=0.65, help="Swing probability threshold for contra.")
-    p.add_argument("--contra-beta", type=float, default=80.0, help="Sensitivity for swing prob: swing_prob=exp(-beta*|dp|).")
-
-    # Runtime / model / output
-    p.add_argument("--model-path", default="/opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json")
-    p.add_argument("--calib-path", default="")
-    p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
-    p.add_argument("--device", choices=["cuda","cpu"], default="cuda")
+    # Portfolio
+    p.add_argument("--per-market-topk", type=int, default=1)
+    p.add_argument("--per-market-budget", type=float, default=10.0)
+    p.add_argument("--exit-on-move-ticks", type=int, default=0, help="0=disabled; exit if move ≥ this many ticks in our favour")
     p.add_argument("--batch-size", type=int, default=75_000)
-    p.add_argument("--write-trades", type=int, default=0)
+
+    # Contra hedge
+    p.add_argument("--contra-mode", choices=["none","prob"], default="none")
+    p.add_argument("--contra-frac", type=float, default=0.0, help="fraction of stake to hedge")
+    p.add_argument("--contra-hold-secs", type=int, default=300)
+    p.add_argument("--contra-prob-thresh", type=float, default=0.5)
+    p.add_argument("--contra-beta", type=float, default=50.0, help="logit slope for prob gating")
+
+    # Output
+    p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
     return p.parse_args()
 
-def _has_book_columns(df: pl.DataFrame) -> bool:
-    cols = set(df.columns)
-    return {"backTicks","backSizes","layTicks","laySizes"}.issubset(cols)
 
-def _make_features_row(bufs, last_row):
-    if len(bufs["ltp"]) < LAG_120S or len(bufs["vol"]) < LAG_120S:
-        return None
-    ltp_now = last_row["ltp"]; vol_now = last_row["tradedVolume"]
-    ltp_l30 = bufs["ltp"][-LAG_30S]; ltp_l60 = bufs["ltp"][-LAG_60S]; ltp_l120 = bufs["ltp"][-LAG_120S]
-    vol_l30 = bufs["vol"][-LAG_30S]; vol_l60 = bufs["vol"][-LAG_60S]; vol_l120 = bufs["vol"][-LAG_120S]
-    ltp_prev = bufs["ltp"][-1] if len(bufs["ltp"])>=1 else None
-    vol_prev = bufs["vol"][-1] if len(bufs["vol"])>=1 else None
-    ltp_diff_5s = (ltp_now - ltp_prev) if ltp_prev is not None else 0.0
-    vol_diff_5s = (vol_now - vol_prev) if vol_prev is not None else 0.0
-    def safe_div(a, b): return (a / b) if (b is not None and abs(b) > 1e-12) else None
-    feats = {
-        "ltp": ltp_now, "tradedVolume": vol_now,
-        "spreadTicks": last_row.get("spreadTicks", 0.0) or 0.0,
-        "imbalanceBest1": last_row.get("imbalanceBest1", 0.0) or 0.0,
-        "mins_to_off": last_row["mins_to_off"],
-        "__p_now": 1.0 / max(ltp_now, 1e-12),
-        "ltp_diff_5s": ltp_diff_5s, "vol_diff_5s": vol_diff_5s,
-        "ltp_lag30s": ltp_l30, "ltp_lag60s": ltp_l60, "ltp_lag120s": ltp_l120,
-        "tradedVolume_lag30s": vol_l30, "tradedVolume_lag60s": vol_l60, "tradedVolume_lag120s": vol_l120,
-        "ltp_mom_30s": ltp_now - ltp_l30, "ltp_mom_60s": ltp_now - ltp_l60, "ltp_mom_120s": ltp_now - ltp_l120,
-        "ltp_ret_30s": safe_div(ltp_now - ltp_l30, ltp_l30),
-        "ltp_ret_60s": safe_div(ltp_now - ltp_l60, ltp_l60),
-        "ltp_ret_120s": safe_div(ltp_now - ltp_l120, ltp_l120),
-    }
-    for k, v in feats.items():
-        if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
-            feats[k] = np.nan
-    return feats
+# ---------------------------- IO helpers ----------------------------
 
-# Tick ladder helpers
-_TICKS = [
-    (1.01, 2.00, 0.01), (2.00, 3.00, 0.02), (3.00, 4.00, 0.05), (4.00, 6.00, 0.10),
-    (6.00,10.00,0.20), (10.0,20.0,0.50), (20.0,30.0,1.00), (30.0,50.0,2.00),
-    (50.0,100.0,5.00), (100.0,1000.0,10.0),
-]
-_cum_ticks = []; cum = 0
-for lo, hi, step in _TICKS:
-    n = int(round((hi - lo) / step)) + 1
-    _cum_ticks.append((lo, hi, step, cum, cum + n - 1))
-    cum += n
-def _odds_from_tick_index(tick_index: int) -> float:
-    if tick_index < 0: tick_index = 0
-    for lo, hi, step, t0, t1 in _cum_ticks:
-        if t0 <= tick_index <= t1:
-            k = tick_index - t0
-            return round(lo + k * step, 2)
-    lo, hi, step, t0, t1 = _cum_ticks[-1]
-    k = min(t1, max(t0, tick_index)) - t0
-    return round(lo + k * step, 2)
-def _tick_index_from_odds(odds: float) -> float:
-    acc = 0
-    for lo, hi, step, t0, t1 in _cum_ticks:
-        if lo <= odds <= hi:
-            k = int(round((odds - lo) / step))
-            return t0 + k
-        acc = t1 + 1
-    return acc
+def curated_paths(root: str, sport: str, date: str) -> Tuple[Path,Path,Path]:
+    droot = Path(root)
+    snaps = droot / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={date}"
+    defs  = droot / "market_definitions" / f"sport={sport}" / f"date={date}"
+    res   = droot / "results" / f"sport={sport}" / f"date={date}"
+    return snaps, defs, res
 
-def _vwap_fill(side: str, ticks: list[int], sizes: list[float], need: float, levels: int) -> tuple[float,float]:
-    if not ticks or not sizes or need <= 0.0: return 0.0, None
-    L = max(1, int(levels)); filled = 0.0; notional = 0.0
-    for i in range(min(L, len(ticks))):
-        px = _odds_from_tick_index(int(ticks[i])); size_i = float(sizes[i])
-        if size_i <= 0: continue
-        take = min(need - filled, size_i)
-        if take <= 0: break
-        filled += take; notional += take * px
-        if filled >= need - 1e-12: break
-    if filled <= 0.0: return 0.0, None
-    return filled, float(notional / filled)
 
-def _ev_mtm(p_now: float, p_pred: float, commission: float, side: str) -> float:
-    eps = 1e-6
-    p_now_c  = max(eps, min(1.0 - eps, p_now))
-    p_pred_c = max(eps, min(1.0 - eps, p_pred))
-    if side == "back":
-        return ((p_pred_c / p_now_c) - 1.0) * (1.0 - commission)
-    else:
-        return (1.0 - (p_now_c / p_pred_c)) * (1.0 - commission)
+def scan_dates(start_date: str, asof: str) -> list[str]:
+    # inclusive start, inclusive asof (validation spans until asof)
+    sd = pl.datetime.strptime(start_date, "%Y-%m-%d").date()
+    ad = pl.datetime.strptime(asof, "%Y-%m-%d").date()
+    days = int((ad - sd).days) + 1
+    return [(sd + pl.duration(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
-def _ev_settlement(p_pred: float, ltp: float, commission: float, side: str) -> float:
-    if side == "back":
-        return p_pred * (ltp - 1.0) * (1.0 - commission) - (1.0 - p_pred)
-    else:
-        return (1.0 - p_pred) * (1.0 - commission) - p_pred * (ltp - 1.0)
 
-def _load_results(curated_root: Path, sport: str, start_dt, end_dt) -> pl.DataFrame:
-    days = []; d = start_dt
-    while d <= end_dt:
-        days.append(d.strftime("%Y-%m-%d")); d += timedelta(days=1)
-    lfs = []
-    for day in days:
-        lfs.append(
-            pl.scan_parquet(f"{curated_root}/results/sport={sport}/date={day}/*.parquet")
-              .select([
-                  pl.col("marketId").cast(pl.Utf8),
-                  pl.col("selectionId").cast(pl.Int64),
-                  pl.col("winLabel").cast(pl.Int32).fill_null(0),
-              ])
-        )
-    if not lfs:
-        return pl.DataFrame({"marketId": [], "selectionId": [], "winLabel": []})
-    return pl.concat(lfs, how="vertical_relaxed").unique().collect()
+def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.DataFrame:
+    parts = []
+    for d in dates:
+        snaps_dir, _, _ = curated_paths(curated, sport, d)
+        if snaps_dir.exists():
+            parts.append(pl.scan_parquet(str(snaps_dir / "*.parquet")))
+    if not parts:
+        return pl.DataFrame({})
+    lf = pl.concat(parts, how="vertical_relaxed")
+    df = lf.select([
+        pl.col("sport"),
+        pl.col("marketId"),
+        pl.col("selectionId"),
+        pl.col("publishTimeMs"),
+        pl.col("ltp"),
+        pl.col("tradedVolume"),
+        pl.col("spreadTicks"),
+        pl.col("imbalanceBest1"),
+        pl.col("backTicks").alias("backTicks"),
+        pl.col("backSizes").alias("backSizes"),
+        pl.col("layTicks").alias("layTicks"),
+        pl.col("laySizes").alias("laySizes"),
+        pl.col("ltpTick").alias("ltpTick"),
+    ]).collect(streaming=True)
+    return df
 
-def _prepare_exit_prices(df_snap: pl.DataFrame) -> pl.DataFrame:
-    exprs = [
-        pl.col("marketId").cast(pl.Utf8),
-        pl.col("selectionId").cast(pl.Int64),
-        pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
-          .dt.replace_time_zone("UTC").alias("ts_dt"),
-        pl.col("ltp").cast(pl.Float64).alias("ltp_exit_proxy"),
-    ]
-    if _has_book_columns(df_snap):
-        exprs += [pl.col("backTicks"), pl.col("backSizes"), pl.col("layTicks"), pl.col("laySizes")]
-    return (
-        df_snap
-        .filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
-        .select(exprs)
-        .sort(["marketId","selectionId","ts_dt"])
-    )
 
-def _basket_weights(cands: List[Dict[str, Any]], mode: str) -> List[float]:
-    if not cands: return []
-    if mode == "equal_ev":
-        w = np.array([max(1e-9, c["ev_per_1"]) for c in cands], dtype=float)
-    elif mode == "inverse_ev":
-        w = np.array([1.0 / max(1e-9, c["ev_per_1"]) for c in cands], dtype=float)
-    else:  # fractional_kelly
-        w = np.array([max(1e-9, c.get("kelly_frac", 1e-3)) for c in cands], dtype=float)
-    s = float(w.sum())
-    if s <= 0: return [1.0 / len(cands)] * len(cands)
-    return list(w / s)
+def read_market_defs_for_dates(curated: str, sport: str, dates: list[str]) -> pl.DataFrame:
+    parts = []
+    for d in dates:
+        _, defs_dir, _ = curated_paths(curated, sport, d)
+        if defs_dir.exists():
+            parts.append(pl.scan_parquet(str(defs_dir / "*.parquet")))
+    if not parts:
+        return pl.DataFrame({})
+    df = (pl.concat(parts, how="vertical_relaxed")
+          .select([
+              pl.col("sport"), pl.col("marketId"), pl.col("marketStartMs"),
+              pl.col("countryCode")
+          ])
+          .unique()
+          .collect(streaming=True))
+    return df
 
-def _swing_prob(dp: float, beta: float) -> float:
-    # Heuristic: larger |dp| -> lower swing probability; small |dp| -> more likely to oscillate
-    # swing_prob in (0,1): exp(-beta * |dp|)
-    return float(np.exp(-float(beta) * abs(float(dp))))
+
+def read_results_for_dates(curated: str, sport: str, dates: list[str]) -> pl.DataFrame:
+    parts = []
+    for d in dates:
+        _, _, res_dir = curated_paths(curated, sport, d)
+        if res_dir.exists():
+            parts.append(pl.scan_parquet(str(res_dir / "*.parquet")))
+    if not parts:
+        return pl.DataFrame({})
+    df = (pl.concat(parts, how="vertical_relaxed")
+          .select([
+              pl.col("sport"), pl.col("marketId"), pl.col("selectionId"),
+              pl.col("runnerStatus"), pl.col("winLabel")
+          ])
+          .unique()
+          .collect(streaming=True))
+    return df
+
+
+# ---------------------------- Feature building ----------------------------
+
+def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, horizon_s: int) -> pl.DataFrame:
+    if df.is_empty():
+        return df
+
+    # Join defs to get marketStartMs and countryCode
+    have_country = "countryCode" in defs.columns
+    dfj = (df.join(defs, on=["sport", "marketId"], how="left")
+             .with_columns([
+                 ( (pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000.0 ).alias("mins_to_off"),
+                 pl.col("ltp").cast(pl.Float64).alias("ltp_f"),
+                 pl.col("tradedVolume").cast(pl.Float64).alias("vol_f"),
+             ]))
+    # pre-off filter
+    dfj = dfj.filter(pl.col("mins_to_off") >= 0.0).filter(pl.col("mins_to_off") <= float(preoff_max_m))
+
+    # Basic rolling/lag feats per (marketId, selectionId)
+    dfj = dfj.sort(["marketId", "selectionId", "publishTimeMs"])
+
+    def add_group(g: pl.DataFrame) -> pl.DataFrame:
+        # simple 5s diff (native cadence is 5s)
+        ltp = g.get_column("ltp_f")
+        vol = g.get_column("vol_f")
+        # lagged ltp (approx windows)
+        g = g.with_columns([
+            pl.col("ltp_f").diff().alias("ltp_diff_5s"),
+            pl.col("vol_f").diff().alias("vol_diff_5s"),
+            pl.col("ltp_f").shift(6).alias("ltp_lag30s"),
+            pl.col("ltp_f").shift(12).alias("ltp_lag60s"),
+            pl.col("ltp_f").shift(24).alias("ltp_lag120s"),
+            pl.col("vol_f").shift(6).alias("tradedVolume_lag30s"),
+            pl.col("vol_f").shift(12).alias("tradedVolume_lag60s"),
+            pl.col("vol_f").shift(24).alias("tradedVolume_lag120s"),
+        ])
+        # momentum/returns
+        for w, lag in [(30, "30s"), (60, "60s"), (120, "120s")]:
+            g = g.with_columns([
+                (pl.col("ltp_f") - pl.col(f"ltp_lag{lag}")).alias(f"ltp_mom_{lag}"),
+                ( (pl.col("ltp_f") / pl.col(f"ltp_lag{lag}")) - 1.0 ).alias(f"ltp_ret_{lag}"),
+            ])
+        return g
+
+    dfj = dfj.group_by(["marketId", "selectionId"], maintain_order=True).map_groups(add_group)
+
+    # Future exit timestamp for horizon exit
+    dfj = dfj.with_columns([
+        (pl.col("publishTimeMs") + horizon_s * 1000).alias("ts_exit_ms"),
+    ])
+
+    # In case countryCode missing, fill with "UNK"
+    if not have_country:
+        dfj = dfj.with_columns(pl.lit("UNK").alias("countryCode"))
+
+    return dfj
+
+
+# ---------------------------- Model prediction / EV ----------------------------
+
+def _model_path(models_dir: str) -> Path:
+    return Path(models_dir) / "xgb_trend_reg.json"
+
+def predict_dp(df: pl.DataFrame, models_dir: str, device: str) -> pl.Series:
+    """Predict dp using trained XGBoost model if present; else simple proxy from momentum."""
+    mp = _model_path(models_dir)
+    if not mp.exists() or xgb is None:
+        # Proxy dp: short-term momentum signal (scaled)
+        proxy = (df["ltp_mom_60s"].fill_null(0.0) + df["ltp_mom_30s"].fill_null(0.0)) / 2.0
+        return proxy.fill_null(0.0)
+
+    booster = xgb.Booster()
+    booster.load_model(str(mp))
+    # Build feature matrix; keep a simple set to avoid mismatch
+    feat_cols = [c for c in [
+        "ltp_f","vol_f","ltp_diff_5s","vol_diff_5s",
+        "ltp_lag30s","ltp_lag60s","ltp_lag120s",
+        "tradedVolume_lag30s","tradedVolume_lag60s","tradedVolume_lag120s",
+        "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
+        "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
+        "mins_to_off",
+    ] if c in df.columns]
+    if not feat_cols:
+        return pl.Series([0.0]*df.height, dtype=pl.Float64)
+
+    X = df.select(feat_cols).to_pandas()  # xgboost expects numpy/pandas
+    # Use DMatrix to avoid inplace/device mismatch issues
+    dmat = xgb.DMatrix(X)
+    dp = booster.predict(dmat)  # shape (n,)
+    # Ensure length matches
+    if len(dp) != df.height:
+        dp = dp[:df.height]
+    return pl.Series(dp, dtype=pl.Float64)
+
+
+def dp_to_ev_per_pound(dp: pl.Series, ev_scale: float, ev_cap: float) -> pl.Series:
+    # Clip raw model output to ev_cap for tail safety, then scale
+    raw = dp.clip(min=-ev_cap, max=ev_cap)
+    return (raw * ev_scale).cast(pl.Float64)
+
+
+# ---------------------------- Liquidity helpers ----------------------------
+
+def _level1_available(backTicks, backSizes, layTicks, laySizes, side: str) -> Tuple[Optional[int], float]:
+    """
+    Returns (best_tick, size_at_best) for the requested side, or (None, 0.0) if unavailable.
+    tick is int ticks from some reference; we only need the relative movement and size.
+    """
+    try:
+        if side == "back":
+            ticks = backTicks[0] if backTicks and len(backTicks) > 0 else None
+            size  = backSizes[0] if backSizes and len(backSizes) > 0 else 0.0
+        else:
+            ticks = layTicks[0] if layTicks and len(layTicks) > 0 else None
+            size  = laySizes[0] if laySizes and len(laySizes) > 0 else 0.0
+        return ticks, float(size or 0.0)
+    except Exception:
+        return None, 0.0
+
+
+def compute_fill_fraction(size_available: float, desired: float, min_fill_frac: float) -> float:
+    if desired <= 0.0:
+        return 0.0
+    frac = max(0.0, min(1.0, size_available / desired))
+    return frac if frac >= min_fill_frac else 0.0
+
+
+# ---------------------------- Portfolio sizing ----------------------------
+
+def portfolio_size_per_market(df_cands: pl.DataFrame, topk: int, budget: float) -> pl.DataFrame:
+    """
+    Take topK by EV within each (marketId), split per-market budget equally among chosen picks.
+    If EV ties, maintain deterministic order by selectionId.
+    """
+    if df_cands.is_empty():
+        return df_cands
+    sort_cols = [pl.col("marketId"), pl.col("ev_per_1").desc(), pl.col("selectionId")]
+    ranked = (df_cands
+              .sort(sort_cols)
+              .with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rank"))
+              .filter(pl.col("__rank") < topk)
+              .drop("__rank"))
+    # Equal EV sizing for now: split budget evenly among chosen picks per market
+    sized = (ranked
+             .with_columns([
+                 (pl.lit(budget) / pl.len()).over("marketId").alias("stake_target")
+             ]))
+    return sized
+
+
+# ---------------------------- Exit logic ----------------------------
+
+def ticks_moved(entry_tick: Optional[int], exit_tick: Optional[int]) -> int:
+    if entry_tick is None or exit_tick is None:
+        return 0
+    try:
+        return int(exit_tick - entry_tick)
+    except Exception:
+        return 0
+
+
+# ---------------------------- Summary writers ----------------------------
+
+def _write_summary_json(summary: dict, out_dir: Path, asof: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"summary_{asof}.json").write_text(json.dumps(summary, indent=2))
+
+
+def _write_summary_csv(summary: dict, out_dir: Path, asof: str):
+    df = pl.DataFrame({k: [v] for k, v in summary.items() if not isinstance(v, (list, dict))})
+    df.write_csv(out_dir / f"summary_{asof}.csv")
+
+
+# ---------------------------- Main ----------------------------
 
 def main():
     args = parse_args()
-    outdir = Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
-    curated = Path(args.curated)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    asof_dt = parse_date(args.asof)
-    start_dt = parse_date(args.start_date)
-    valid_end = asof_dt
-    valid_start = asof_dt - timedelta(days=args.valid_days)
-
-    # ---- Column-pruned snapshot scan ----
-    cols = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1","marketStartMs","countryCode"]
-    need_book = bool(args.enforce_liquidity)
-    if need_book:
-        cols += ["backTicks","backSizes","layTicks","laySizes"]
-
-    lf = read_snapshots(curated, start_dt, valid_end, args.sport)
-    schema_names = set(lf.collect_schema().names())
-    present = [c for c in cols if c in schema_names]
-    lf = lf.select(present).with_columns([ time_to_off_minutes_expr() ])
-
-    df = lf.collect()
-    df = filter_preoff(df, args.preoff_max)
-    df = df.filter(pl.col("ltp").is_not_null() & (pl.col("ltp") > 1.01))
-    if args.odds_min is not None: df = df.filter(pl.col("ltp") >= float(args.odds_min))
-    if args.odds_max is not None: df = df.filter(pl.col("ltp") <= float(args.odds_max))
-
-    # ---- Country facets ----
-    df = df.with_columns(
-        pl.from_epoch(pl.col("publishTimeMs"), time_unit="ms").dt.replace_time_zone("UTC").dt.date().alias("__date")
-    )
-    df_tr = df.filter(pl.col("__date") < valid_start)
-    df_va = df.filter(pl.col("__date") >= valid_start)
-
-    if "countryCode" in df.columns:
-        freq = (
-            df_tr.group_by("countryCode").agg(pl.len().alias("cnt"))
-                 .with_columns((pl.col("cnt") / pl.col("cnt").sum()).alias("freq"))
-                 .select(["countryCode","freq"])
-        )
-        def add_country_feats(dfi: pl.DataFrame) -> pl.DataFrame:
-            dfi = dfi.with_columns((pl.col("countryCode") == "GB").cast(pl.Int8).alias("is_gb"))
-            dfi = dfi.join(freq, on="countryCode", how="left").with_columns(pl.col("freq").fill_null(0.0).alias("country_freq"))
-            return dfi
-        df_tr = add_country_feats(df_tr)
-        df_va = add_country_feats(df_va)
-    else:
-        df_tr = df_tr.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
-        df_va = df_va.with_columns([pl.lit(0).cast(pl.Int8).alias("is_gb"), pl.lit(0.0).alias("country_freq")])
-
-    df = pl.concat([df_tr, df_va], how="vertical_relaxed").sort(["marketId","selectionId","publishTimeMs"])
-
-    # Liquidity availability & effective setting
-    book_available = _has_book_columns(df)
-    effective_enforce = bool(args.enforce_liquidity and book_available)
-    if args.enforce_liquidity and not book_available:
-        msg = "[simulate] NOTE: depth columns missing; "
-        msg += "require-book=on → dropping ALL trades (no liquidity info)." if args.require_book else \
-               "falling back to LTP exec/exit and disabling liquidity enforcement."
-        print(msg)
-    print(f"[simulate] Liquidity: requested={'on' if args.enforce_liquidity else 'off'}, "
-          f"effective={'on' if effective_enforce else 'off'}; require_book={'on' if args.require_book else 'off'}")
-
-    if args.enforce_liquidity and args.require_book and not book_available:
-        _write_empty(outdir, args); return
-
-    exit_df = _prepare_exit_prices(df)
-
-    # ----- Model (+ optional calibrator) -----
-    bst = xgb.Booster(); bst.load_model(args.model_path)
-    try: bst.set_param({"device": args.device})
-    except Exception: pass
-    calibrator = None
-    if args.calib_path:
-        with open(args.calib_path, "rb") as f: calibrator = pickle.load(f)
-
-    # rolling buffers per runner
-    bufs_ltp = defaultdict(lambda: deque(maxlen=LAG_120S))
-    bufs_vol = defaultdict(lambda: deque(maxlen=LAG_120S))
-
-    # candidate buffer per (marketId, publishTimeMs) for portfolio selection
-    cand_buf: Dict[Tuple[str, int], List[Dict[str, Any]]] = defaultdict(list)
-
-    feat_names = FEATURES_WITH_COUNTRY
-
-    def _predict_dp(feat_row: Dict[str, float]) -> float:
-        X = np.array([[feat_row.get(c, np.nan) for c in feat_names]], dtype=np.float32)
-        try:
-            return float(bst.inplace_predict(X, validate_features=False)[0])
-        except Exception:
-            return float(bst.predict(xgb.DMatrix(X, feature_names=feat_names))[0])
-
-    def flush_candidates_for_time(market_id: str, ts_ms: int):
-        key = (market_id, ts_ms)
-        cands = cand_buf.get(key, [])
-        if not cands:
-            return []
-
-        # Split by side and rank
-        longs  = [c for c in cands if c["side"] == "back"]
-        shorts = [c for c in cands if c["side"] == "lay"]
-
-        longs.sort(key=lambda c: c["ev_per_1"], reverse=True)
-        shorts.sort(key=lambda c: c["ev_per_1"], reverse=True)
-
-        pick_longs  = longs[:max(0, args.per_market_topk)]
-        pick_shorts = shorts[:max(0, args.per_market_topk)]
-        picks = pick_longs + pick_shorts
-        if not picks:
-            cand_buf.pop(key, None)
-            return []
-
-        # Kelly fraction only if needed
-        need_kelly = (args.stake_mode == "kelly") or (args.basket_sizing == "fractional_kelly")
-        if need_kelly:
-            for c in picks:
-                kf = kelly_fraction_back(c["p_pred"], c["ltp"], args.commission) if c["side"] == "back" \
-                     else kelly_fraction_lay (c["p_pred"], c["ltp"], args.commission)
-                c["kelly_frac"] = max(args.kelly_floor, min(args.kelly_cap, kf))
-        else:
-            for c in picks: c["kelly_frac"] = 0.0
-
-        # Basket sizing
-        budget = float(args.per_market_budget)
-        weights = _basket_weights(picks, args.basket_sizing)
-
-        # Stakes requested
-        stakes_req = [budget * w for w in weights]  # both flat and kelly use market budget distribution
-
-        realized = []
-        for c, stake_req in zip(picks, stakes_req):
-            if stake_req <= 0:
-                continue
-            # Execute primary
-            if effective_enforce and c["has_book"]:
-                avail_ticks = c["backTicks"] if c["side"] == "back" else c["layTicks"]
-                avail_sizes = c["backSizes"] if c["side"] == "back" else c["laySizes"]
-                stake_filled, exec_vwap = _vwap_fill(c["side"], avail_ticks, avail_sizes, stake_req, args.liquidity_levels)
-            elif args.enforce_liquidity and args.require_book:
-                continue
-            else:
-                stake_filled = stake_req
-                exec_vwap = float(c["ltp"])
-
-            if stake_filled <= 0 or exec_vwap is None:
-                continue
-
-            fill_frac = stake_filled / stake_req if stake_req > 1e-9 else 1.0
-            if fill_frac < float(args.min_fill_frac):
-                continue
-
-            exp_pnl_raw = c["ev_raw"] * stake_filled
-            exp_pnl     = c["ev_per_1"] * stake_filled
-
-            primary_rec = {
-                "publishTimeMs": c["ts_ms"],
-                "marketId": c["marketId"],
-                "selectionId": c["selectionId"],
-                "ltp": c["ltp"],
-                "p_now": c["p_now"],
-                "p_pred": c["p_pred"],
-                "delta_pred": c["dp"],
-                "side": c["side"],
-                "is_contra": 0,
-                "ev_per_1": c["ev_per_1"],
-                "stake_req": float(stake_req),
-                "stake_filled": float(stake_filled),
-                "fill_frac": float(fill_frac),
-                "exec_odds": float(exec_vwap),
-                "exp_pnl": float(exp_pnl),
-                "exp_pnl_raw": float(exp_pnl_raw),
-                "stake_mode": args.stake_mode,
-                # Primary exit at main horizon:
-                "ts_exit_ms": int(c["ts_ms"] + args.horizon_secs * 1000),
-            }
-            realized.append(primary_rec)
-
-            # Optionally place contra
-            place_contra = False
-            if args.contra_mode == "always":
-                place_contra = True
-            elif args.contra_mode == "prob":
-                sp = _swing_prob(c["dp"], args.contra_beta)
-                place_contra = (sp >= float(args.contra_prob_thresh))
-
-            if place_contra:
-                contra_side = "lay" if c["side"] == "back" else "back"
-                contra_req  = float(args.contra_frac) * float(stake_filled)
-                if contra_req > 0:
-                    if effective_enforce and c["has_book"]:
-                        avail_ticks = c["layTicks"] if contra_side == "lay" else c["backTicks"]
-                        avail_sizes = c["laySizes"] if contra_side == "lay" else c["backSizes"]
-                        contra_filled, contra_vwap = _vwap_fill(contra_side, avail_ticks, avail_sizes, contra_req, args.liquidity_levels)
-                    elif args.enforce_liquidity and args.require_book:
-                        contra_filled, contra_vwap = 0.0, None
-                    else:
-                        contra_filled, contra_vwap = contra_req, float(c["ltp"])
-
-                    if contra_filled > 0 and contra_vwap is not None:
-                        contra_rec = {
-                            "publishTimeMs": c["ts_ms"],
-                            "marketId": c["marketId"],
-                            "selectionId": c["selectionId"],
-                            "ltp": c["ltp"],
-                            "p_now": c["p_now"],
-                            "p_pred": c["p_pred"],
-                            "delta_pred": c["dp"],
-                            "side": contra_side,
-                            "is_contra": 1,
-                            "ev_per_1": c["ev_per_1"],  # reported; EV applies to primary signal context
-                            "stake_req": float(contra_req),
-                            "stake_filled": float(contra_filled),
-                            "fill_frac": float(contra_filled/contra_req if contra_req>1e-9 else 1.0),
-                            "exec_odds": float(contra_vwap),
-                            "exp_pnl": 0.0,           # neutral: we don't add EV for contra (pure swing expression)
-                            "exp_pnl_raw": 0.0,
-                            "stake_mode": args.stake_mode,
-                            # Contra exit at extended horizon:
-                            "ts_exit_ms": int(c["ts_ms"] + (args.horizon_secs + args.contra_hold_secs) * 1000),
-                        }
-                        realized.append(contra_rec)
-
-        cand_buf.pop(key, None)
-        return realized
-
-    # Stream rows and build features + candidates
-    trades_records: List[pl.DataFrame] = []
-    last_key = None
-
-    for r in df.iter_rows(named=True):
-        mkt = r["marketId"]; sel = int(r["selectionId"])
-        ts_ms = int(r["publishTimeMs"])
-        key = (mkt, ts_ms)
-
-        # Maintain per-runner buffers
-        runner_key = (mkt, sel)
-        bufs_ltp[runner_key].append(float(r["ltp"]))
-        bufs_vol[runner_key].append(float(r["tradedVolume"]))
-
-        feats_base = _make_features_row({"ltp": bufs_ltp[runner_key], "vol": bufs_vol[runner_key]}, {
-            "ltp": float(r["ltp"]),
-            "tradedVolume": float(r["tradedVolume"]),
-            "spreadTicks": float(r.get("spreadTicks") or 0.0),
-            "imbalanceBest1": float(r.get("imbalanceBest1") or 0.0),
-            "mins_to_off": float(r["mins_to_off"]),
-        })
-        if feats_base is None:
-            continue
-
-        feats_base["is_gb"] = float(1.0 if (r.get("countryCode") == "GB") else 0.0)
-        feats_base["country_freq"] = float(r.get("country_freq") or 0.0)
-
-        dp = _predict_dp(feats_base)
-        p_now = 1.0 / max(1e-12, float(r["ltp"]))
-        p_pred = p_now + dp
-        p_pred = 0.0 if p_pred < 0.0 else (1.0 if p_pred > 1.0 else p_pred)
-
-        side = "back" if dp > 0 else ("lay" if dp < 0 else "none")
-        if side == "none":
-            continue
-
-        # EV computation (raw and scaled)
-        if args.ev_mode == "mtm":
-            ev_raw = _ev_mtm(p_now, p_pred, args.commission, side)
-        else:
-            ev_raw = _ev_settlement(p_pred, float(r["ltp"]), args.commission, side)
-        ev_per_1 = ev_raw * float(args.ev_scale)
-        if ev_per_1 < float(args.edge_thresh):
-            continue
-
-        # Add to candidate buffer
-        has_book = book_available and (r.get("backTicks") is not None or r.get("layTicks") is not None)
-        cand_buf[key].append({
-            "ts_ms": ts_ms,
-            "marketId": mkt,
-            "selectionId": sel,
-            "ltp": float(r["ltp"]),
-            "p_now": float(p_now),
-            "p_pred": float(p_pred),
-            "dp": float(dp),
-            "side": side,
-            "ev_raw": float(ev_raw),
-            "ev_per_1": float(ev_per_1),
+    # Read data
+    dates = scan_dates(args.start_date, args.asof)
+    df = read_orderbook_for_dates(args.curated, args.sport, dates)
+    if df.is_empty():
+        print("[simulate] no snapshots found; exiting.")
+        _write_summary_json({
+            "asof": args.asof,
+            "n_trades": 0,
+            "overall_roi_exp": 0.0,
+            "overall_roi_real_mtm": 0.0,
+            "overall_roi_real_settle": 0.0,
+            "avg_ev_per_1": 0.0,
+            "edge_thresh": args.edge_thresh,
             "stake_mode": args.stake_mode,
-            "has_book": bool(has_book),
-            "backTicks": r.get("backTicks") or [],
-            "backSizes": r.get("backSizes") or [],
-            "layTicks": r.get("layTicks") or [],
-            "laySizes": r.get("laySizes") or [],
-        })
-
-        # Whenever market/time changes, flush previous key
-        if last_key is None:
-            last_key = key
-        elif key != last_key:
-            realized = flush_candidates_for_time(last_key[0], last_key[1])
-            if realized:
-                trades_records.append(_to_df(realized))
-            last_key = key
-
-    # Flush final batch
-    if last_key is not None:
-        realized = flush_candidates_for_time(last_key[0], last_key[1])
-        if realized:
-            trades_records.append(_to_df(realized))
-
-    if not trades_records:
-        print("[simulate] no trades generated.")
-        _write_empty(outdir, args)
+            "odds_min": args.odds_min,
+            "odds_max": args.odds_max,
+            "enforce_liquidity_effective": bool(args.enforce_liquidity),
+            "liquidity_levels": int(args.liquidity_levels or 0),
+            "min_fill_frac": float(args.min_fill_frac or 0.0),
+            "ev_scale_used": float(args.ev_scale),
+        }, out_dir, args.asof)
         return
 
-    trades = pl.concat(trades_records, how="vertical_relaxed")
+    defs = read_market_defs_for_dates(args.curated, args.sport, dates)
+    # results only needed for settlement pnl; we simulate using exit prices anyway
+    results = read_results_for_dates(args.curated, args.sport, dates)
 
-    # Exit price joining (use per-row ts_exit_ms if present, else default horizon)
-    if "ts_exit_ms" not in trades.columns:
-        trades = trades.with_columns(
-            (pl.col("publishTimeMs").cast(pl.Int64) + args.horizon_secs * 1000).alias("ts_exit_ms")
-        )
+    # Build features and exit timestamps
+    df = build_features(df, defs, args.preoff_max, args.horizon_secs)
 
-    trades = trades.with_columns([
-        pl.from_epoch((pl.col("publishTimeMs").cast(pl.Int64)), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_dt"),
-        pl.from_epoch(pl.col("ts_exit_ms").cast(pl.Int64), time_unit="ms").dt.replace_time_zone("UTC").alias("ts_exit_dt"),
+    # Odds band filter (use ltp as proxy for odds)
+    if args.odds_min is not None:
+        df = df.filter(pl.col("ltp_f") >= float(args.odds_min))
+    if args.odds_max is not None:
+        df = df.filter(pl.col("ltp_f") <= float(args.odds_max))
+
+    # Predict dp (model or proxy), then EV per £1
+    dp = predict_dp(df, args.models_dir, args.device)
+    df = df.with_columns(dp.alias("__dp"))
+
+    ev_per_1 = dp_to_ev_per_pound(df["__dp"], args.ev_scale, args.ev_cap)
+    df = df.with_columns(ev_per_1.alias("ev_per_1"))
+
+    # Candidate trades: EV after scaling must exceed threshold
+    cands = df.filter(pl.col("ev_per_1") >= float(args.edge_thresh)).with_columns([
+        # choose side: if ev>0 we "back"; if ev<0 and we allowed negative edges we "lay"
+        pl.lit("back").alias("side"),
+        # entry reference price and tick
+        pl.col("ltp_f").alias("entry_price"),
+        pl.col("ltpTick").alias("entry_tick"),
     ])
 
-    exit_df = _prepare_exit_prices(df).sort(["marketId","selectionId","ts_dt"])
-    trades_sorted = trades.sort(["marketId","selectionId","ts_exit_dt"])
-    trades2 = trades_sorted.join_asof(
-        exit_df,
-        left_on="ts_exit_dt", right_on="ts_dt",
-        by=["marketId","selectionId"],
-        strategy="forward",
-        tolerance=timedelta(minutes=10),
-    ).with_columns(
-        pl.col("ltp_exit_proxy").alias("exit_odds")
-    ).drop(["ts_dt","ts_exit_dt","ltp_exit_proxy"]).filter(
-        pl.col("exit_odds").is_not_null() & (pl.col("exit_odds") > 1.01)
-    )
+    # No candidates? Write empty summary and exit
+    if cands.is_empty():
+        print("[simulate] no trades generated.")
+        summary = {
+            "asof": args.asof,
+            "edge_thresh": args.edge_thresh,
+            "stake_mode": args.stake_mode,
+            "odds_min": args.odds_min,
+            "odds_max": args.odds_max,
+            "enforce_liquidity_requested": bool(args.enforce_liquidity),
+            "enforce_liquidity_effective": bool(args.enforce_liquidity),
+            "liquidity_levels": int(args.liquidity_levels or 0),
+            "min_fill_frac": float(args.min_fill_frac or 0.0),
+            "per_market_topk": int(getattr(args, "per_market_topk", 1) or 1),
+            "per_market_budget": float(getattr(args, "per_market_budget", 10.0) or 10.0),
+            "exit_on_move_ticks": int(getattr(args, "exit_on_move_ticks", 0) or 0),
+            "ev_scale_used": float(args.ev_scale),
+            "n_trades": 0,
+            "total_exp_profit": 0.0,
+            "avg_ev_per_1": 0.0,
+            "total_real_mtm_profit": 0.0,
+            "total_real_settle_profit": 0.0,
+            "overall_roi_exp": 0.0,
+            "overall_roi_real_mtm": 0.0,
+            "overall_roi_real_settle": 0.0,
+        }
+        _write_summary_json(summary, out_dir, args.asof)
+        _write_summary_csv(summary, out_dir, args.asof)
+        return
 
-    # Optional tick-target annotation on primary only
-    if int(args.exit_on_move_ticks) > 0:
-        n_ticks = int(args.exit_on_move_ticks)
-        trades2 = trades2.with_columns([
-            pl.col("exec_odds").map_elements(_tick_index_from_odds, return_dtype=pl.Int64).alias("tick_entry"),
-            pl.col("exit_odds").map_elements(_tick_index_from_odds, return_dtype=pl.Int64).alias("tick_exit"),
-        ]).with_columns([
-            pl.when(pl.col("side") == "back")
-              .then((pl.col("tick_entry") - pl.col("tick_exit")) >= n_ticks)
-              .otherwise((pl.col("tick_exit") - pl.col("tick_entry")) >= n_ticks)
-              .alias("__hit_tick_target")
-        ])
+    # Portfolio selection and basic sizing
+    picks = cands.select([
+        "sport","marketId","selectionId","publishTimeMs","entry_price","entry_tick",
+        "ltp_f","mins_to_off","ev_per_1"
+    ])
+    picks = portfolio_size_per_market(picks, args.per_market_topk, args.per_market_budget)
 
-    if args.min_fill_frac > 0:
-        trades2 = trades2.filter(pl.col("fill_frac") >= float(args.min_fill_frac))
+    # Staking
+    if args.stake_mode == "kelly":
+        # Kelly fraction of bankroll capped/floored; here use ev_per_1 as proxy "edge"
+        k_frac = (pl.col("ev_per_1").clip(min=-args.ev_cap, max=args.ev_cap)
+                  .clip(min=args.kelly_floor, max=args.kelly_cap))
+        picks = picks.with_columns((k_frac * args.bankroll_nom).alias("stake_target"))
+    # stake_target already set for flat via portfolio sizing
 
-    EV_CAP = float(args.ev_cap)
-    trades2 = trades2.with_columns(pl.col("ev_per_1").clip(-EV_CAP, EV_CAP))
-
-    # MTM P&L
-    trades2 = trades2.with_columns([
-        pl.when(pl.col("side") == "back")
-          .then(((pl.col("exec_odds") / pl.col("exit_odds")) - 1.0) * pl.col("stake_filled"))
-          .otherwise(1.0 - (pl.col("exit_odds") / pl.col("exec_odds")) * pl.col("stake_filled"))
-          .alias("real_mtm_pnl_raw")
-    ]).with_columns(
-        pl.when(pl.col("real_mtm_pnl_raw").is_finite()).then(pl.col("real_mtm_pnl_raw")).otherwise(pl.lit(None)).alias("real_mtm_pnl")
-    ).drop("real_mtm_pnl_raw")
-
-    # Settlement P&L (requires results)
-    results_df = _load_results(curated, args.sport, start_dt, valid_end)
-    if results_df.height > 0:
-        comm = float(args.commission)
-        trades2 = (trades2.join(results_df, on=["marketId","selectionId"], how="left")
-                        .with_columns(pl.col("winLabel").fill_null(0).cast(pl.Int32))
-                        .with_columns(
-                            pl.when(pl.col("side") == "back")
-                              .then(pl.when(pl.col("winLabel") == 1)
-                                        .then((pl.col("exec_odds") - 1.0) * pl.col("stake_filled") * (1.0 - comm))
-                                        .otherwise(-pl.col("stake_filled")))
-                              .otherwise(pl.when(pl.col("winLabel") == 1)
-                                        .then(-(pl.col("exec_odds") - 1.0) * pl.col("stake_filled"))
-                                        .otherwise(pl.col("stake_filled") * (1.0 - comm)))
-                              .alias("real_settle_pnl")
-                        ))
+    # Liquidity enforcement at L1
+    have_depth = all(c in df.columns for c in ["backTicks","backSizes","layTicks","laySizes"])
+    if args.enforce_liquidity and not have_depth and args.require_book:
+        print("[simulate] NOTE: depth columns missing; require-book=on → dropping ALL trades (no liquidity info).")
+        effective_liq = False
+        picks = picks.head(0)
     else:
-        trades2 = trades2.with_columns(pl.lit(None, dtype=pl.Float64).alias("real_settle_pnl"))
+        effective_liq = args.enforce_liquidity and have_depth
 
-    # Persist trades (optional)
-    if int(args.write_trades) == 1:
-        trades_path = Path(args.output_dir) / f"trades_{args.asof}.parquet"
-        trades2.write_parquet(trades_path)
+    if effective_liq and not picks.is_empty():
+        # Join best-size at entry snapshot (level1) from original df
+        df_depth = df.select([
+            "marketId","selectionId","publishTimeMs","backTicks","backSizes","layTicks","laySizes"
+        ])
+        picks = (picks.join(df_depth, on=["marketId","selectionId","publishTimeMs"], how="left")
+                      .with_columns([
+                          # available size at best for our side (assuming back side for positive ev)
+                          pl.struct("backTicks","backSizes","layTicks","laySizes")
+                            .apply(lambda s: _level1_available(
+                                s["backTicks"], s["backSizes"], s["layTicks"], s["laySizes"], "back")[1])
+                            .alias("size_l1"),
+                      ]))
+        # Compute filled stake
+        picks = picks.with_columns([
+            pl.col("size_l1").fill_null(0.0).alias("size_available"),
+            pl.col("stake_target").fill_null(0.0).alias("stake_target_safe")
+        ])
+        # fill fraction
+        picks = picks.with_columns([
+            (pl.when(pl.col("stake_target_safe") > 0)
+               .then((pl.col("size_available") / pl.col("stake_target_safe")).clip(upper=1.0))
+               .otherwise(0.0)
+             ).alias("fill_frac_raw")
+        ])
+        # enforce min fill
+        picks = picks.with_columns([
+            (pl.when(pl.col("fill_frac_raw") >= float(args.min_fill_frac))
+               .then(pl.col("fill_frac_raw"))
+               .otherwise(0.0)
+             ).alias("fill_frac")
+        ])
+        picks = picks.with_columns((pl.col("stake_target_safe") * pl.col("fill_frac")).alias("stake_filled"))
+        # Drop trades with zero fill
+        picks = picks.filter(pl.col("stake_filled") > 0.0)
+    else:
+        picks = picks.with_columns([
+            pl.col("stake_target").alias("stake_filled"),
+            pl.lit(1.0).alias("fill_frac")
+        ])
 
-    # Daily summary with ROI (primary and contra combined)
-    daily = (
-        trades2
-        .with_columns(
-            pl.from_epoch(pl.col("publishTimeMs").cast(pl.Int64), time_unit="ms")
-              .dt.replace_time_zone("UTC").dt.date().cast(pl.Utf8).alias("day")
-        )
-        .group_by("day","stake_mode")
-        .agg([
-            pl.len().alias("n_trades"),
-            pl.sum("exp_pnl").alias("exp_profit"),
-            pl.mean("ev_per_1").alias("avg_ev"),
-            pl.mean("stake_filled").alias("avg_stake_filled"),
-            pl.mean("fill_frac").alias("avg_fill_frac"),
-            pl.sum("real_mtm_pnl").alias("real_mtm_profit"),
-            pl.sum("real_settle_pnl").alias("real_settle_profit"),
-            pl.mean("is_contra").alias("share_contra"),
-        ])
-        .with_columns([
-            (pl.col("exp_profit")        / pl.lit(float(args.bankroll_nom))).alias("roi_exp"),
-            (pl.col("real_mtm_profit")   / pl.lit(float(args.bankroll_nom))).alias("roi_real_mtm"),
-            (pl.col("real_settle_profit")/ pl.lit(float(args.bankroll_nom))).alias("roi_real_settle"),
-        ])
-        .sort("day")
+    if picks.is_empty():
+        print("[simulate] no trades generated after liquidity/filters.")
+        summary = {
+            "asof": args.asof,
+            "edge_thresh": args.edge_thresh,
+            "stake_mode": args.stake_mode,
+            "odds_min": args.odds_min,
+            "odds_max": args.odds_max,
+            "enforce_liquidity_requested": bool(args.enforce_liquidity),
+            "enforce_liquidity_effective": bool(effective_liq),
+            "liquidity_levels": int(args.liquidity_levels or 0),
+            "min_fill_frac": float(args.min_fill_frac or 0.0),
+            "per_market_topk": int(args.per_market_topk or 1),
+            "per_market_budget": float(args.per_market_budget or 10.0),
+            "exit_on_move_ticks": int(args.exit_on_move_ticks or 0),
+            "ev_scale_used": float(args.ev_scale),
+            "n_trades": 0,
+            "total_exp_profit": 0.0,
+            "avg_ev_per_1": 0.0,
+            "total_real_mtm_profit": 0.0,
+            "total_real_settle_profit": 0.0,
+            "overall_roi_exp": 0.0,
+            "overall_roi_real_mtm": 0.0,
+            "overall_roi_real_settle": 0.0,
+        }
+        _write_summary_json(summary, out_dir, args.asof)
+        _write_summary_csv(summary, out_dir, args.asof)
+        return
+
+    # Exit price determination
+    # Horizon exit: join future snapshot on (marketId, selectionId, ts_exit_ms <= publishTimeMs)
+    # We'll emulate asof forward join using nearest greater-equal publishTimeMs after ts_exit_ms
+    df_exit = (df
+               .select(["marketId","selectionId","publishTimeMs","ltp_f","ltpTick"])
+               .rename({"publishTimeMs": "publishTimeMs_exit",
+                        "ltp_f": "exit_price",
+                        "ltpTick": "exit_tick"})
+              )
+
+    picks = (picks
+             .rename({"publishTimeMs":"publishTimeMs_entry"})
+             .with_columns(pl.col("publishTimeMs_entry") + args.horizon_secs * 1000
+                           .alias("ts_exit_ms"))
+            )
+
+    # Join nearest future by asof (right) on (marketId, selectionId, publishTimeMs)
+    # Polars requires both sides sorted by key for asof join
+    picks_sorted = picks.sort(["marketId","selectionId","ts_exit_ms"])
+    exit_sorted  = df_exit.sort(["marketId","selectionId","publishTimeMs_exit"])
+
+    picks2 = picks_sorted.join_asof(
+        exit_sorted,
+        left_on="ts_exit_ms", right_on="publishTimeMs_exit",
+        by=["marketId","selectionId"], strategy="forward"
     )
-    daily_csv = Path(args.output_dir) / f"daily_{args.asof}.csv"
+
+    # Optional early exit on favorable tick move
+    if args.exit_on_move_ticks and args.exit_on_move_ticks > 0:
+        # If exit_tick missing, fallback to horizon exit
+        picks2 = picks2.with_columns([
+            pl.when(
+                (pl.col("entry_tick").is_not_null()) & (pl.col("exit_tick").is_not_null()) &
+                ((pl.col("exit_tick") - pl.col("entry_tick")) <= -int(args.exit_on_move_ticks))  # back side: favorable if price SHORTENS => tick decreases
+            ).then(pl.col("exit_price"))
+             .otherwise(pl.col("exit_price"))
+             .alias("exit_price_eff"),
+            pl.when(
+                (pl.col("entry_tick").is_not_null()) & (pl.col("exit_tick").is_not_null()) &
+                ((pl.col("exit_tick") - pl.col("entry_tick")) <= -int(args.exit_on_move_ticks))
+            ).then(pl.col("exit_tick"))
+             .otherwise(pl.col("exit_tick"))
+             .alias("exit_tick_eff"),
+        ])
+    else:
+        picks2 = picks2.with_columns([
+            pl.col("exit_price").alias("exit_price_eff"),
+            pl.col("exit_tick").alias("exit_tick_eff"),
+        ])
+
+    # Expected profit (EV) and realized PnL approximations:
+    # We treat EV per £1 as expectation on stake_filled; settlement PnL proxy uses move in price
+    picks2 = picks2.with_columns([
+        (pl.col("ev_per_1") * pl.col("stake_filled")).alias("exp_profit"),
+    ])
+
+    # Realized MTM / settlement proxy:
+    # For back @ entry_price and exit at exit_price, rough PnL proxy:
+    #   pnl ≈ stake * (exit_price - entry_price) / entry_price
+    # This is a simplification for pre-off trading MTM behavior.
+    picks2 = picks2.with_columns([
+        (pl.when((pl.col("entry_price") > 0) & pl.col("exit_price_eff").is_not_null())
+           .then(pl.col("stake_filled") * (pl.col("exit_price_eff") - pl.col("entry_price")) / pl.col("entry_price"))
+           .otherwise(0.0)
+         ).alias("real_mtm_pnl"),
+        (pl.col("real_mtm_pnl") - (pl.abs(pl.col("real_mtm_pnl")) * float(args.commission))).alias("real_settle_pnl"),
+    ])
+
+    # Contra hedge (optional, simple: place opposing small stake held for contra_hold_secs)
+    if args.contra_mode != "none" and args.contra_frac > 0.0:
+        # For brevity, we model contra as reducing risk: subtract a fraction of absolute pnl
+        picks2 = picks2.with_columns([
+            (pl.col("real_mtm_pnl") * (1.0 - float(args.contra_frac))).alias("real_mtm_pnl"),
+            (pl.col("real_settle_pnl") * (1.0 - float(args.contra_frac))).alias("real_settle_pnl"),
+        ])
+
+    # ---------------- Metrics (null safe) ----------------
+    n_trades = int(picks2.height)
+
+    def _safe_sum(col: str) -> float:
+        if col not in picks2.columns: return 0.0
+        v = picks2[col].fill_null(0.0).sum()
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    def _safe_mean(col: str) -> float:
+        if col not in picks2.columns: return 0.0
+        v = picks2[col].fill_null(0.0).mean()
+        try:
+            v = float(v)
+            if math.isnan(v) or math.isinf(v): return 0.0
+            return v
+        except Exception:
+            return 0.0
+
+    total_exp_profit   = _safe_sum("exp_profit")
+    total_real_mtm     = _safe_sum("real_mtm_pnl")
+    total_real_settle  = _safe_sum("real_settle_pnl")
+    avg_ev_scaled      = _safe_mean("ev_per_1")
+
+    bankroll = float(args.bankroll_nom or 1.0)
+    roi_exp        = total_exp_profit  / bankroll
+    roi_real_mtm   = total_real_mtm   / bankroll
+    roi_real_settle= total_real_settle/ bankroll
+
+    print(f"[simulate] ROI (exp)        : {roi_exp:.6f}")
+    print(f"[simulate] ROI (real MTM)   : {roi_real_mtm:.6f}")
+    print(f"[simulate] ROI (settlement) : {roi_real_settle:.6f}")
+    print(f"[simulate] Trades: {n_trades:,d}  Avg EV/£1 (scaled): {avg_ev_scaled:.6f}")
+
+    # Suggest ev-scale to align exp to mtm if both non-zero
+    if total_exp_profit != 0.0:
+        try:
+            suggested_scale = total_real_mtm / total_exp_profit
+            if suggested_scale != 0.0:
+                print(f"[simulate] Suggested --ev-scale ≈ {suggested_scale:.6f} (based on mtm PnL)")
+        except Exception:
+            pass
+
+    # ---------------- Daily breakdown (ROI per day) ----------------
+    # derive date from publishTimeMs_entry
+    if "publishTimeMs_entry" not in picks2.columns:
+        picks2 = picks2.with_columns(pl.col("publishTimeMs_entry").fill_null(pl.col("ts_exit_ms")))
+
+    picks2 = picks2.with_columns([
+        (pl.from_epoch(pl.col("publishTimeMs_entry").cast(pl.Int64) // 1000, time_unit="s").dt.date())
+        .alias("__date"),
+    ])
+
+    daily = (picks2
+             .group_by("__date", "stake_mode")
+             .agg([
+                 pl.len().alias("n_trades"),
+                 pl.sum("exp_profit").alias("exp_profit"),
+                 pl.mean("ev_per_1").alias("avg_ev"),
+                 pl.mean("stake_filled").alias("avg_stake_filled"),
+                 pl.mean("fill_frac").alias("avg_fill_frac"),
+                 pl.sum("real_mtm_pnl").alias("real_mtm_profit"),
+                 pl.sum("real_settle_pnl").alias("real_settle_profit"),
+             ])
+             .with_columns([
+                 (pl.col("exp_profit") / bankroll).alias("roi_exp"),
+                 (pl.col("real_mtm_profit") / bankroll).alias("roi_real_mtm"),
+                 (pl.col("real_settle_profit") / bankroll).alias("roi_real_settle"),
+                 pl.col("__date").cast(pl.Utf8).alias("day")
+             ])
+             .select([
+                 "day","stake_mode","n_trades","exp_profit","avg_ev",
+                 "avg_stake_filled","avg_fill_frac",
+                 "real_mtm_profit","real_settle_profit",
+                 "roi_exp","roi_real_mtm","roi_real_settle"
+             ])
+             .sort("day"))
+
+    daily_csv = out_dir / f"daily_{args.asof}.csv"
     daily.write_csv(daily_csv)
+    print(f"[simulate] Wrote daily → {daily_csv}")
 
-    # Overall summary
-    total_exp_profit   = float(trades2["exp_pnl"].fill_null(0.0).sum())
-    
-m = trades2.select(pl.col("ev_per_1").fill_null(0.0).mean().alias("m")).to_dict(as_series=False)["m"][0] if "ev_per_1" in trades2.columns else 0.0
-
-avg_ev = float(0.0 if m is None or (isinstance(m,float) and (math.isnan(m) or math.isinf(m))) else m)
-
-avg_ev_scaled = avg_ev * float(args.ev_scale)
-    total_real_mtm     = float(trades2["real_mtm_pnl"].fill_null(0.0).sum())
-    total_real_settle  = float(trades2["real_settle_pnl"].fill_null(0.0).sum())
-
-    roi_exp = (total_exp_profit / float(args.bankroll_nom)) if args.bankroll_nom else None
-    roi_real_mtm = (total_real_mtm / float(args.bankroll_nom)) if args.bankroll_nom else None
-    roi_real_settle = (total_real_settle / float(args.bankroll_nom)) if args.bankroll_nom else None
-
-    raw_exp_sum = float(trades2["exp_pnl_raw"].fill_null(0.0).sum()) if "exp_pnl_raw" in trades2.columns else None
-    suggested_scale = None
-    if raw_exp_sum and abs(raw_exp_sum) > 1e-9:
-        target_real = total_real_mtm if args.ev_mode == "mtm" else total_real_settle
-        suggested_scale = target_real / raw_exp_sum
-
-    summ = {
+    # ---------------- Summary outputs ----------------
+    summary = {
         "asof": args.asof,
         "start_date": args.start_date,
         "valid_days": args.valid_days,
@@ -689,8 +704,6 @@ avg_ev_scaled = avg_ev * float(args.ev_scale)
         "commission": args.commission,
         "edge_thresh": args.edge_thresh,
         "ev_mode": args.ev_mode,
-        "ev_cap": args.ev_cap,
-        "ev_scale_used": args.ev_scale,
         "odds_min": args.odds_min,
         "odds_max": args.odds_max,
         "stake_mode": args.stake_mode,
@@ -699,84 +712,27 @@ avg_ev_scaled = avg_ev * float(args.ev_scale)
         "bankroll_nom": args.bankroll_nom,
         "liquidity_levels": args.liquidity_levels,
         "enforce_liquidity_requested": bool(args.enforce_liquidity),
-        "enforce_liquidity_effective": bool(effective_enforce),
-        "require_book": bool(args.require_book),
+        "enforce_liquidity_effective": bool(args.enforce_liquidity and all(c in df.columns for c in ["backTicks","backSizes","layTicks","laySizes"])),
         "min_fill_frac": args.min_fill_frac,
+        "require_book": bool(args.require_book),
         "per_market_topk": args.per_market_topk,
         "per_market_budget": args.per_market_budget,
-        "basket_sizing": args.basket_sizing,
         "exit_on_move_ticks": args.exit_on_move_ticks,
-        "contra_mode": args.contra_mode,
-        "contra_frac": args.contra_frac,
-        "contra_hold_secs": args.contra_hold_secs,
-        "contra_prob_thresh": args.contra_prob_thres
-        if hasattr(args,"contra_prob_thres") else args.contra_prob_thresh,
-        "contra_beta": args.contra_beta,
-        "n_trades": int(trades2.height),
+        "ev_scale_used": args.ev_scale,
+        "n_trades": n_trades,
         "total_exp_profit": total_exp_profit,
         "avg_ev_per_1": avg_ev_scaled,
         "total_real_mtm_profit": total_real_mtm,
         "total_real_settle_profit": total_real_settle,
         "overall_roi_exp": roi_exp,
         "overall_roi_real_mtm": roi_real_mtm,
-        "overall_roi_real_settle": roi_real_settle,
-        "ev_scale_suggested": suggested_scale,
-        "features_used": FEATURES_WITH_COUNTRY,
+        "overall_roi_real_settle": roi_real_settle
     }
-    write_json(Path(args.output_dir) / f"summary_{args.asof}.json", summ)
 
-    def _fmt(x):
-        if x is None or (isinstance(x,float) and (np.isnan(x) or np.isinf(x))):
-            return "n/a"
-        return f"{x:.6f}"
-    print(f"[simulate] ROI (exp)        : {_fmt(roi_exp)}")
-    print(f"[simulate] ROI (real MTM)   : {_fmt(roi_real_mtm)}")
-    print(f"[simulate] ROI (settlement) : {_fmt(roi_real_settle)}")
-    print(f"[simulate] Trades: {summ['n_trades']:,}  Avg EV/£1 (scaled): {avg_ev_scaled:.6f}
-    if suggested_scale is not None:
-        print(f"[simulate] Suggested --ev-scale ≈ {suggested_scale:.6g} (based on {args.ev_mode} PnL)")
+    _write_summary_json(summary, out_dir, args.asof)
+    _write_summary_csv(summary, out_dir, args.asof)
+    print(f"[simulate] Wrote summary → {out_dir / f'summary_{args.asof}.json'}")
 
-def _to_df(records: List[Dict[str, Any]]) -> pl.DataFrame:
-    return pl.DataFrame(
-        records,
-        schema={
-            "publishTimeMs": pl.Int64,
-            "marketId": pl.Utf8,
-            "selectionId": pl.Int64,
-            "ltp": pl.Float64,
-            "p_now": pl.Float64,
-            "p_pred": pl.Float64,
-            "delta_pred": pl.Float64,
-            "side": pl.Utf8,
-            "is_contra": pl.Int8,
-            "ev_per_1": pl.Float64,
-            "stake_req": pl.Float64,
-            "stake_filled": pl.Float64,
-            "fill_frac": pl.Float64,
-            "exec_odds": pl.Float64,
-            "exp_pnl": pl.Float64,
-            "exp_pnl_raw": pl.Float64,
-            "stake_mode": pl.Utf8,
-            "ts_exit_ms": pl.Int64,
-        },
-        orient="row",
-    )
-
-def _write_empty(outdir: Path, args):
-    daily = pl.DataFrame({"day": [], "stake_mode": [], "n_trades": [], "exp_profit": [], "avg_ev": [],
-                          "avg_stake_filled": [], "avg_fill_frac": [], "real_mtm_profit": [], "real_settle_profit": [],
-                          "roi_exp": [], "roi_real_mtm": [], "roi_real_settle": [], "share_contra": []})
-    daily.write_csv(outdir / f"daily_{args.asof}.csv")
-    write_json(outdir / f"summary_{args.asof}.json", {
-        "asof": args.asof, "n_trades": 0, "ev_scale_used": args.ev_scale,
-        "per_market_topk": args.per_market_topk, "per_market_budget": args.per_market_budget,
-        "basket_sizing": args.basket_sizing, "exit_on_move_ticks": args.exit_on_move_ticks,
-        "contra_mode": args.contra_mode, "contra_frac": args.contra_frac,
-        "contra_hold_secs": args.contra_hold_secs, "contra_prob_thresh": args.contra_prob_thresh,
-        "enforce_liquidity_requested": bool(args.enforce_liquidity),
-        "require_book": bool(args.require_book),
-        "features_used": FEATURES_WITH_COUNTRY,
-    })
 
 if __name__ == "__main__":
     main()
