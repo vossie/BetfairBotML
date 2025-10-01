@@ -661,7 +661,12 @@ def main():
 
     # Overall summary
     total_exp_profit   = float(trades2["exp_pnl"].fill_null(0.0).sum())
-    avg_ev             = float(trades2["ev_per_1"].mean())
+    
+m = trades2.select(pl.col("ev_per_1").fill_null(0.0).mean().alias("m")).to_dict(as_series=False)["m"][0] if "ev_per_1" in trades2.columns else 0.0
+
+avg_ev = float(0.0 if m is None or (isinstance(m,float) and (math.isnan(m) or math.isinf(m))) else m)
+
+avg_ev_scaled = avg_ev * float(args.ev_scale)
     total_real_mtm     = float(trades2["real_mtm_pnl"].fill_null(0.0).sum())
     total_real_settle  = float(trades2["real_settle_pnl"].fill_null(0.0).sum())
 
@@ -709,7 +714,7 @@ def main():
         "contra_beta": args.contra_beta,
         "n_trades": int(trades2.height),
         "total_exp_profit": total_exp_profit,
-        "avg_ev_per_1": avg_ev,
+        "avg_ev_per_1": avg_ev_scaled,
         "total_real_mtm_profit": total_real_mtm,
         "total_real_settle_profit": total_real_settle,
         "overall_roi_exp": roi_exp,
@@ -727,7 +732,7 @@ def main():
     print(f"[simulate] ROI (exp)        : {_fmt(roi_exp)}")
     print(f"[simulate] ROI (real MTM)   : {_fmt(roi_real_mtm)}")
     print(f"[simulate] ROI (settlement) : {_fmt(roi_real_settle)}")
-    print(f"[simulate] Trades: {summ['n_trades']:,}  Avg EV/£1 (scaled): {avg_ev:.6f}")
+    print(f"[simulate] Trades: {summ['n_trades']:,}  Avg EV/£1 (scaled): {avg_ev_scaled:.6f}
     if suggested_scale is not None:
         print(f"[simulate] Suggested --ev-scale ≈ {suggested_scale:.6g} (based on {args.ev_mode} PnL)")
 
