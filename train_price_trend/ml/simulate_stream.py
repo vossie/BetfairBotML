@@ -18,8 +18,6 @@ Features
 
 from __future__ import annotations
 import argparse
-import os
-import sys
 import json
 import math
 from pathlib import Path
@@ -33,6 +31,16 @@ try:
     import xgboost as xgb
 except Exception:
     xgb = None
+
+
+# ---------------------------- helpers ----------------------------
+
+def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
+    """Compatibility wrapper for Polars streaming collect."""
+    try:
+        return lf.collect(engine="streaming")  # Polars >= 1.25
+    except TypeError:
+        return lf.collect(streaming=True)      # Older Polars
 
 
 # ---------------------------- CLI ----------------------------
@@ -118,7 +126,6 @@ def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.D
         return pl.DataFrame({})
     lf = pl.concat(parts, how="vertical_relaxed")
 
-    # Try selecting extended columns; fall back to core if depth is missing
     wanted = [
         "sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1",
         "backTicks","backSizes","layTicks","laySizes","ltpTick"
@@ -127,8 +134,7 @@ def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.D
     if not present:
         return pl.DataFrame({})
 
-    df = lf.select([pl.col(c) for c in present]).collect(engine=True)
-    # Ensure expected columns exist; add nulls for missing depth cols
+    df = collect_streaming(lf.select([pl.col(c) for c in present]))
     for c in ["backTicks","backSizes","layTicks","laySizes","ltpTick"]:
         if c not in df.columns:
             df = df.with_columns(pl.lit(None).alias(c))
@@ -149,9 +155,8 @@ def read_market_defs_for_dates(curated: str, sport: str, dates: list[str]) -> pl
     if "countryCode"  in names: sel.append("countryCode")
     df = (pl.concat(parts, how="vertical_relaxed")
           .select([pl.col(c) for c in sel])
-          .unique()
-          .collect(engine=True))
-    # fill missing
+          .unique())
+    df = collect_streaming(df)
     if "marketStartMs" not in df.columns: df = df.with_columns(pl.lit(None).alias("marketStartMs"))
     if "countryCode" not in df.columns:   df = df.with_columns(pl.lit("UNK").alias("countryCode"))
     return df
@@ -171,9 +176,8 @@ def read_results_for_dates(curated: str, sport: str, dates: list[str]) -> pl.Dat
         if c in names: sel.append(c)
     df = (pl.concat(parts, how="vertical_relaxed")
           .select([pl.col(c) for c in sel])
-          .unique()
-          .collect(streaming=True))
-    return df
+          .unique())
+    return collect_streaming(df)
 
 
 # ---------------------------- Feature building ----------------------------
@@ -182,48 +186,46 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, hori
     if df.is_empty():
         return df
 
-    # Join defs to get marketStartMs and countryCode
-    have_country = "countryCode" in defs.columns
     dfj = (df.join(defs, on=["sport", "marketId"], how="left")
              .with_columns([
-                 ( (pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000.0 ).alias("mins_to_off"),
+                 ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000.0).alias("mins_to_off"),
                  pl.col("ltp").cast(pl.Float64).alias("ltp_f"),
                  pl.col("tradedVolume").cast(pl.Float64).alias("vol_f"),
-             ]))
-    # pre-off filter
-    dfj = dfj.filter(pl.col("mins_to_off").is_not_null())
-    dfj = dfj.filter(pl.col("mins_to_off") >= 0.0).filter(pl.col("mins_to_off") <= float(preoff_max_m))
+             ])
+             .filter(pl.col("mins_to_off").is_not_null())
+             .filter(pl.col("mins_to_off") >= 0.0)
+             .filter(pl.col("mins_to_off") <= float(preoff_max_m))
+             .sort(["marketId", "selectionId", "publishTimeMs"])
+          )
 
-    # Basic rolling/lag feats per (marketId, selectionId)
-    dfj = dfj.sort(["marketId", "selectionId", "publishTimeMs"])
+    grp = ["marketId", "selectionId"]
 
-    def add_group(g: pl.DataFrame) -> pl.DataFrame:
-        g = g.with_columns([
-            pl.col("ltp_f").diff().alias("ltp_diff_5s"),
-            pl.col("vol_f").diff().alias("vol_diff_5s"),
-            pl.col("ltp_f").shift(6).alias("ltp_lag30s"),
-            pl.col("ltp_f").shift(12).alias("ltp_lag60s"),
-            pl.col("ltp_f").shift(24).alias("ltp_lag120s"),
-            pl.col("vol_f").shift(6).alias("tradedVolume_lag30s"),
-            pl.col("vol_f").shift(12).alias("tradedVolume_lag60s"),
-            pl.col("vol_f").shift(24).alias("tradedVolume_lag120s"),
-        ])
-        for lag in ("30s","60s","120s"):
-            g = g.with_columns([
-                (pl.col("ltp_f") - pl.col(f"ltp_lag{lag}")).alias(f"ltp_mom_{lag}"),
-                ((pl.col("ltp_f") / pl.col(f"ltp_lag{lag}")) - 1.0).alias(f"ltp_ret_{lag}"),
-            ])
-        return g
+    # Diffs/lag via window expressions (faster, avoids map_groups)
+    dfj = dfj.with_columns([
+        pl.col("ltp_f").diff().over(grp).alias("ltp_diff_5s"),
+        pl.col("vol_f").diff().over(grp).alias("vol_diff_5s"),
+        pl.col("ltp_f").shift(6).over(grp).alias("ltp_lag30s"),
+        pl.col("ltp_f").shift(12).over(grp).alias("ltp_lag60s"),
+        pl.col("ltp_f").shift(24).over(grp).alias("ltp_lag120s"),
+        pl.col("vol_f").shift(6).over(grp).alias("tradedVolume_lag30s"),
+        pl.col("vol_f").shift(12).over(grp).alias("tradedVolume_lag60s"),
+        pl.col("vol_f").shift(24).over(grp).alias("tradedVolume_lag120s"),
+    ])
 
-    dfj = dfj.group_by(["marketId", "selectionId"], maintain_order=True).map_groups(add_group)
+    dfj = dfj.with_columns([
+        (pl.col("ltp_f") - pl.col("ltp_lag30s")).alias("ltp_mom_30s"),
+        (pl.col("ltp_f") - pl.col("ltp_lag60s")).alias("ltp_mom_60s"),
+        (pl.col("ltp_f") - pl.col("ltp_lag120s")).alias("ltp_mom_120s"),
+        ((pl.col("ltp_f") / pl.col("ltp_lag30s")) - 1.0).alias("ltp_ret_30s"),
+        ((pl.col("ltp_f") / pl.col("ltp_lag60s")) - 1.0).alias("ltp_ret_60s"),
+        ((pl.col("ltp_f") / pl.col("ltp_lag120s")) - 1.0).alias("ltp_ret_120s"),
+    ])
 
-    # Future exit timestamp for horizon exit
     dfj = dfj.with_columns([
         (pl.col("publishTimeMs") + horizon_s * 1000).alias("ts_exit_ms"),
     ])
 
-    # In case countryCode missing, fill with "UNK"
-    if not have_country:
+    if "countryCode" not in dfj.columns:
         dfj = dfj.with_columns(pl.lit("UNK").alias("countryCode"))
 
     return dfj
@@ -256,7 +258,7 @@ def predict_dp(df: pl.DataFrame, models_dir: str, device: str) -> pl.Series:
 
     X = df.select(feat_cols).to_pandas()
     dmat = xgb.DMatrix(X)
-    dp = booster.predict(dmat)  # shape (n,)
+    dp = booster.predict(dmat)
     if len(dp) != df.height:
         dp = dp[:df.height]
     return pl.Series(dp, dtype=pl.Float64)
@@ -282,13 +284,6 @@ def _level1_available(backTicks, backSizes, layTicks, laySizes, side: str) -> Tu
         return None, 0.0
 
 
-def compute_fill_fraction(size_available: float, desired: float, min_fill_frac: float) -> float:
-    if desired <= 0.0:
-        return 0.0
-    frac = max(0.0, min(1.0, size_available / desired))
-    return frac if frac >= min_fill_frac else 0.0
-
-
 # ---------------------------- Portfolio sizing ----------------------------
 
 def portfolio_size_per_market(df_cands: pl.DataFrame, topk: int, budget: float) -> pl.DataFrame:
@@ -301,7 +296,6 @@ def portfolio_size_per_market(df_cands: pl.DataFrame, topk: int, budget: float) 
               .drop("__rank"))
     sized = (ranked
              .with_columns([
-                 # equal split of budget among chosen picks per market
                  (pl.lit(budget) / pl.len()).over("marketId").alias("stake_target")
              ]))
     return sized
@@ -350,7 +344,7 @@ def main():
         return
 
     defs = read_market_defs_for_dates(args.curated, args.sport, dates)
-    results = read_results_for_dates(args.curated, args.sport, dates)  # not used directly yet
+    # results = read_results_for_dates(args.curated, args.sport, dates)  # not used directly yet
 
     # Build features and exit timestamps
     df = build_features(df, defs, args.preoff_max, args.horizon_secs)
