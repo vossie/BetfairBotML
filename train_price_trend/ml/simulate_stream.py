@@ -3,17 +3,18 @@
 """
 Simulation of pre-off trading using trend model predictions.
 
-Features
+Adds --basket-sizing {equal_stake,prop_ev,all_to_top} to control per-market
+budget allocation across the selected topK runners.
+
+Other features preserved:
 - Curated parquet ingestion (orderbook_snapshots_5s, market_definitions, results)
-- Optional model prediction (XGBoost) if model json exists; proxy signal otherwise
-- Odds band filter; EV scaling and capping; min expected value threshold
-- Liquidity enforcement from order book depth (if present). Falls back cleanly
-- Per-market portfolio: topK picks, per-market budget, equal-EV sizing
-- Exit rules: horizon or exit on favorable move in ticks
-- Contra-hedge (optional): partial opposite bet with hold/prob gate (simplified risk cut)
-- Outputs:
-  - stream/daily_<asof>.csv (day-level breakdown incl. ROI/day)
-  - stream/summary_<asof>.json and .csv (overall metrics)
+- Optional model prediction (XGBoost) if model json exists; proxy otherwise
+- Odds band filter; EV scaling/cap; min expected value threshold
+- Liquidity enforcement via order book depth (if present), with graceful fallback
+- Per-market portfolio selection: topK + per-market budget
+- Exit rules: horizon or exit on favourable move in ticks
+- Optional contra-hedge knobs
+- Outputs daily_<asof>.csv with ROI/day, and summary_<asof>.json/.csv
 """
 
 from __future__ import annotations
@@ -84,6 +85,8 @@ def parse_args():
     # Portfolio
     p.add_argument("--per-market-topk", type=int, default=1)
     p.add_argument("--per-market-budget", type=float, default=10.0)
+    p.add_argument("--basket-sizing", choices=["equal_stake","prop_ev","all_to_top"], default="equal_stake",
+                   help="How to split per-market budget across topK picks.")
     p.add_argument("--exit-on-move-ticks", type=int, default=0, help="0=disabled; exit if move ≥ this many ticks in our favour")
     p.add_argument("--batch-size", type=int, default=75_000)
 
@@ -101,6 +104,8 @@ def parse_args():
 
 # ---------------------------- IO helpers ----------------------------
 
+from typing import List
+
 def curated_paths(root: str, sport: str, date: str) -> Tuple[Path,Path,Path]:
     droot = Path(root)
     snaps = droot / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={date}"
@@ -109,14 +114,14 @@ def curated_paths(root: str, sport: str, date: str) -> Tuple[Path,Path,Path]:
     return snaps, defs, res
 
 
-def scan_dates(start_date: str, asof: str) -> list[str]:
+def scan_dates(start_date: str, asof: str) -> List[str]:
     sd = datetime.strptime(start_date, "%Y-%m-%d").date()
     ad = datetime.strptime(asof, "%Y-%m-%d").date()
     days = (ad - sd).days + 1
     return [(sd + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
 
-def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.DataFrame:
+def read_orderbook_for_dates(curated: str, sport: str, dates: List[str]) -> pl.DataFrame:
     parts = []
     for d in dates:
         snaps_dir, _, _ = curated_paths(curated, sport, d)
@@ -141,7 +146,7 @@ def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.D
     return df
 
 
-def read_market_defs_for_dates(curated: str, sport: str, dates: list[str]) -> pl.DataFrame:
+def read_market_defs_for_dates(curated: str, sport: str, dates: List[str]) -> pl.DataFrame:
     parts = []
     for d in dates:
         _, defs_dir, _ = curated_paths(curated, sport, d)
@@ -162,7 +167,7 @@ def read_market_defs_for_dates(curated: str, sport: str, dates: list[str]) -> pl
     return df
 
 
-def read_results_for_dates(curated: str, sport: str, dates: list[str]) -> pl.DataFrame:
+def read_results_for_dates(curated: str, sport: str, dates: List[str]) -> pl.DataFrame:
     parts = []
     for d in dates:
         _, _, res_dir = curated_paths(curated, sport, d)
@@ -200,7 +205,7 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, hori
 
     grp = ["marketId", "selectionId"]
 
-    # Diffs/lag via window expressions (faster, avoids map_groups)
+    # Window-based lags/diffs (fast, no map_groups)
     dfj = dfj.with_columns([
         pl.col("ltp_f").diff().over(grp).alias("ltp_diff_5s"),
         pl.col("vol_f").diff().over(grp).alias("vol_diff_5s"),
@@ -221,9 +226,7 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, hori
         ((pl.col("ltp_f") / pl.col("ltp_lag120s")) - 1.0).alias("ltp_ret_120s"),
     ])
 
-    dfj = dfj.with_columns([
-        (pl.col("publishTimeMs") + horizon_s * 1000).alias("ts_exit_ms"),
-    ])
+    dfj = dfj.with_columns((pl.col("publishTimeMs") + horizon_s * 1000).alias("ts_exit_ms"))
 
     if "countryCode" not in dfj.columns:
         dfj = dfj.with_columns(pl.lit("UNK").alias("countryCode"))
@@ -271,6 +274,8 @@ def dp_to_ev_per_pound(dp: pl.Series, ev_scale: float, ev_cap: float) -> pl.Seri
 
 # ---------------------------- Liquidity helpers ----------------------------
 
+from typing import Optional
+
 def _level1_available(backTicks, backSizes, layTicks, laySizes, side: str) -> Tuple[Optional[int], float]:
     try:
         if side == "back":
@@ -286,7 +291,7 @@ def _level1_available(backTicks, backSizes, layTicks, laySizes, side: str) -> Tu
 
 # ---------------------------- Portfolio sizing ----------------------------
 
-def portfolio_size_per_market(df_cands: pl.DataFrame, topk: int, budget: float) -> pl.DataFrame:
+def portfolio_select(df_cands: pl.DataFrame, topk: int) -> pl.DataFrame:
     if df_cands.is_empty():
         return df_cands
     ranked = (df_cands
@@ -294,11 +299,33 @@ def portfolio_size_per_market(df_cands: pl.DataFrame, topk: int, budget: float) 
               .with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rank"))
               .filter(pl.col("__rank") < topk)
               .drop("__rank"))
-    sized = (ranked
-             .with_columns([
-                 (pl.lit(budget) / pl.len()).over("marketId").alias("stake_target")
-             ]))
-    return sized
+    return ranked
+
+
+def portfolio_size(df_sel: pl.DataFrame, basket_sizing: str, budget: float) -> pl.DataFrame:
+    if df_sel.is_empty():
+        return df_sel
+    if basket_sizing == "equal_stake":
+        # equal split of per-market budget
+        return df_sel.with_columns((pl.lit(budget) / pl.len()).over("marketId").alias("stake_target"))
+    elif basket_sizing == "prop_ev":
+        # split budget proportional to EV among selected picks
+        return df_sel.with_columns([
+            (pl.col("ev_per_1") / pl.sum("ev_per_1").over("marketId")).alias("__w")
+        ]).with_columns([
+            (pl.lit(budget) * pl.col("__w").fill_null(0.0)).alias("stake_target")
+        ]).drop("__w")
+    elif basket_sizing == "all_to_top":
+        # all budget to the highest EV (rank 0)
+        return (df_sel
+                .with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rank"))
+                .with_columns(pl.when(pl.col("__rank") == 0)
+                               .then(pl.lit(budget))
+                               .otherwise(0.0).alias("stake_target"))
+                .drop("__rank"))
+    else:
+        # fallback to equal stake
+        return df_sel.with_columns((pl.lit(budget) / pl.len()).over("marketId").alias("stake_target"))
 
 
 # ---------------------------- Summary writers ----------------------------
@@ -344,7 +371,6 @@ def main():
         return
 
     defs = read_market_defs_for_dates(args.curated, args.sport, dates)
-    # results = read_results_for_dates(args.curated, args.sport, dates)  # not used directly yet
 
     # Build features and exit timestamps
     df = build_features(df, defs, args.preoff_max, args.horizon_secs)
@@ -383,6 +409,7 @@ def main():
             "min_fill_frac": float(args.min_fill_frac or 0.0),
             "per_market_topk": int(getattr(args, "per_market_topk", 1) or 1),
             "per_market_budget": float(getattr(args, "per_market_budget", 10.0) or 10.0),
+            "basket_sizing": args.basket_sizing,
             "exit_on_move_ticks": int(getattr(args, "exit_on_move_ticks", 0) or 0),
             "ev_scale_used": float(args.ev_scale),
             "n_trades": 0,
@@ -398,19 +425,20 @@ def main():
         _write_summary_csv(summary, out_dir, args.asof)
         return
 
-    # Portfolio selection and basic sizing
+    # Portfolio selection and sizing
     picks = cands.select([
         "sport","marketId","selectionId","publishTimeMs","entry_price","entry_tick",
         "ltp_f","mins_to_off","ev_per_1"
     ])
-    picks = portfolio_size_per_market(picks, args.per_market_topk, args.per_market_budget)
+    picks = portfolio_select(picks, args.per_market_topk)
+    picks = portfolio_size(picks, args.basket_sizing, args.per_market_budget)
 
-    # Staking
+    # Staking mode (kelly modifies stake_target)
     if args.stake_mode == "kelly":
         k_frac = (pl.col("ev_per_1").clip(min=-args.ev_cap, max=args.ev_cap)
                   .clip(min=args.kelly_floor, max=args.kelly_cap))
         picks = picks.with_columns((k_frac * args.bankroll_nom).alias("stake_target"))
-    # For flat, stake_target already set by portfolio sizing
+
     if "stake_target" not in picks.columns:
         picks = picks.with_columns(pl.lit(args.per_market_budget).alias("stake_target"))
 
@@ -470,6 +498,7 @@ def main():
             "min_fill_frac": float(args.min_fill_frac or 0.0),
             "per_market_topk": int(args.per_market_topk or 1),
             "per_market_budget": float(args.per_market_budget or 10.0),
+            "basket_sizing": args.basket_sizing,
             "exit_on_move_ticks": int(args.exit_on_move_ticks or 0),
             "ev_scale_used": float(args.ev_scale),
             "n_trades": 0,
@@ -654,6 +683,7 @@ def main():
         "require_book": bool(args.require_book),
         "per_market_topk": args.per_market_topk,
         "per_market_budget": args.per_market_budget,
+        "basket_sizing": args.basket_sizing,
         "exit_on_move_ticks": args.exit_on_move_ticks,
         "ev_scale_used": args.ev_scale,
         "n_trades": n_trades,
