@@ -127,7 +127,7 @@ def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.D
     if not present:
         return pl.DataFrame({})
 
-    df = lf.select([pl.col(c) for c in present]).collect(streaming=True)
+    df = lf.select([pl.col(c) for c in present]).collect(engine=True)
     # Ensure expected columns exist; add nulls for missing depth cols
     for c in ["backTicks","backSizes","layTicks","laySizes","ltpTick"]:
         if c not in df.columns:
@@ -150,7 +150,7 @@ def read_market_defs_for_dates(curated: str, sport: str, dates: list[str]) -> pl
     df = (pl.concat(parts, how="vertical_relaxed")
           .select([pl.col(c) for c in sel])
           .unique()
-          .collect(streaming=True))
+          .collect(engine=True))
     # fill missing
     if "marketStartMs" not in df.columns: df = df.with_columns(pl.lit(None).alias("marketStartMs"))
     if "countryCode" not in df.columns:   df = df.with_columns(pl.lit("UNK").alias("countryCode"))
