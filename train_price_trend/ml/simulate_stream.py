@@ -3,25 +3,17 @@
 """
 Simulation of pre-off trading using trend model predictions.
 
-Key features
-- Uses curated parquet (orderbook_snapshots_5s, market_definitions, results)
-- Optional model prediction (XGBoost) if model json exists
+Features
+- Curated parquet ingestion (orderbook_snapshots_5s, market_definitions, results)
+- Optional model prediction (XGBoost) if model json exists; proxy signal otherwise
 - Odds band filter; EV scaling and capping; min expected value threshold
 - Liquidity enforcement from order book depth (if present). Falls back cleanly
 - Per-market portfolio: topK picks, per-market budget, equal-EV sizing
 - Exit rules: horizon or exit on favorable move in ticks
-- Contra-hedge (optional): place partial opposite side bet with hold time/prob gate
-- Writes:
-  - stream/daily_<asof>.csv (day-level breakdown incl. ROI per day)
+- Contra-hedge (optional): partial opposite bet with hold/prob gate (simplified risk cut)
+- Outputs:
+  - stream/daily_<asof>.csv (day-level breakdown incl. ROI/day)
   - stream/summary_<asof>.json and .csv (overall metrics)
-- Robust to missing columns and empty result sets
-
-Notes
-- This is a simulation / backtest. It *does not* place real bets.
-- If depth columns are missing and enforce_liquidity==1 & require_book==1, drops trades.
-- If model is present at output/models/xgb_trend_reg.json, predicts dp and converts to EV.
-- If model is absent, uses a simple proxy dp from short-term momentum features.
-
 """
 
 from __future__ import annotations
@@ -32,6 +24,7 @@ import json
 import math
 from pathlib import Path
 from typing import Optional, Tuple
+from datetime import datetime, timedelta
 
 import polars as pl
 
@@ -109,11 +102,10 @@ def curated_paths(root: str, sport: str, date: str) -> Tuple[Path,Path,Path]:
 
 
 def scan_dates(start_date: str, asof: str) -> list[str]:
-    # inclusive start, inclusive asof (validation spans until asof)
-    sd = pl.datetime.strptime(start_date, "%Y-%m-%d").date()
-    ad = pl.datetime.strptime(asof, "%Y-%m-%d").date()
-    days = int((ad - sd).days) + 1
-    return [(sd + pl.duration(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    sd = datetime.strptime(start_date, "%Y-%m-%d").date()
+    ad = datetime.strptime(asof, "%Y-%m-%d").date()
+    days = (ad - sd).days + 1
+    return [(sd + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
 
 def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.DataFrame:
@@ -125,21 +117,21 @@ def read_orderbook_for_dates(curated: str, sport: str, dates: list[str]) -> pl.D
     if not parts:
         return pl.DataFrame({})
     lf = pl.concat(parts, how="vertical_relaxed")
-    df = lf.select([
-        pl.col("sport"),
-        pl.col("marketId"),
-        pl.col("selectionId"),
-        pl.col("publishTimeMs"),
-        pl.col("ltp"),
-        pl.col("tradedVolume"),
-        pl.col("spreadTicks"),
-        pl.col("imbalanceBest1"),
-        pl.col("backTicks").alias("backTicks"),
-        pl.col("backSizes").alias("backSizes"),
-        pl.col("layTicks").alias("layTicks"),
-        pl.col("laySizes").alias("laySizes"),
-        pl.col("ltpTick").alias("ltpTick"),
-    ]).collect(streaming=True)
+
+    # Try selecting extended columns; fall back to core if depth is missing
+    wanted = [
+        "sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1",
+        "backTicks","backSizes","layTicks","laySizes","ltpTick"
+    ]
+    present = [c for c in wanted if c in lf.collect_schema().names()]
+    if not present:
+        return pl.DataFrame({})
+
+    df = lf.select([pl.col(c) for c in present]).collect(streaming=True)
+    # Ensure expected columns exist; add nulls for missing depth cols
+    for c in ["backTicks","backSizes","layTicks","laySizes","ltpTick"]:
+        if c not in df.columns:
+            df = df.with_columns(pl.lit(None).alias(c))
     return df
 
 
@@ -151,13 +143,17 @@ def read_market_defs_for_dates(curated: str, sport: str, dates: list[str]) -> pl
             parts.append(pl.scan_parquet(str(defs_dir / "*.parquet")))
     if not parts:
         return pl.DataFrame({})
+    names = (pl.concat(parts, how="vertical_relaxed").collect_schema().names())
+    sel = ["sport","marketId"]
+    if "marketStartMs" in names: sel.append("marketStartMs")
+    if "countryCode"  in names: sel.append("countryCode")
     df = (pl.concat(parts, how="vertical_relaxed")
-          .select([
-              pl.col("sport"), pl.col("marketId"), pl.col("marketStartMs"),
-              pl.col("countryCode")
-          ])
+          .select([pl.col(c) for c in sel])
           .unique()
           .collect(streaming=True))
+    # fill missing
+    if "marketStartMs" not in df.columns: df = df.with_columns(pl.lit(None).alias("marketStartMs"))
+    if "countryCode" not in df.columns:   df = df.with_columns(pl.lit("UNK").alias("countryCode"))
     return df
 
 
@@ -169,11 +165,12 @@ def read_results_for_dates(curated: str, sport: str, dates: list[str]) -> pl.Dat
             parts.append(pl.scan_parquet(str(res_dir / "*.parquet")))
     if not parts:
         return pl.DataFrame({})
+    names = (pl.concat(parts, how="vertical_relaxed").collect_schema().names())
+    sel = ["sport","marketId","selectionId"]
+    for c in ["runnerStatus","winLabel"]:
+        if c in names: sel.append(c)
     df = (pl.concat(parts, how="vertical_relaxed")
-          .select([
-              pl.col("sport"), pl.col("marketId"), pl.col("selectionId"),
-              pl.col("runnerStatus"), pl.col("winLabel")
-          ])
+          .select([pl.col(c) for c in sel])
           .unique()
           .collect(streaming=True))
     return df
@@ -194,16 +191,13 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, hori
                  pl.col("tradedVolume").cast(pl.Float64).alias("vol_f"),
              ]))
     # pre-off filter
+    dfj = dfj.filter(pl.col("mins_to_off").is_not_null())
     dfj = dfj.filter(pl.col("mins_to_off") >= 0.0).filter(pl.col("mins_to_off") <= float(preoff_max_m))
 
     # Basic rolling/lag feats per (marketId, selectionId)
     dfj = dfj.sort(["marketId", "selectionId", "publishTimeMs"])
 
     def add_group(g: pl.DataFrame) -> pl.DataFrame:
-        # simple 5s diff (native cadence is 5s)
-        ltp = g.get_column("ltp_f")
-        vol = g.get_column("vol_f")
-        # lagged ltp (approx windows)
         g = g.with_columns([
             pl.col("ltp_f").diff().alias("ltp_diff_5s"),
             pl.col("vol_f").diff().alias("vol_diff_5s"),
@@ -214,11 +208,10 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, hori
             pl.col("vol_f").shift(12).alias("tradedVolume_lag60s"),
             pl.col("vol_f").shift(24).alias("tradedVolume_lag120s"),
         ])
-        # momentum/returns
-        for w, lag in [(30, "30s"), (60, "60s"), (120, "120s")]:
+        for lag in ("30s","60s","120s"):
             g = g.with_columns([
                 (pl.col("ltp_f") - pl.col(f"ltp_lag{lag}")).alias(f"ltp_mom_{lag}"),
-                ( (pl.col("ltp_f") / pl.col(f"ltp_lag{lag}")) - 1.0 ).alias(f"ltp_ret_{lag}"),
+                ((pl.col("ltp_f") / pl.col(f"ltp_lag{lag}")) - 1.0).alias(f"ltp_ret_{lag}"),
             ])
         return g
 
@@ -245,13 +238,11 @@ def predict_dp(df: pl.DataFrame, models_dir: str, device: str) -> pl.Series:
     """Predict dp using trained XGBoost model if present; else simple proxy from momentum."""
     mp = _model_path(models_dir)
     if not mp.exists() or xgb is None:
-        # Proxy dp: short-term momentum signal (scaled)
         proxy = (df["ltp_mom_60s"].fill_null(0.0) + df["ltp_mom_30s"].fill_null(0.0)) / 2.0
         return proxy.fill_null(0.0)
 
     booster = xgb.Booster()
     booster.load_model(str(mp))
-    # Build feature matrix; keep a simple set to avoid mismatch
     feat_cols = [c for c in [
         "ltp_f","vol_f","ltp_diff_5s","vol_diff_5s",
         "ltp_lag30s","ltp_lag60s","ltp_lag120s",
@@ -263,18 +254,15 @@ def predict_dp(df: pl.DataFrame, models_dir: str, device: str) -> pl.Series:
     if not feat_cols:
         return pl.Series([0.0]*df.height, dtype=pl.Float64)
 
-    X = df.select(feat_cols).to_pandas()  # xgboost expects numpy/pandas
-    # Use DMatrix to avoid inplace/device mismatch issues
+    X = df.select(feat_cols).to_pandas()
     dmat = xgb.DMatrix(X)
     dp = booster.predict(dmat)  # shape (n,)
-    # Ensure length matches
     if len(dp) != df.height:
         dp = dp[:df.height]
     return pl.Series(dp, dtype=pl.Float64)
 
 
 def dp_to_ev_per_pound(dp: pl.Series, ev_scale: float, ev_cap: float) -> pl.Series:
-    # Clip raw model output to ev_cap for tail safety, then scale
     raw = dp.clip(min=-ev_cap, max=ev_cap)
     return (raw * ev_scale).cast(pl.Float64)
 
@@ -282,10 +270,6 @@ def dp_to_ev_per_pound(dp: pl.Series, ev_scale: float, ev_cap: float) -> pl.Seri
 # ---------------------------- Liquidity helpers ----------------------------
 
 def _level1_available(backTicks, backSizes, layTicks, laySizes, side: str) -> Tuple[Optional[int], float]:
-    """
-    Returns (best_tick, size_at_best) for the requested side, or (None, 0.0) if unavailable.
-    tick is int ticks from some reference; we only need the relative movement and size.
-    """
     try:
         if side == "back":
             ticks = backTicks[0] if backTicks and len(backTicks) > 0 else None
@@ -308,35 +292,19 @@ def compute_fill_fraction(size_available: float, desired: float, min_fill_frac: 
 # ---------------------------- Portfolio sizing ----------------------------
 
 def portfolio_size_per_market(df_cands: pl.DataFrame, topk: int, budget: float) -> pl.DataFrame:
-    """
-    Take topK by EV within each (marketId), split per-market budget equally among chosen picks.
-    If EV ties, maintain deterministic order by selectionId.
-    """
     if df_cands.is_empty():
         return df_cands
-    sort_cols = [pl.col("marketId"), pl.col("ev_per_1").desc(), pl.col("selectionId")]
     ranked = (df_cands
-              .sort(sort_cols)
+              .sort([pl.col("marketId"), pl.col("ev_per_1").desc(), pl.col("selectionId")])
               .with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rank"))
               .filter(pl.col("__rank") < topk)
               .drop("__rank"))
-    # Equal EV sizing for now: split budget evenly among chosen picks per market
     sized = (ranked
              .with_columns([
+                 # equal split of budget among chosen picks per market
                  (pl.lit(budget) / pl.len()).over("marketId").alias("stake_target")
              ]))
     return sized
-
-
-# ---------------------------- Exit logic ----------------------------
-
-def ticks_moved(entry_tick: Optional[int], exit_tick: Optional[int]) -> int:
-    if entry_tick is None or exit_tick is None:
-        return 0
-    try:
-        return int(exit_tick - entry_tick)
-    except Exception:
-        return 0
 
 
 # ---------------------------- Summary writers ----------------------------
@@ -382,8 +350,7 @@ def main():
         return
 
     defs = read_market_defs_for_dates(args.curated, args.sport, dates)
-    # results only needed for settlement pnl; we simulate using exit prices anyway
-    results = read_results_for_dates(args.curated, args.sport, dates)
+    results = read_results_for_dates(args.curated, args.sport, dates)  # not used directly yet
 
     # Build features and exit timestamps
     df = build_features(df, defs, args.preoff_max, args.horizon_secs)
@@ -403,14 +370,11 @@ def main():
 
     # Candidate trades: EV after scaling must exceed threshold
     cands = df.filter(pl.col("ev_per_1") >= float(args.edge_thresh)).with_columns([
-        # choose side: if ev>0 we "back"; if ev<0 and we allowed negative edges we "lay"
         pl.lit("back").alias("side"),
-        # entry reference price and tick
         pl.col("ltp_f").alias("entry_price"),
         pl.col("ltpTick").alias("entry_tick"),
     ])
 
-    # No candidates? Write empty summary and exit
     if cands.is_empty():
         print("[simulate] no trades generated.")
         summary = {
@@ -449,11 +413,12 @@ def main():
 
     # Staking
     if args.stake_mode == "kelly":
-        # Kelly fraction of bankroll capped/floored; here use ev_per_1 as proxy "edge"
         k_frac = (pl.col("ev_per_1").clip(min=-args.ev_cap, max=args.ev_cap)
                   .clip(min=args.kelly_floor, max=args.kelly_cap))
         picks = picks.with_columns((k_frac * args.bankroll_nom).alias("stake_target"))
-    # stake_target already set for flat via portfolio sizing
+    # For flat, stake_target already set by portfolio sizing
+    if "stake_target" not in picks.columns:
+        picks = picks.with_columns(pl.lit(args.per_market_budget).alias("stake_target"))
 
     # Liquidity enforcement at L1
     have_depth = all(c in df.columns for c in ["backTicks","backSizes","layTicks","laySizes"])
@@ -465,39 +430,31 @@ def main():
         effective_liq = args.enforce_liquidity and have_depth
 
     if effective_liq and not picks.is_empty():
-        # Join best-size at entry snapshot (level1) from original df
         df_depth = df.select([
             "marketId","selectionId","publishTimeMs","backTicks","backSizes","layTicks","laySizes"
         ])
         picks = (picks.join(df_depth, on=["marketId","selectionId","publishTimeMs"], how="left")
                       .with_columns([
-                          # available size at best for our side (assuming back side for positive ev)
                           pl.struct("backTicks","backSizes","layTicks","laySizes")
                             .apply(lambda s: _level1_available(
                                 s["backTicks"], s["backSizes"], s["layTicks"], s["laySizes"], "back")[1])
                             .alias("size_l1"),
                       ]))
-        # Compute filled stake
         picks = picks.with_columns([
             pl.col("size_l1").fill_null(0.0).alias("size_available"),
             pl.col("stake_target").fill_null(0.0).alias("stake_target_safe")
         ])
-        # fill fraction
         picks = picks.with_columns([
             (pl.when(pl.col("stake_target_safe") > 0)
                .then((pl.col("size_available") / pl.col("stake_target_safe")).clip(upper=1.0))
-               .otherwise(0.0)
-             ).alias("fill_frac_raw")
+               .otherwise(0.0)).alias("fill_frac_raw")
         ])
-        # enforce min fill
         picks = picks.with_columns([
             (pl.when(pl.col("fill_frac_raw") >= float(args.min_fill_frac))
                .then(pl.col("fill_frac_raw"))
-               .otherwise(0.0)
-             ).alias("fill_frac")
+               .otherwise(0.0)).alias("fill_frac")
         ])
         picks = picks.with_columns((pl.col("stake_target_safe") * pl.col("fill_frac")).alias("stake_filled"))
-        # Drop trades with zero fill
         picks = picks.filter(pl.col("stake_filled") > 0.0)
     else:
         picks = picks.with_columns([
@@ -534,24 +491,18 @@ def main():
         _write_summary_csv(summary, out_dir, args.asof)
         return
 
-    # Exit price determination
-    # Horizon exit: join future snapshot on (marketId, selectionId, ts_exit_ms <= publishTimeMs)
-    # We'll emulate asof forward join using nearest greater-equal publishTimeMs after ts_exit_ms
+    # Exit prices (horizon exit); prepare right table
     df_exit = (df
                .select(["marketId","selectionId","publishTimeMs","ltp_f","ltpTick"])
                .rename({"publishTimeMs": "publishTimeMs_exit",
                         "ltp_f": "exit_price",
-                        "ltpTick": "exit_tick"})
-              )
+                        "ltpTick": "exit_tick"}))
 
     picks = (picks
              .rename({"publishTimeMs":"publishTimeMs_entry"})
-             .with_columns(pl.col("publishTimeMs_entry") + args.horizon_secs * 1000
-                           .alias("ts_exit_ms"))
-            )
+             .with_columns((pl.col("publishTimeMs_entry") + args.horizon_secs * 1000).alias("ts_exit_ms")))
 
-    # Join nearest future by asof (right) on (marketId, selectionId, publishTimeMs)
-    # Polars requires both sides sorted by key for asof join
+    # Sort for asof join
     picks_sorted = picks.sort(["marketId","selectionId","ts_exit_ms"])
     exit_sorted  = df_exit.sort(["marketId","selectionId","publishTimeMs_exit"])
 
@@ -561,13 +512,12 @@ def main():
         by=["marketId","selectionId"], strategy="forward"
     )
 
-    # Optional early exit on favorable tick move
+    # Early exit on favorable move in ticks (for back, favorable is tick decrease)
     if args.exit_on_move_ticks and args.exit_on_move_ticks > 0:
-        # If exit_tick missing, fallback to horizon exit
         picks2 = picks2.with_columns([
             pl.when(
                 (pl.col("entry_tick").is_not_null()) & (pl.col("exit_tick").is_not_null()) &
-                ((pl.col("exit_tick") - pl.col("entry_tick")) <= -int(args.exit_on_move_ticks))  # back side: favorable if price SHORTENS => tick decreases
+                ((pl.col("exit_tick") - pl.col("entry_tick")) <= -int(args.exit_on_move_ticks))
             ).then(pl.col("exit_price"))
              .otherwise(pl.col("exit_price"))
              .alias("exit_price_eff"),
@@ -584,31 +534,26 @@ def main():
             pl.col("exit_tick").alias("exit_tick_eff"),
         ])
 
-    # Expected profit (EV) and realized PnL approximations:
-    # We treat EV per £1 as expectation on stake_filled; settlement PnL proxy uses move in price
+    # Expected & realized PnL (simplified MTM proxy)
     picks2 = picks2.with_columns([
         (pl.col("ev_per_1") * pl.col("stake_filled")).alias("exp_profit"),
-    ])
-
-    # Realized MTM / settlement proxy:
-    # For back @ entry_price and exit at exit_price, rough PnL proxy:
-    #   pnl ≈ stake * (exit_price - entry_price) / entry_price
-    # This is a simplification for pre-off trading MTM behavior.
-    picks2 = picks2.with_columns([
         (pl.when((pl.col("entry_price") > 0) & pl.col("exit_price_eff").is_not_null())
            .then(pl.col("stake_filled") * (pl.col("exit_price_eff") - pl.col("entry_price")) / pl.col("entry_price"))
            .otherwise(0.0)
          ).alias("real_mtm_pnl"),
+    ]).with_columns([
         (pl.col("real_mtm_pnl") - (pl.abs(pl.col("real_mtm_pnl")) * float(args.commission))).alias("real_settle_pnl"),
     ])
 
-    # Contra hedge (optional, simple: place opposing small stake held for contra_hold_secs)
+    # Contra hedge (optional, simplified risk cut)
     if args.contra_mode != "none" and args.contra_frac > 0.0:
-        # For brevity, we model contra as reducing risk: subtract a fraction of absolute pnl
         picks2 = picks2.with_columns([
             (pl.col("real_mtm_pnl") * (1.0 - float(args.contra_frac))).alias("real_mtm_pnl"),
             (pl.col("real_settle_pnl") * (1.0 - float(args.contra_frac))).alias("real_settle_pnl"),
         ])
+
+    # Ensure stake_mode column exists for daily grouping
+    picks2 = picks2.with_columns(pl.lit(args.stake_mode).alias("stake_mode"))
 
     # ---------------- Metrics (null safe) ----------------
     n_trades = int(picks2.height)
@@ -646,7 +591,6 @@ def main():
     print(f"[simulate] ROI (settlement) : {roi_real_settle:.6f}")
     print(f"[simulate] Trades: {n_trades:,d}  Avg EV/£1 (scaled): {avg_ev_scaled:.6f}")
 
-    # Suggest ev-scale to align exp to mtm if both non-zero
     if total_exp_profit != 0.0:
         try:
             suggested_scale = total_real_mtm / total_exp_profit
@@ -656,7 +600,6 @@ def main():
             pass
 
     # ---------------- Daily breakdown (ROI per day) ----------------
-    # derive date from publishTimeMs_entry
     if "publishTimeMs_entry" not in picks2.columns:
         picks2 = picks2.with_columns(pl.col("publishTimeMs_entry").fill_null(pl.col("ts_exit_ms")))
 
