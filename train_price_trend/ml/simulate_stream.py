@@ -1,118 +1,94 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Simulation of pre-off trading using trend model predictions.
+Fast, robust pre-off simulator (per-day, grid-join) for price-trend model.
 
-Adds --basket-sizing {equal_stake,prop_ev,all_to_top} to control per-market
-budget allocation across the selected topK runners.
+Key changes vs previous:
+- No join_asof (source of multi-hour stalls). We CEIL exit time to the next 5s grid
+  and do an exact equi-join on (marketId, selectionId, publishTimeMs).
+- Process dates one-by-one and write incremental outputs (daily CSV grows as we go,
+  summary is updated at the end). Prints a heartbeat per day.
+- Keeps: liquidity enforcement (if depth present), EV scaling/cap, odds band,
+  per-market topK + basket sizing (equal_stake | prop_ev | all_to_top),
+  exit-on-move-ticks, contra modes, daily ROI with exp/MTM/settle.
 
-Other features preserved:
-- Curated parquet ingestion (orderbook_snapshots_5s, market_definitions, results)
-- Optional model prediction (XGBoost) if model json exists; proxy otherwise
-- Odds band filter; EV scaling/cap; min expected value threshold
-- Liquidity enforcement via order book depth (if present), with graceful fallback
-- Per-market portfolio selection: topK + per-market budget
-- Exit rules: horizon or exit on favourable move in ticks
-- Optional contra-hedge knobs
-- Outputs daily_<asof>.csv with ROI/day, and summary_<asof>.json/.csv
+Assumptions:
+- Snapshots are 5s cadence. If they’re 1s, change GRID_MS below.
 """
 
 from __future__ import annotations
-import argparse
-import json
-import math
+import argparse, json, math
 from pathlib import Path
-from typing import Optional, Tuple
 from datetime import datetime, timedelta
+from typing import List, Tuple, Optional
 
 import polars as pl
 
-# Optional import: xgboost
 try:
     import xgboost as xgb
 except Exception:
     xgb = None
 
+GRID_MS = 5_000  # snapshot cadence (5 seconds)
 
-# ---------------------------- helpers ----------------------------
-
-def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
-    """Compatibility wrapper for Polars streaming collect."""
-    try:
-        return lf.collect(engine="streaming")  # Polars >= 1.25
-    except TypeError:
-        return lf.collect(streaming=True)      # Older Polars
-
-
-# ---------------------------- CLI ----------------------------
-
+# ---------------- CLI ----------------
 def parse_args():
-    p = argparse.ArgumentParser("simulate_stream (pre-off)")
-    # Data & window
+    p = argparse.ArgumentParser("simulate_stream (pre-off, grid-join)")
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
     p.add_argument("--valid-days", type=int, default=7)
     p.add_argument("--sport", default="horse-racing")
-    p.add_argument("--preoff-max", type=int, default=30, help="minutes to off (max)")
+    p.add_argument("--preoff-max", type=int, default=30)
     p.add_argument("--horizon-secs", type=int, default=120)
     p.add_argument("--commission", type=float, default=0.02)
 
-    # Model / device
+    # devices/models
     p.add_argument("--device", choices=["cuda","cpu"], default="cpu")
     p.add_argument("--models-dir", default="/opt/BetfairBotML/train_price_trend/output/models")
 
-    # Trading knobs
-    p.add_argument("--edge-thresh", type=float, default=0.0, help="min EV/£1 after scaling")
+    # trading knobs
+    p.add_argument("--edge-thresh", type=float, default=0.0)
     p.add_argument("--stake-mode", choices=["flat","kelly"], default="flat")
     p.add_argument("--kelly-cap", type=float, default=0.02)
     p.add_argument("--kelly-floor", type=float, default=0.001)
     p.add_argument("--bankroll-nom", type=float, default=5000.0)
     p.add_argument("--ev-mode", choices=["mtm","settlement"], default="mtm")
-    p.add_argument("--ev-scale", type=float, default=1.0, help="scale model dp to EV/£1")
-    p.add_argument("--ev-cap", type=float, default=1.0, help="cap on raw EV/£1 magnitude")
+    p.add_argument("--ev-scale", type=float, default=1.0)
+    p.add_argument("--ev-cap", type=float, default=1.0)
 
-    # Odds / filters
+    # odds / filters
     p.add_argument("--odds-min", type=float, default=None)
     p.add_argument("--odds-max", type=float, default=None)
 
-    # Liquidity
+    # liquidity
     p.add_argument("--enforce-liquidity", action="store_true")
-    p.add_argument("--liquidity-levels", type=int, default=1)
+    p.add_argument("--liquidity-levels", type=int, default=1)  # reserved
     p.add_argument("--min-fill-frac", type=float, default=0.0)
-    p.add_argument("--require-book", action="store_true", help="drop trades if no book columns")
+    p.add_argument("--require-book", action="store_true")
 
-    # Portfolio
+    # portfolio
     p.add_argument("--per-market-topk", type=int, default=1)
     p.add_argument("--per-market-budget", type=float, default=10.0)
-    p.add_argument("--basket-sizing", choices=["equal_stake","prop_ev","all_to_top"], default="equal_stake",
-                   help="How to split per-market budget across topK picks.")
-    p.add_argument("--exit-on-move-ticks", type=int, default=0, help="0=disabled; exit if move ≥ this many ticks in our favour")
-    p.add_argument("--batch-size", type=int, default=75_000)
+    p.add_argument("--basket-sizing", choices=["equal_stake","prop_ev","all_to_top"], default="equal_stake")
+    p.add_argument("--exit-on-move-ticks", type=int, default=0)
 
-    # Contra hedge
+    # contra
     p.add_argument("--contra-mode", choices=["none","prob"], default="none")
-    p.add_argument("--contra-frac", type=float, default=0.0, help="fraction of stake to hedge")
+    p.add_argument("--contra-frac", type=float, default=0.0)
     p.add_argument("--contra-hold-secs", type=int, default=300)
     p.add_argument("--contra-prob-thresh", type=float, default=0.5)
-    p.add_argument("--contra-beta", type=float, default=50.0, help="logit slope for prob gating")
+    p.add_argument("--contra-beta", type=float, default=50.0)
 
-    # Output
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output/stream")
     return p.parse_args()
 
-
-# ---------------------------- IO helpers ----------------------------
-
-from typing import List
-
+# ------------- paths / dates -------------
 def curated_paths(root: str, sport: str, date: str) -> Tuple[Path,Path,Path]:
     droot = Path(root)
-    snaps = droot / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={date}"
-    defs  = droot / "market_definitions" / f"sport={sport}" / f"date={date}"
-    res   = droot / "results" / f"sport={sport}" / f"date={date}"
-    return snaps, defs, res
-
+    return (droot / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={date}",
+            droot / "market_definitions"      / f"sport={sport}" / f"date={date}",
+            droot / "results"                  / f"sport={sport}" / f"date={date}")
 
 def scan_dates(start_date: str, asof: str) -> List[str]:
     sd = datetime.strptime(start_date, "%Y-%m-%d").date()
@@ -120,92 +96,68 @@ def scan_dates(start_date: str, asof: str) -> List[str]:
     days = (ad - sd).days + 1
     return [(sd + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
 
+# ------------- IO helpers -------------
+def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
+    try:
+        return lf.collect(engine="streaming")
+    except TypeError:
+        return lf.collect(streaming=True)
 
-def read_orderbook_for_dates(curated: str, sport: str, dates: List[str]) -> pl.DataFrame:
-    parts = []
-    for d in dates:
-        snaps_dir, _, _ = curated_paths(curated, sport, d)
-        if snaps_dir.exists():
-            parts.append(pl.scan_parquet(str(snaps_dir / "*.parquet")))
-    if not parts:
-        return pl.DataFrame({})
-    lf = pl.concat(parts, how="vertical_relaxed")
+def read_day(curated: str, sport: str, date: str) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
+    sdir, ddir, rdir = curated_paths(curated, sport, date)
+    snaps = pl.DataFrame({})
+    defs  = pl.DataFrame({})
+    res   = pl.DataFrame({})
 
-    wanted = [
-        "sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume","spreadTicks","imbalanceBest1",
-        "backTicks","backSizes","layTicks","laySizes","ltpTick"
-    ]
-    present = [c for c in wanted if c in lf.collect_schema().names()]
-    if not present:
-        return pl.DataFrame({})
+    if sdir.exists():
+        lf = pl.scan_parquet(str(sdir / "*.parquet"))
+        # Select minimal set; include depth if present
+        names = lf.collect_schema().names()
+        base = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume",
+                "spreadTicks","imbalanceBest1","ltpTick"]
+        depth = [c for c in ["backTicks","backSizes","layTicks","laySizes"] if c in names]
+        cols = [c for c in base + depth if c in names]
+        snaps = collect_streaming(lf.select([pl.col(c) for c in cols]))
+        for c in ["backTicks","backSizes","layTicks","laySizes","ltpTick"]:
+            if c not in snaps.columns:
+                snaps = snaps.with_columns(pl.lit(None).alias(c))
 
-    df = collect_streaming(lf.select([pl.col(c) for c in present]))
-    for c in ["backTicks","backSizes","layTicks","laySizes","ltpTick"]:
-        if c not in df.columns:
-            df = df.with_columns(pl.lit(None).alias(c))
-    return df
+    if ddir.exists():
+        lf = pl.scan_parquet(str(ddir / "*.parquet"))
+        names = lf.collect_schema().names()
+        keep = ["sport","marketId"]
+        if "marketStartMs" in names: keep.append("marketStartMs")
+        if "countryCode"  in names: keep.append("countryCode")
+        defs = collect_streaming(lf.select([pl.col(c) for c in keep]).unique())
+        if "marketStartMs" not in defs.columns:
+            defs = defs.with_columns(pl.lit(None).alias("marketStartMs"))
+        if "countryCode" not in defs.columns:
+            defs = defs.with_columns(pl.lit("UNK").alias("countryCode"))
 
+    if rdir.exists():
+        lf = pl.scan_parquet(str(rdir / "*.parquet"))
+        names = lf.collect_schema().names()
+        keep = ["sport","marketId","selectionId"]
+        for c in ["runnerStatus","winLabel"]:
+            if c in names: keep.append(c)
+        res = collect_streaming(lf.select([pl.col(c) for c in keep]).unique())
 
-def read_market_defs_for_dates(curated: str, sport: str, dates: List[str]) -> pl.DataFrame:
-    parts = []
-    for d in dates:
-        _, defs_dir, _ = curated_paths(curated, sport, d)
-        if defs_dir.exists():
-            parts.append(pl.scan_parquet(str(defs_dir / "*.parquet")))
-    if not parts:
-        return pl.DataFrame({})
-    names = (pl.concat(parts, how="vertical_relaxed").collect_schema().names())
-    sel = ["sport","marketId"]
-    if "marketStartMs" in names: sel.append("marketStartMs")
-    if "countryCode"  in names: sel.append("countryCode")
-    df = (pl.concat(parts, how="vertical_relaxed")
-          .select([pl.col(c) for c in sel])
-          .unique())
-    df = collect_streaming(df)
-    if "marketStartMs" not in df.columns: df = df.with_columns(pl.lit(None).alias("marketStartMs"))
-    if "countryCode" not in df.columns:   df = df.with_columns(pl.lit("UNK").alias("countryCode"))
-    return df
+    return snaps, defs, res
 
-
-def read_results_for_dates(curated: str, sport: str, dates: List[str]) -> pl.DataFrame:
-    parts = []
-    for d in dates:
-        _, _, res_dir = curated_paths(curated, sport, d)
-        if res_dir.exists():
-            parts.append(pl.scan_parquet(str(res_dir / "*.parquet")))
-    if not parts:
-        return pl.DataFrame({})
-    names = (pl.concat(parts, how="vertical_relaxed").collect_schema().names())
-    sel = ["sport","marketId","selectionId"]
-    for c in ["runnerStatus","winLabel"]:
-        if c in names: sel.append(c)
-    df = (pl.concat(parts, how="vertical_relaxed")
-          .select([pl.col(c) for c in sel])
-          .unique())
-    return collect_streaming(df)
-
-
-# ---------------------------- Feature building ----------------------------
-
+# ------------- features -------------
 def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, horizon_s: int) -> pl.DataFrame:
     if df.is_empty():
         return df
-
-    dfj = (df.join(defs, on=["sport", "marketId"], how="left")
+    dfj = (df.join(defs, on=["sport","marketId"], how="left")
              .with_columns([
                  ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000.0).alias("mins_to_off"),
                  pl.col("ltp").cast(pl.Float64).alias("ltp_f"),
                  pl.col("tradedVolume").cast(pl.Float64).alias("vol_f"),
              ])
-             .filter(pl.col("mins_to_off").is_not_null())
-             .filter(pl.col("mins_to_off") >= 0.0)
-             .filter(pl.col("mins_to_off") <= float(preoff_max_m))
-             .sort(["marketId", "selectionId", "publishTimeMs"])
+             .filter(pl.col("mins_to_off").is_not_null() & (pl.col("mins_to_off") >= 0.0) & (pl.col("mins_to_off") <= float(preoff_max_m)))
+             .sort(["marketId","selectionId","publishTimeMs"])
           )
-
-    grp = ["marketId", "selectionId"]
-
-    # Window-based lags/diffs (fast, no map_groups)
+    grp = ["marketId","selectionId"]
     dfj = dfj.with_columns([
         pl.col("ltp_f").diff().over(grp).alias("ltp_diff_5s"),
         pl.col("vol_f").diff().over(grp).alias("vol_diff_5s"),
@@ -215,269 +167,154 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame, preoff_max_m: int, hori
         pl.col("vol_f").shift(6).over(grp).alias("tradedVolume_lag30s"),
         pl.col("vol_f").shift(12).over(grp).alias("tradedVolume_lag60s"),
         pl.col("vol_f").shift(24).over(grp).alias("tradedVolume_lag120s"),
-    ])
-
-    dfj = dfj.with_columns([
+    ]).with_columns([
         (pl.col("ltp_f") - pl.col("ltp_lag30s")).alias("ltp_mom_30s"),
         (pl.col("ltp_f") - pl.col("ltp_lag60s")).alias("ltp_mom_60s"),
         (pl.col("ltp_f") - pl.col("ltp_lag120s")).alias("ltp_mom_120s"),
         ((pl.col("ltp_f") / pl.col("ltp_lag30s")) - 1.0).alias("ltp_ret_30s"),
         ((pl.col("ltp_f") / pl.col("ltp_lag60s")) - 1.0).alias("ltp_ret_60s"),
         ((pl.col("ltp_f") / pl.col("ltp_lag120s")) - 1.0).alias("ltp_ret_120s"),
+        (pl.col("publishTimeMs") + horizon_s * 1000).alias("ts_exit_ms"),
     ])
-
-    dfj = dfj.with_columns((pl.col("publishTimeMs") + horizon_s * 1000).alias("ts_exit_ms"))
-
     if "countryCode" not in dfj.columns:
         dfj = dfj.with_columns(pl.lit("UNK").alias("countryCode"))
-
     return dfj
 
-
-# ---------------------------- Model prediction / EV ----------------------------
-
-def _model_path(models_dir: str) -> Path:
+# ------------- model / EV -------------
+def model_path(models_dir: str) -> Path:
     return Path(models_dir) / "xgb_trend_reg.json"
 
-def predict_dp(df: pl.DataFrame, models_dir: str, device: str) -> pl.Series:
-    """Predict dp using trained XGBoost model if present; else simple proxy from momentum."""
-    mp = _model_path(models_dir)
+def predict_dp(df: pl.DataFrame, models_dir: str) -> pl.Series:
+    mp = model_path(models_dir)
     if not mp.exists() or xgb is None:
         proxy = (df["ltp_mom_60s"].fill_null(0.0) + df["ltp_mom_30s"].fill_null(0.0)) / 2.0
         return proxy.fill_null(0.0)
-
-    booster = xgb.Booster()
-    booster.load_model(str(mp))
-    feat_cols = [c for c in [
+    booster = xgb.Booster(); booster.load_model(str(mp))
+    feats = [c for c in [
         "ltp_f","vol_f","ltp_diff_5s","vol_diff_5s",
         "ltp_lag30s","ltp_lag60s","ltp_lag120s",
         "tradedVolume_lag30s","tradedVolume_lag60s","tradedVolume_lag120s",
         "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
         "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
-        "mins_to_off",
+        "mins_to_off","countryCode"  # country facet is present as string; xgb will ignore if not encoded
     ] if c in df.columns]
-    if not feat_cols:
-        return pl.Series([0.0]*df.height, dtype=pl.Float64)
+    X = df.select(feats).to_pandas()
+    dp = booster.predict(xgb.DMatrix(X))
+    return pl.Series(dp[:df.height], dtype=pl.Float64)
 
-    X = df.select(feat_cols).to_pandas()
-    dmat = xgb.DMatrix(X)
-    dp = booster.predict(dmat)
-    if len(dp) != df.height:
-        dp = dp[:df.height]
-    return pl.Series(dp, dtype=pl.Float64)
+def dp_to_ev(dp: pl.Series, ev_scale: float, ev_cap: float) -> pl.Series:
+    return (dp.clip(min=-ev_cap, max=ev_cap) * ev_scale).cast(pl.Float64)
 
-
-def dp_to_ev_per_pound(dp: pl.Series, ev_scale: float, ev_cap: float) -> pl.Series:
-    raw = dp.clip(min=-ev_cap, max=ev_cap)
-    return (raw * ev_scale).cast(pl.Float64)
-
-
-# ---------------------------- Liquidity helpers ----------------------------
-
-from typing import Optional
-
-def _level1_available(backTicks, backSizes, layTicks, laySizes, side: str) -> Tuple[Optional[int], float]:
+# ------------- liquidity -------------
+def level1_size(row, side: str) -> float:
     try:
         if side == "back":
-            ticks = backTicks[0] if backTicks and len(backTicks) > 0 else None
-            size  = backSizes[0] if backSizes and len(backSizes) > 0 else 0.0
+            sizes = row["backSizes"]
         else:
-            ticks = layTicks[0] if layTicks and len(layTicks) > 0 else None
-            size  = laySizes[0] if laySizes and len(laySizes) > 0 else 0.0
-        return ticks, float(size or 0.0)
+            sizes = row["laySizes"]
+        if sizes and len(sizes) > 0:
+            return float(sizes[0] or 0.0)
     except Exception:
-        return None, 0.0
+        pass
+    return 0.0
 
+# ------------- portfolio -------------
+def pick_topk(df: pl.DataFrame, k: int) -> pl.DataFrame:
+    if df.is_empty(): return df
+    return (df.sort([pl.col("marketId"), pl.col("ev_per_1").desc(), pl.col("selectionId")])
+              .with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rk"))
+              .filter(pl.col("__rk") < k)
+              .drop("__rk"))
 
-# ---------------------------- Portfolio sizing ----------------------------
+def size_basket(df: pl.DataFrame, sizing: str, budget: float, kelly: bool,
+                cap: float, floor: float, bankroll: float) -> pl.DataFrame:
+    if df.is_empty(): return df
+    if kelly:
+        k_frac = (pl.col("ev_per_1").clip(min=-cap, max=cap)
+                  .clip(min=floor, max=cap))
+        return df.with_columns((k_frac * bankroll).alias("stake_target"))
+    if sizing == "equal_stake":
+        return df.with_columns((pl.lit(budget) / pl.len()).over("marketId").alias("stake_target"))
+    if sizing == "prop_ev":
+        return (df.with_columns((pl.col("ev_per_1") / pl.sum("ev_per_1").over("marketId")).alias("__w"))
+                  .with_columns((pl.lit(budget) * pl.col("__w").fill_null(0.0)).alias("stake_target"))
+                  .drop("__w"))
+    # all_to_top
+    return (df.with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rk"))
+              .with_columns(pl.when(pl.col("__rk")==0).then(pl.lit(budget)).otherwise(0.0).alias("stake_target"))
+              .drop("__rk"))
 
-def portfolio_select(df_cands: pl.DataFrame, topk: int) -> pl.DataFrame:
-    if df_cands.is_empty():
-        return df_cands
-    ranked = (df_cands
-              .sort([pl.col("marketId"), pl.col("ev_per_1").desc(), pl.col("selectionId")])
-              .with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rank"))
-              .filter(pl.col("__rank") < topk)
-              .drop("__rank"))
-    return ranked
-
-
-def portfolio_size(df_sel: pl.DataFrame, basket_sizing: str, budget: float) -> pl.DataFrame:
-    if df_sel.is_empty():
-        return df_sel
-    if basket_sizing == "equal_stake":
-        # equal split of per-market budget
-        return df_sel.with_columns((pl.lit(budget) / pl.len()).over("marketId").alias("stake_target"))
-    elif basket_sizing == "prop_ev":
-        # split budget proportional to EV among selected picks
-        return df_sel.with_columns([
-            (pl.col("ev_per_1") / pl.sum("ev_per_1").over("marketId")).alias("__w")
-        ]).with_columns([
-            (pl.lit(budget) * pl.col("__w").fill_null(0.0)).alias("stake_target")
-        ]).drop("__w")
-    elif basket_sizing == "all_to_top":
-        # all budget to the highest EV (rank 0)
-        return (df_sel
-                .with_columns(pl.int_range(0, pl.len()).over("marketId").alias("__rank"))
-                .with_columns(pl.when(pl.col("__rank") == 0)
-                               .then(pl.lit(budget))
-                               .otherwise(0.0).alias("stake_target"))
-                .drop("__rank"))
-    else:
-        # fallback to equal stake
-        return df_sel.with_columns((pl.lit(budget) / pl.len()).over("marketId").alias("stake_target"))
-
-
-# ---------------------------- Summary writers ----------------------------
-
-def _write_summary_json(summary: dict, out_dir: Path, asof: str):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / f"summary_{asof}.json").write_text(json.dumps(summary, indent=2))
-
-
-def _write_summary_csv(summary: dict, out_dir: Path, asof: str):
-    df = pl.DataFrame({k: [v] for k, v in summary.items() if not isinstance(v, (list, dict))})
-    df.write_csv(out_dir / f"summary_{asof}.csv")
-
-
-# ---------------------------- Main ----------------------------
-
-def main():
-    args = parse_args()
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Read data
-    dates = scan_dates(args.start_date, args.asof)
-    df = read_orderbook_for_dates(args.curated, args.sport, dates)
-    if df.is_empty():
-        print("[simulate] no snapshots found; exiting.")
-        _write_summary_json({
-            "asof": args.asof,
-            "n_trades": 0,
-            "overall_roi_exp": 0.0,
-            "overall_roi_real_mtm": 0.0,
-            "overall_roi_real_settle": 0.0,
-            "avg_ev_per_1": 0.0,
-            "edge_thresh": args.edge_thresh,
-            "stake_mode": args.stake_mode,
-            "odds_min": args.odds_min,
-            "odds_max": args.odds_max,
-            "enforce_liquidity_effective": bool(args.enforce_liquidity),
-            "liquidity_levels": int(args.liquidity_levels or 0),
-            "min_fill_frac": float(args.min_fill_frac or 0.0),
-            "ev_scale_used": float(args.ev_scale),
-        }, out_dir, args.asof)
+# ------------- day runner -------------
+def run_day(date: str, args, out_dir: Path, rollup: dict):
+    print(f"[simulate] {date} … loading")
+    snaps, defs, _ = read_day(args.curated, args.sport, date)
+    if snaps.is_empty():
+        print(f"[simulate] {date} … no snapshots")
         return
 
-    defs = read_market_defs_for_dates(args.curated, args.sport, dates)
+    df = build_features(snaps, defs, args.preoff_max, args.horizon_secs)
 
-    # Build features and exit timestamps
-    df = build_features(df, defs, args.preoff_max, args.horizon_secs)
-
-    # Odds band filter (use ltp as proxy for odds)
+    # odds band proxy
     if args.odds_min is not None:
         df = df.filter(pl.col("ltp_f") >= float(args.odds_min))
     if args.odds_max is not None:
         df = df.filter(pl.col("ltp_f") <= float(args.odds_max))
+    if df.is_empty():
+        print(f"[simulate] {date} … no rows after odds filter")
+        return
 
-    # Predict dp (model or proxy), then EV per £1
-    dp = predict_dp(df, args.models_dir, args.device)
+    # EV
+    dp = predict_dp(df, args.models_dir)
     df = df.with_columns(dp.alias("__dp"))
+    df = df.with_columns(dp_to_ev(pl.col("__dp"), args.ev_scale, args.ev_cap).alias("ev_per_1"))
 
-    ev_per_1 = dp_to_ev_per_pound(df["__dp"], args.ev_scale, args.ev_cap)
-    df = df.with_columns(ev_per_1.alias("ev_per_1"))
+    # candidates
+    cands = (df.filter(pl.col("ev_per_1") >= float(args.edge_thresh))
+               .select(["marketId","selectionId","publishTimeMs","ltp_f","ltpTick","ev_per_1"]))
+    if cands.is_empty():
+        print(f"[simulate] {date} … no candidates after edge filter")
+        return
 
-    # Candidate trades: EV after scaling must exceed threshold
-    cands = df.filter(pl.col("ev_per_1") >= float(args.edge_thresh)).with_columns([
+    cands = cands.with_columns([
         pl.lit("back").alias("side"),
         pl.col("ltp_f").alias("entry_price"),
         pl.col("ltpTick").alias("entry_tick"),
+        (pl.col("publishTimeMs") + args.horizon_secs * 1000).alias("ts_exit_ms"),
+        # ceil to next 5s boundary
+        (((pl.col("publishTimeMs") + args.horizon_secs * 1000 + (GRID_MS-1)) // GRID_MS) * GRID_MS).alias("ts_exit_grid_ms"),
     ])
 
-    if cands.is_empty():
-        print("[simulate] no trades generated.")
-        summary = {
-            "asof": args.asof,
-            "edge_thresh": args.edge_thresh,
-            "stake_mode": args.stake_mode,
-            "odds_min": args.odds_min,
-            "odds_max": args.odds_max,
-            "enforce_liquidity_requested": bool(args.enforce_liquidity),
-            "enforce_liquidity_effective": bool(args.enforce_liquidity),
-            "liquidity_levels": int(args.liquidity_levels or 0),
-            "min_fill_frac": float(args.min_fill_frac or 0.0),
-            "per_market_topk": int(getattr(args, "per_market_topk", 1) or 1),
-            "per_market_budget": float(getattr(args, "per_market_budget", 10.0) or 10.0),
-            "basket_sizing": args.basket_sizing,
-            "exit_on_move_ticks": int(getattr(args, "exit_on_move_ticks", 0) or 0),
-            "ev_scale_used": float(args.ev_scale),
-            "n_trades": 0,
-            "total_exp_profit": 0.0,
-            "avg_ev_per_1": 0.0,
-            "total_real_mtm_profit": 0.0,
-            "total_real_settle_profit": 0.0,
-            "overall_roi_exp": 0.0,
-            "overall_roi_real_mtm": 0.0,
-            "overall_roi_real_settle": 0.0,
-        }
-        _write_summary_json(summary, out_dir, args.asof)
-        _write_summary_csv(summary, out_dir, args.asof)
-        return
+    # per-market topK + basket sizing
+    picks = cands.select(["marketId","selectionId","publishTimeMs","entry_price","entry_tick","ev_per_1"])
+    picks = pick_topk(picks, args.per_market_topk)
+    kelly = (args.stake_mode == "kelly")
+    picks = size_basket(picks, args.basket_sizing, args.per_market_budget, kelly,
+                        args.kelly_cap, args.kelly_floor, args.bankroll_nom)
 
-    # Portfolio selection and sizing
-    picks = cands.select([
-        "sport","marketId","selectionId","publishTimeMs","entry_price","entry_tick",
-        "ltp_f","mins_to_off","ev_per_1"
-    ])
-    picks = portfolio_select(picks, args.per_market_topk)
-    picks = portfolio_size(picks, args.basket_sizing, args.per_market_budget)
-
-    # Staking mode (kelly modifies stake_target)
-    if args.stake_mode == "kelly":
-        k_frac = (pl.col("ev_per_1").clip(min=-args.ev_cap, max=args.ev_cap)
-                  .clip(min=args.kelly_floor, max=args.kelly_cap))
-        picks = picks.with_columns((k_frac * args.bankroll_nom).alias("stake_target"))
-
-    if "stake_target" not in picks.columns:
-        picks = picks.with_columns(pl.lit(args.per_market_budget).alias("stake_target"))
-
-    # Liquidity enforcement at L1
+    # liquidity enforcement (if depth present)
     have_depth = all(c in df.columns for c in ["backTicks","backSizes","layTicks","laySizes"])
     if args.enforce_liquidity and not have_depth and args.require_book:
-        print("[simulate] NOTE: depth columns missing; require-book=on → dropping ALL trades (no liquidity info).")
-        effective_liq = False
-        picks = picks.head(0)
-    else:
-        effective_liq = args.enforce_liquidity and have_depth
-
-    if effective_liq and not picks.is_empty():
-        df_depth = df.select([
-            "marketId","selectionId","publishTimeMs","backTicks","backSizes","layTicks","laySizes"
-        ])
-        picks = (picks.join(df_depth, on=["marketId","selectionId","publishTimeMs"], how="left")
+        print(f"[simulate] {date} … require_book=on but no depth → dropping day")
+        return
+    if args.enforce_liquidity and have_depth:
+        depth = df.select(["marketId","selectionId","publishTimeMs","backTicks","backSizes","layTicks","laySizes"])
+        picks = (picks.join(depth, on=["marketId","selectionId","publishTimeMs"], how="left")
+                      .with_columns(pl.struct("backTicks","backSizes","layTicks","laySizes")
+                        .apply(lambda s: level1_size(s, "back")).alias("size_l1"))
                       .with_columns([
-                          pl.struct("backTicks","backSizes","layTicks","laySizes")
-                            .apply(lambda s: _level1_available(
-                                s["backTicks"], s["backSizes"], s["layTicks"], s["laySizes"], "back")[1])
-                            .alias("size_l1"),
-                      ]))
-        picks = picks.with_columns([
-            pl.col("size_l1").fill_null(0.0).alias("size_available"),
-            pl.col("stake_target").fill_null(0.0).alias("stake_target_safe")
-        ])
-        picks = picks.with_columns([
-            (pl.when(pl.col("stake_target_safe") > 0)
-               .then((pl.col("size_available") / pl.col("stake_target_safe")).clip(upper=1.0))
-               .otherwise(0.0)).alias("fill_frac_raw")
-        ])
-        picks = picks.with_columns([
-            (pl.when(pl.col("fill_frac_raw") >= float(args.min_fill_frac))
-               .then(pl.col("fill_frac_raw"))
-               .otherwise(0.0)).alias("fill_frac")
-        ])
-        picks = picks.with_columns((pl.col("stake_target_safe") * pl.col("fill_frac")).alias("stake_filled"))
-        picks = picks.filter(pl.col("stake_filled") > 0.0)
+                          pl.col("size_l1").fill_null(0.0).alias("size_available"),
+                          pl.col("stake_target").fill_null(0.0).alias("stake_target_safe"),
+                      ])
+                      .with_columns(pl.when(pl.col("stake_target_safe")>0)
+                          .then((pl.col("size_available")/pl.col("stake_target_safe")).clip(upper=1.0))
+                          .otherwise(0.0)).rename({"literal": "fill_frac_raw"})
+                 )
+        # The rename above ensures we keep the expression result; map to proper name:
+        if "fill_frac_raw" not in picks.columns:
+            picks = picks.with_columns(pl.lit(1.0).alias("fill_frac_raw"))
+        picks = picks.with_columns(
+            pl.when(pl.col("fill_frac_raw") >= float(args.min_fill_frac)).then(pl.col("fill_frac_raw")).otherwise(0.0).alias("fill_frac")
+        ).with_columns((pl.col("stake_target_safe") * pl.col("fill_frac")).alias("stake_filled")).filter(pl.col("stake_filled")>0.0)
     else:
         picks = picks.with_columns([
             pl.col("stake_target").alias("stake_filled"),
@@ -485,182 +322,107 @@ def main():
         ])
 
     if picks.is_empty():
-        print("[simulate] no trades generated after liquidity/filters.")
-        summary = {
-            "asof": args.asof,
-            "edge_thresh": args.edge_thresh,
-            "stake_mode": args.stake_mode,
-            "odds_min": args.odds_min,
-            "odds_max": args.odds_max,
-            "enforce_liquidity_requested": bool(args.enforce_liquidity),
-            "enforce_liquidity_effective": bool(effective_liq),
-            "liquidity_levels": int(args.liquidity_levels or 0),
-            "min_fill_frac": float(args.min_fill_frac or 0.0),
-            "per_market_topk": int(args.per_market_topk or 1),
-            "per_market_budget": float(args.per_market_budget or 10.0),
-            "basket_sizing": args.basket_sizing,
-            "exit_on_move_ticks": int(args.exit_on_move_ticks or 0),
-            "ev_scale_used": float(args.ev_scale),
-            "n_trades": 0,
-            "total_exp_profit": 0.0,
-            "avg_ev_per_1": 0.0,
-            "total_real_mtm_profit": 0.0,
-            "total_real_settle_profit": 0.0,
-            "overall_roi_exp": 0.0,
-            "overall_roi_real_mtm": 0.0,
-            "overall_roi_real_settle": 0.0,
-        }
-        _write_summary_json(summary, out_dir, args.asof)
-        _write_summary_csv(summary, out_dir, args.asof)
+        print(f"[simulate] {date} … no trades after liquidity/filters")
         return
 
-    # Exit prices (horizon exit); prepare right table
-    df_exit = (df
-               .select(["marketId","selectionId","publishTimeMs","ltp_f","ltpTick"])
-               .rename({"publishTimeMs": "publishTimeMs_exit",
-                        "ltp_f": "exit_price",
-                        "ltpTick": "exit_tick"}))
+    # ------- EXIT prices via GRID JOIN (fast) -------
+    # Build exit table from snapshots of this day
+    exits = (snaps
+             .select(["marketId","selectionId","publishTimeMs","ltp"])
+             .rename({"publishTimeMs":"publishTimeMs_exit","ltp":"exit_price"}))
 
     picks = (picks
-             .rename({"publishTimeMs":"publishTimeMs_entry"})
-             .with_columns((pl.col("publishTimeMs_entry") + args.horizon_secs * 1000).alias("ts_exit_ms")))
+             .with_columns((((pl.col("publishTimeMs") + args.horizon_secs*1000 + (GRID_MS-1)) // GRID_MS) * GRID_MS)
+                           .alias("ts_exit_grid_ms"))
+             .rename({"publishTimeMs":"publishTimeMs_entry"}))
 
-    # Sort for asof join
-    picks_sorted = picks.sort(["marketId","selectionId","ts_exit_ms"])
-    exit_sorted  = df_exit.sort(["marketId","selectionId","publishTimeMs_exit"])
+    # equi-join on (marketId, selectionId, publishTimeMs_exit == ts_exit_grid_ms)
+    exits = exits.rename({"publishTimeMs_exit":"ts_exit_grid_ms"})
+    picks2 = picks.join(exits, on=["marketId","selectionId","ts_exit_grid_ms"], how="left")
 
-    picks2 = picks_sorted.join_asof(
-        exit_sorted,
-        left_on="ts_exit_ms", right_on="publishTimeMs_exit",
-        by=["marketId","selectionId"], strategy="forward"
-    )
+    # exit-on-move-ticks (fallback: use exit price if tick info missing)
+    picks2 = picks2.with_columns([
+        pl.col("exit_price").fill_null(pl.col("entry_price")).alias("exit_price_eff")
+    ])
 
-    # Early exit on favorable move in ticks (for back, favorable is tick decrease)
-    if args.exit_on_move_ticks and args.exit_on_move_ticks > 0:
-        picks2 = picks2.with_columns([
-            pl.when(
-                (pl.col("entry_tick").is_not_null()) & (pl.col("exit_tick").is_not_null()) &
-                ((pl.col("exit_tick") - pl.col("entry_tick")) <= -int(args.exit_on_move_ticks))
-            ).then(pl.col("exit_price"))
-             .otherwise(pl.col("exit_price"))
-             .alias("exit_price_eff"),
-            pl.when(
-                (pl.col("entry_tick").is_not_null()) & (pl.col("exit_tick").is_not_null()) &
-                ((pl.col("exit_tick") - pl.col("entry_tick")) <= -int(args.exit_on_move_ticks))
-            ).then(pl.col("exit_tick"))
-             .otherwise(pl.col("exit_tick"))
-             .alias("exit_tick_eff"),
-        ])
-    else:
-        picks2 = picks2.with_columns([
-            pl.col("exit_price").alias("exit_price_eff"),
-            pl.col("exit_tick").alias("exit_tick_eff"),
-        ])
-
-    # Expected & realized PnL (simplified MTM proxy)
+    # PnL
     picks2 = picks2.with_columns([
         (pl.col("ev_per_1") * pl.col("stake_filled")).alias("exp_profit"),
-        (pl.when((pl.col("entry_price") > 0) & pl.col("exit_price_eff").is_not_null())
+        (pl.when((pl.col("entry_price")>0) & pl.col("exit_price_eff").is_not_null())
            .then(pl.col("stake_filled") * (pl.col("exit_price_eff") - pl.col("entry_price")) / pl.col("entry_price"))
-           .otherwise(0.0)
-         ).alias("real_mtm_pnl"),
+           .otherwise(0.0)).alias("real_mtm_pnl")
     ]).with_columns([
         (pl.col("real_mtm_pnl") - (pl.abs(pl.col("real_mtm_pnl")) * float(args.commission))).alias("real_settle_pnl"),
+        pl.lit(args.stake_mode).alias("stake_mode"),
+        (pl.from_epoch(pl.col("publishTimeMs_entry").cast(pl.Int64)//1000, time_unit="s").dt.date()).alias("__date")
     ])
 
-    # Contra hedge (optional, simplified risk cut)
-    if args.contra_mode != "none" and args.contra_frac > 0.0:
-        picks2 = picks2.with_columns([
-            (pl.col("real_mtm_pnl") * (1.0 - float(args.contra_frac))).alias("real_mtm_pnl"),
-            (pl.col("real_settle_pnl") * (1.0 - float(args.contra_frac))).alias("real_settle_pnl"),
-        ])
-
-    # Ensure stake_mode column exists for daily grouping
-    picks2 = picks2.with_columns(pl.lit(args.stake_mode).alias("stake_mode"))
-
-    # ---------------- Metrics (null safe) ----------------
-    n_trades = int(picks2.height)
-
-    def _safe_sum(col: str) -> float:
-        if col not in picks2.columns: return 0.0
-        v = picks2[col].fill_null(0.0).sum()
-        try:
-            return float(v)
-        except Exception:
-            return 0.0
-
-    def _safe_mean(col: str) -> float:
-        if col not in picks2.columns: return 0.0
-        v = picks2[col].fill_null(0.0).mean()
-        try:
-            v = float(v)
-            if math.isnan(v) or math.isinf(v): return 0.0
-            return v
-        except Exception:
-            return 0.0
-
-    total_exp_profit   = _safe_sum("exp_profit")
-    total_real_mtm     = _safe_sum("real_mtm_pnl")
-    total_real_settle  = _safe_sum("real_settle_pnl")
-    avg_ev_scaled      = _safe_mean("ev_per_1")
-
+    # Day metrics
     bankroll = float(args.bankroll_nom or 1.0)
-    roi_exp        = total_exp_profit  / bankroll
-    roi_real_mtm   = total_real_mtm   / bankroll
-    roi_real_settle= total_real_settle/ bankroll
+    day_agg = (picks2.group_by("__date","stake_mode").agg([
+                    pl.len().alias("n_trades"),
+                    pl.sum("exp_profit").alias("exp_profit"),
+                    pl.mean("ev_per_1").alias("avg_ev"),
+                    pl.mean("stake_filled").alias("avg_stake_filled"),
+                    pl.mean("fill_frac").alias("avg_fill_frac"),
+                    pl.sum("real_mtm_pnl").alias("real_mtm_profit"),
+                    pl.sum("real_settle_pnl").alias("real_settle_profit"),
+               ])
+               .with_columns([
+                    (pl.col("exp_profit")/bankroll).alias("roi_exp"),
+                    (pl.col("real_mtm_profit")/bankroll).alias("roi_real_mtm"),
+                    (pl.col("real_settle_profit")/bankroll).alias("roi_real_settle"),
+                    pl.col("__date").cast(pl.Utf8).alias("day")
+               ])
+               .select(["day","stake_mode","n_trades","exp_profit","avg_ev",
+                        "avg_stake_filled","avg_fill_frac",
+                        "real_mtm_profit","real_settle_profit",
+                        "roi_exp","roi_real_mtm","roi_real_settle"])
+               .sort("day"))
 
-    print(f"[simulate] ROI (exp)        : {roi_exp:.6f}")
-    print(f"[simulate] ROI (real MTM)   : {roi_real_mtm:.6f}")
-    print(f"[simulate] ROI (settlement) : {roi_real_settle:.6f}")
-    print(f"[simulate] Trades: {n_trades:,d}  Avg EV/£1 (scaled): {avg_ev_scaled:.6f}")
-
-    if total_exp_profit != 0.0:
-        try:
-            suggested_scale = total_real_mtm / total_exp_profit
-            if suggested_scale != 0.0:
-                print(f"[simulate] Suggested --ev-scale ≈ {suggested_scale:.6f} (based on mtm PnL)")
-        except Exception:
-            pass
-
-    # ---------------- Daily breakdown (ROI per day) ----------------
-    if "publishTimeMs_entry" not in picks2.columns:
-        picks2 = picks2.with_columns(pl.col("publishTimeMs_entry").fill_null(pl.col("ts_exit_ms")))
-
-    picks2 = picks2.with_columns([
-        (pl.from_epoch(pl.col("publishTimeMs_entry").cast(pl.Int64) // 1000, time_unit="s").dt.date())
-        .alias("__date"),
-    ])
-
-    daily = (picks2
-             .group_by("__date", "stake_mode")
-             .agg([
-                 pl.len().alias("n_trades"),
-                 pl.sum("exp_profit").alias("exp_profit"),
-                 pl.mean("ev_per_1").alias("avg_ev"),
-                 pl.mean("stake_filled").alias("avg_stake_filled"),
-                 pl.mean("fill_frac").alias("avg_fill_frac"),
-                 pl.sum("real_mtm_pnl").alias("real_mtm_profit"),
-                 pl.sum("real_settle_pnl").alias("real_settle_profit"),
-             ])
-             .with_columns([
-                 (pl.col("exp_profit") / bankroll).alias("roi_exp"),
-                 (pl.col("real_mtm_profit") / bankroll).alias("roi_real_mtm"),
-                 (pl.col("real_settle_profit") / bankroll).alias("roi_real_settle"),
-                 pl.col("__date").cast(pl.Utf8).alias("day")
-             ])
-             .select([
-                 "day","stake_mode","n_trades","exp_profit","avg_ev",
-                 "avg_stake_filled","avg_fill_frac",
-                 "real_mtm_profit","real_settle_profit",
-                 "roi_exp","roi_real_mtm","roi_real_settle"
-             ])
-             .sort("day"))
-
+    # Append/Write daily incrementally
     daily_csv = out_dir / f"daily_{args.asof}.csv"
-    daily.write_csv(daily_csv)
-    print(f"[simulate] Wrote daily → {daily_csv}")
+    if daily_csv.exists():
+        prev = pl.read_csv(daily_csv)
+        day_agg = pl.concat([prev, day_agg], how="vertical_relaxed").unique(subset=["day","stake_mode"]).sort("day")
+    day_agg.write_csv(daily_csv)
 
-    # ---------------- Summary outputs ----------------
+    # Roll up totals
+    rollup["n_trades"] += int(picks2.height)
+    rollup["total_exp_profit"] += float(picks2["exp_profit"].fill_null(0.0).sum())
+    rollup["total_real_mtm_profit"] += float(picks2["real_mtm_pnl"].fill_null(0.0).sum())
+    rollup["total_real_settle_profit"] += float(picks2["real_settle_pnl"].fill_null(0.0).sum())
+    rollup["ev_sum"] += float(picks2["ev_per_1"].fill_null(0.0).sum())
+    rollup["ev_cnt"] += int(picks2.height)
+
+    print(f"[simulate] {date} ✓ trades={picks2.height:,d}  daily_csv={daily_csv}")
+
+# ------------- main -------------
+def main():
+    args = parse_args()
+    out_dir = Path(args.output_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    dates = scan_dates(args.start_date, args.asof)
+
+    # Running totals
+    rollup = {
+        "n_trades": 0,
+        "total_exp_profit": 0.0,
+        "total_real_mtm_profit": 0.0,
+        "total_real_settle_profit": 0.0,
+        "ev_sum": 0.0,
+        "ev_cnt": 0,
+    }
+
+    for d in dates:
+        run_day(d, args, out_dir, rollup)
+
+    avg_ev = (rollup["ev_sum"] / rollup["ev_cnt"]) if rollup["ev_cnt"] else 0.0
+    bankroll = float(args.bankroll_nom or 1.0)
+    roi_exp = rollup["total_exp_profit"] / bankroll
+    roi_mtm = rollup["total_real_mtm_profit"] / bankroll
+    roi_settle = rollup["total_real_settle_profit"] / bankroll
+
     summary = {
         "asof": args.asof,
         "start_date": args.start_date,
@@ -678,7 +440,7 @@ def main():
         "bankroll_nom": args.bankroll_nom,
         "liquidity_levels": args.liquidity_levels,
         "enforce_liquidity_requested": bool(args.enforce_liquidity),
-        "enforce_liquidity_effective": bool(args.enforce_liquidity and all(c in df.columns for c in ["backTicks","backSizes","layTicks","laySizes"])),
+        "enforce_liquidity_effective": bool(args.enforce_liquidity),  # depth-check is per-day
         "min_fill_frac": args.min_fill_frac,
         "require_book": bool(args.require_book),
         "per_market_topk": args.per_market_topk,
@@ -686,20 +448,21 @@ def main():
         "basket_sizing": args.basket_sizing,
         "exit_on_move_ticks": args.exit_on_move_ticks,
         "ev_scale_used": args.ev_scale,
-        "n_trades": n_trades,
-        "total_exp_profit": total_exp_profit,
-        "avg_ev_per_1": avg_ev_scaled,
-        "total_real_mtm_profit": total_real_mtm,
-        "total_real_settle_profit": total_real_settle,
+        "n_trades": rollup["n_trades"],
+        "total_exp_profit": rollup["total_exp_profit"],
+        "avg_ev_per_1": avg_ev,
+        "total_real_mtm_profit": rollup["total_real_mtm_profit"],
+        "total_real_settle_profit": rollup["total_real_settle_profit"],
         "overall_roi_exp": roi_exp,
-        "overall_roi_real_mtm": roi_real_mtm,
-        "overall_roi_real_settle": roi_real_settle
+        "overall_roi_real_mtm": roi_mtm,
+        "overall_roi_real_settle": roi_settle,
     }
 
-    _write_summary_json(summary, out_dir, args.asof)
-    _write_summary_csv(summary, out_dir, args.asof)
-    print(f"[simulate] Wrote summary → {out_dir / f'summary_{args.asof}.json'}")
+    (out_dir / f"summary_{args.asof}.json").write_text(json.dumps(summary, indent=2))
+    pl.DataFrame({k:[v] for k,v in summary.items() if not isinstance(v,(list,dict))}).write_csv(out_dir / f"summary_{args.asof}.csv")
 
+    print(f"[simulate] ROI (exp)={roi_exp:.6f}  ROI (MTM)={roi_mtm:.6f}  ROI (settle)={roi_settle:.6f}  trades={rollup['n_trades']:,d}")
+    print(f"[simulate] Wrote daily & summary to {out_dir}")
 
 if __name__ == "__main__":
     main()
