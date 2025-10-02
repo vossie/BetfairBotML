@@ -1,35 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Memory-safe trainer for price trend (dp = ltp(t+H) - ltp(t)).
-
-Key features to avoid OOM:
-- Per-day streaming feature build (no giant in-memory concat).
-- Optional downsample of snapshot grid (e.g., keep every 10s).
-- Optional sampling and row cap for train/valid.
-- Float32 everywhere.
-- GPU: QuantileDMatrix for hist device; CPU: standard DMatrix.
-
-Polars >=1.33; XGBoost >=2.x recommended.
-"""
 
 from __future__ import annotations
 import argparse
 import glob
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 
 import polars as pl
+import numpy as np
 
 try:
     import xgboost as xgb
 except Exception:
     xgb = None
 
-# --------------- CLI ---------------
+# ---------------- CLI ----------------
 def parse_args():
-    p = argparse.ArgumentParser("train_price_trend (memory-safe)")
+    p = argparse.ArgumentParser("train_price_trend (inf-safe, memory-safe)")
     p.add_argument("--curated", required=True)
     p.add_argument("--asof", required=True)
     p.add_argument("--start-date", required=True)
@@ -38,27 +27,27 @@ def parse_args():
     p.add_argument("--horizon-secs", type=int, default=120)
     p.add_argument("--preoff-max", type=int, default=30)
     p.add_argument("--commission", type=float, default=0.02)
-    p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    p.add_argument("--device", choices=["cuda","cpu"], default="cuda")
     p.add_argument("--output-dir", default="/opt/BetfairBotML/train_price_trend/output")
-    p.add_argument("--country-facet", action="store_true", help="include countryCode")
+    p.add_argument("--country-facet", action="store_true")
 
-    # NEW: memory/runtime control
-    p.add_argument("--downsample-secs", type=int, default=0,
-                   help="Downsample snapshots: keep >= this step (0=off, e.g., 10 keeps 10s grid).")
-    p.add_argument("--sample-frac", type=float, default=1.0, help="Random sample fraction for training (0<frac<=1).")
-    p.add_argument("--max-train-rows", type=int, default=0, help="Hard cap on train rows (0=off).")
-    p.add_argument("--max-valid-rows", type=int, default=250_000, help="Hard cap on valid rows.")
+    # memory/runtime controls
+    p.add_argument("--downsample-secs", type=int, default=0, help="keep one row each N seconds (0=off)")
+    p.add_argument("--sample-frac", type=float, default=1.0, help="random sample fraction for training (<=1)")
+    p.add_argument("--max-train-rows", type=int, default=0, help="cap train rows (0=off)")
+    p.add_argument("--max-valid-rows", type=int, default=250_000, help="cap valid rows")
     return p.parse_args()
 
-# --------------- schema helpers ---------------
+# ---------------- schema helpers ----------------
 def load_schema(kind: str) -> list[str]:
+    # Try project-provided loader if present
     try:
         from ml.schema_loader import load_schema as _load
         return _load(kind)
     except Exception:
         if kind == "orderbook":
-            return ["sport","marketId","selectionId","publishTimeMs","ltp","ltpTick",
-                    "tradedVolume","spreadTicks","imbalanceBest1"]
+            return ["sport","marketId","selectionId","publishTimeMs",
+                    "ltp","ltpTick","tradedVolume","spreadTicks","imbalanceBest1"]
         if kind == "marketdef":
             return ["sport","marketId","marketStartMs","countryCode"]
         return []
@@ -67,7 +56,7 @@ def intersect_existing(requested: list[str], have: list[str]) -> list[str]:
     hs = set(have)
     return [c for c in requested if c in hs]
 
-# --------------- dates/paths ---------------
+# ---------------- dates/paths ----------------
 def daterange(start: str, end: str) -> list[str]:
     sd = datetime.strptime(start, "%Y-%m-%d").date()
     ed = datetime.strptime(end, "%Y-%m-%d").date()
@@ -79,8 +68,8 @@ def curated_dirs(root: str, sport: str, date: str) -> Tuple[Path,Path]:
     ddir = base / "market_definitions"      / f"sport={sport}" / f"date={date}"
     return sdir, ddir
 
-def list_parquets(dirpath: Path) -> list[str]:
-    return sorted(glob.glob(str(dirpath / "*.parquet")))
+def list_parquets(p: Path) -> list[str]:
+    return sorted(glob.glob(str(p / "*.parquet")))
 
 def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
     try:
@@ -88,13 +77,12 @@ def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
     except TypeError:
         return lf.collect(streaming=True)
 
-# --------------- IO per day ---------------
+# ---------------- IO per day ----------------
 def read_day(curated: str, sport: str, date: str) -> tuple[pl.DataFrame, pl.DataFrame]:
     want_order = load_schema("orderbook")
     want_defs  = load_schema("marketdef")
     sdir, ddir = curated_dirs(curated, sport, date)
 
-    # snapshots
     snaps = pl.DataFrame({})
     sfiles = list_parquets(sdir)
     if sfiles:
@@ -104,7 +92,6 @@ def read_day(curated: str, sport: str, date: str) -> tuple[pl.DataFrame, pl.Data
         if cols:
             snaps = collect_streaming(lf.select([pl.col(c) for c in cols]))
 
-    # market defs
     defs = pl.DataFrame({})
     dfiles = list_parquets(ddir)
     if dfiles:
@@ -113,18 +100,23 @@ def read_day(curated: str, sport: str, date: str) -> tuple[pl.DataFrame, pl.Data
         cols = intersect_existing(want_defs, have)
         if cols:
             defs = collect_streaming(lf.select([pl.col(c) for c in cols]))
+
     if "marketStartMs" not in defs.columns:
         defs = defs.with_columns(pl.lit(None).alias("marketStartMs"))
     if "countryCode" not in defs.columns:
         defs = defs.with_columns(pl.lit("UNK").alias("countryCode"))
     return snaps, defs
 
-# --------------- features ---------------
+# ---------------- feature utils ----------------
+def _safe_ret(num: pl.Expr, den: pl.Expr) -> pl.Expr:
+    # return (num/den) - 1, but 0 if den<=0 or null; avoids inf
+    return pl.when((den.is_not_null()) & (den > 0)).then((num / den) - 1.0).otherwise(0.0)
+
 def build_features(df: pl.DataFrame, defs: pl.DataFrame,
                    preoff_max_m: int, horizon_s: int,
-                   include_country: bool,
-                   downsample_secs: int) -> pl.DataFrame:
-    if df.is_empty(): return df
+                   include_country: bool, downsample_secs: int) -> pl.DataFrame:
+    if df.is_empty():
+        return df
 
     out = (
         df.join(defs, on=["sport","marketId"], how="left")
@@ -137,13 +129,14 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame,
           .sort(["marketId","selectionId","publishTimeMs"])
     )
 
-    # optional downsample: keep rows near a coarser grid
+    # Optional downsample to reduce rows (keep every N seconds)
     if downsample_secs and downsample_secs > 0:
-        step = max(1, int(round(downsample_secs / 5)))
+        step = max(1, int(round(downsample_secs / 5)))  # base grid is 5s
         out = out.with_columns(((pl.col("publishTimeMs") // 5000) % step).alias("__mod"))
-        out = out.filter(pl.col("__mod")==0).drop("__mod")
+        out = out.filter(pl.col("__mod") == 0).drop("__mod")
 
     grp = ["marketId","selectionId"]
+
     out = out.with_columns([
         pl.col("ltp_f").diff().over(grp).alias("ltp_diff_5s"),
         pl.col("vol_f").diff().over(grp).alias("vol_diff_5s"),
@@ -157,9 +150,9 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame,
         (pl.col("ltp_f") - pl.col("ltp_lag30s")).alias("ltp_mom_30s"),
         (pl.col("ltp_f") - pl.col("ltp_lag60s")).alias("ltp_mom_60s"),
         (pl.col("ltp_f") - pl.col("ltp_lag120s")).alias("ltp_mom_120s"),
-        ((pl.col("ltp_f") / pl.col("ltp_lag30s")) - 1.0).alias("ltp_ret_30s"),
-        ((pl.col("ltp_f") / pl.col("ltp_lag60s")) - 1.0).alias("ltp_ret_60s"),
-        ((pl.col("ltp_f") / pl.col("ltp_lag120s")) - 1.0).alias("ltp_ret_120s"),
+        _safe_ret(pl.col("ltp_f"), pl.col("ltp_lag30s")).alias("ltp_ret_30s"),
+        _safe_ret(pl.col("ltp_f"), pl.col("ltp_lag60s")).alias("ltp_ret_60s"),
+        _safe_ret(pl.col("ltp_f"), pl.col("ltp_lag120s")).alias("ltp_ret_120s"),
         (pl.col("publishTimeMs") + horizon_s * 1000).alias("ts_exit_ms"),
     ])
 
@@ -171,7 +164,7 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame,
     out = out.with_columns([(pl.col("ltp_future") - pl.col("ltp_f")).alias("dp_target")])
     out = out.filter(pl.col("dp_target").is_not_null())
 
-    # keep only needed columns for XGB
+    # Select columns used by model
     keep = [
         "marketId","selectionId","publishTimeMs","marketStartMs","countryCode",
         "ltp_f","vol_f","ltp_diff_5s","vol_diff_5s",
@@ -182,13 +175,12 @@ def build_features(df: pl.DataFrame, defs: pl.DataFrame,
         "mins_to_off","ltp_future","dp_target"
     ]
     present = [c for c in keep if c in out.columns]
-    out = out.select(present)
-    return out
+    return out.select(present)
 
-# --------------- prep sets (bounded) ---------------
+# ---------------- dataset assembly ----------------
 def prepare_sets(args):
-    ad = datetime.strptime(args.asof, "%Y-%m-%d").date()
-    vstart = (ad - timedelta(days=args.valid_days - 1))
+    asof_d = datetime.strptime(args.asof, "%Y-%m-%d").date()
+    vstart = (asof_d - timedelta(days=args.valid_days - 1))
     train_end = (vstart - timedelta(days=1))
     tr_dates = daterange(args.start_date, train_end.strftime("%Y-%m-%d"))
     va_dates = daterange(vstart.strftime("%Y-%m-%d"), args.asof)
@@ -199,7 +191,8 @@ def prepare_sets(args):
         for d in dates:
             snaps, defs = read_day(args.curated, args.sport, d)
             if snaps.is_empty():
-                missing.append(d); continue
+                missing.append(d)
+                continue
             feat = build_features(snaps, defs, args.preoff_max, args.horizon_secs,
                                   args.country_facet, args.downsample_secs)
             if not feat.is_empty():
@@ -208,9 +201,8 @@ def prepare_sets(args):
             print(f"[{label}] skipped {len(missing)} empty day(s): {', '.join(missing[:6])}{' …' if len(missing)>6 else ''}")
         if not parts:
             return pl.DataFrame({})
-        # vertical concat in streaming engine
         try:
-            df = pl.concat(parts, how="vertical_relaxed").collect(engine="streaming")  # if parts are LazyFrames
+            df = pl.concat(parts, how="vertical_relaxed").collect(engine="streaming")
         except Exception:
             df = pl.concat(parts, how="vertical_relaxed")
         return df
@@ -218,16 +210,14 @@ def prepare_sets(args):
     df_tr = collect_dates(tr_dates, "TRAIN")
     df_va = collect_dates(va_dates, "VALID")
 
-    # sampling / caps
+    # sample/cap
     if not df_tr.is_empty():
         if args.sample_frac < 1.0:
             df_tr = df_tr.sample(frac=args.sample_frac, with_replacement=False, shuffle=True, seed=42)
         if args.max_train_rows and df_tr.height > args.max_train_rows:
             df_tr = df_tr.sample(n=args.max_train_rows, with_replacement=False, shuffle=True, seed=42)
-
-    if not df_va.is_empty():
-        if args.max_valid_rows and df_va.height > args.max_valid_rows:
-            df_va = df_va.sample(n=args.max_valid_rows, with_replacement=False, shuffle=True, seed=42)
+    if not df_va.is_empty() and args.max_valid_rows and df_va.height > args.max_valid_rows:
+        df_va = df_va.sample(n=args.max_valid_rows, with_replacement=False, shuffle=True, seed=42)
 
     if not df_tr.is_empty() and not df_va.is_empty():
         print(f"[trend] TRAIN: {tr_dates[0]} .. {tr_dates[-1]}")
@@ -235,14 +225,23 @@ def prepare_sets(args):
 
     return df_tr, df_va
 
-# --------------- XGB ---------------
-def to_pandas_float32(df: pl.DataFrame, cols: list[str]):
-    pdf = df.select(cols).to_pandas()
+# ---------------- XGB helpers ----------------
+def to_float32_pandas(df: pl.DataFrame, cols: list[str]):
+    pdf = df.select(cols).to_pandas(copy=True)
+    # Replace ±inf with NaN; XGBoost will treat NaN as missing
     for c in pdf.columns:
-        if pdf[c].dtype == "float64":
+        col = pdf[c].to_numpy(copy=False)
+        # Convert to float32
+        if np.issubdtype(col.dtype, np.floating):
+            pass
+        else:
             pdf[c] = pdf[c].astype("float32")
-        elif str(pdf[c].dtype).startswith("int"):
-            pdf[c] = pdf[c].astype("float32")
+            col = pdf[c].to_numpy(copy=False)
+        # sanitize infs
+        m_inf = ~np.isfinite(col)
+        if m_inf.any():
+            col[m_inf] = np.nan
+        # Write back (already in place)
     return pdf
 
 def fit_xgb(df_tr: pl.DataFrame, device: str):
@@ -251,9 +250,11 @@ def fit_xgb(df_tr: pl.DataFrame, device: str):
 
     drop = {"marketId","selectionId","publishTimeMs","marketStartMs","countryCode","ltp_future","dp_target"}
     feats = [c for c in df_tr.columns if c not in drop]
-
-    X32 = to_pandas_float32(df_tr, feats)
+    X32 = to_float32_pandas(df_tr, feats)
     y32 = df_tr["dp_target"].to_pandas().astype("float32")
+    # Make sure target has no inf
+    y_arr = y32.to_numpy()
+    y_arr[~np.isfinite(y_arr)] = np.nan
 
     params = {
         "max_depth": 6,
@@ -266,19 +267,18 @@ def fit_xgb(df_tr: pl.DataFrame, device: str):
         "objective": "reg:squarederror",
         "tree_method": "hist",
     }
+
     booster = None
     if device == "cuda":
         params["device"] = "cuda"
-        # QuantileDMatrix -> memory efficient for GPU
         try:
-            dtrain = xgb.QuantileDMatrix(X32, label=y32)
+            dtrain = xgb.QuantileDMatrix(X32, label=y_arr, missing=np.nan)
             booster = xgb.train(params, dtrain, num_boost_round=300)
         except Exception:
-            # fallback
-            dtrain = xgb.DMatrix(X32, label=y32)
+            dtrain = xgb.DMatrix(X32, label=y_arr, missing=np.nan)
             booster = xgb.train(params, dtrain, num_boost_round=300)
     else:
-        dtrain = xgb.DMatrix(X32, label=y32)
+        dtrain = xgb.DMatrix(X32, label=y_arr, missing=np.nan)
         booster = xgb.train(params, dtrain, num_boost_round=250)
 
     return booster, feats
@@ -287,17 +287,18 @@ def eval_xgb(booster, feats: list[str], df_va: pl.DataFrame):
     if booster is None or df_va.is_empty():
         return 0.0, 0.0
     take = [c for c in feats if c in df_va.columns]
-    Xv32 = to_pandas_float32(df_va, take)
+    Xv32 = to_float32_pandas(df_va, take)
     try:
-        dv = xgb.QuantileDMatrix(Xv32) if booster.attributes().get("device","") == "cuda" else xgb.DMatrix(Xv32)
+        # device attribute not guaranteed; just try Quantile then fallback
+        dv = xgb.QuantileDMatrix(Xv32, missing=np.nan)
     except Exception:
-        dv = xgb.DMatrix(Xv32)
+        dv = xgb.DMatrix(Xv32, missing=np.nan)
     preds = booster.predict(dv)
     if len(preds) == 0:
         return 0.0, 0.0
-    return float(preds.mean()), float((preds > 0).mean())
+    return float(np.nanmean(preds)), float(np.mean(preds > 0))
 
-# --------------- main ---------------
+# ---------------- main ----------------
 def main():
     args = parse_args()
 
