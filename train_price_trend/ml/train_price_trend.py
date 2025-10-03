@@ -227,13 +227,15 @@ def prepare_sets(args):
 
 # ---------------- XGB helpers ----------------
 def to_float32_pandas(df: pl.DataFrame, cols: list[str]):
-    pdf = df.select(cols).to_pandas(copy=True)
+    # NOTE: older Polars doesn't accept copy= kw
+    pdf = df.select(cols).to_pandas()
     # Replace ±inf with NaN; XGBoost will treat NaN as missing
     for c in pdf.columns:
         col = pdf[c].to_numpy(copy=False)
         # Convert to float32
         if np.issubdtype(col.dtype, np.floating):
-            pass
+            pdf[c] = pdf[c].astype("float32", copy=False)
+            col = pdf[c].to_numpy(copy=False)
         else:
             pdf[c] = pdf[c].astype("float32")
             col = pdf[c].to_numpy(copy=False)
@@ -241,7 +243,6 @@ def to_float32_pandas(df: pl.DataFrame, cols: list[str]):
         m_inf = ~np.isfinite(col)
         if m_inf.any():
             col[m_inf] = np.nan
-        # Write back (already in place)
     return pdf
 
 def fit_xgb(df_tr: pl.DataFrame, device: str):
@@ -252,7 +253,6 @@ def fit_xgb(df_tr: pl.DataFrame, device: str):
     feats = [c for c in df_tr.columns if c not in drop]
     X32 = to_float32_pandas(df_tr, feats)
     y32 = df_tr["dp_target"].to_pandas().astype("float32")
-    # Make sure target has no inf
     y_arr = y32.to_numpy()
     y_arr[~np.isfinite(y_arr)] = np.nan
 
@@ -289,7 +289,6 @@ def eval_xgb(booster, feats: list[str], df_va: pl.DataFrame):
     take = [c for c in feats if c in df_va.columns]
     Xv32 = to_float32_pandas(df_va, take)
     try:
-        # device attribute not guaranteed; just try Quantile then fallback
         dv = xgb.QuantileDMatrix(Xv32, missing=np.nan)
     except Exception:
         dv = xgb.DMatrix(Xv32, missing=np.nan)
