@@ -212,7 +212,7 @@ def predict_dp(df: pl.DataFrame, models_dir: str) -> pl.Series:
     return pl.Series(dp[:df.height], dtype=pl.Float64)
 
 def dp_to_ev(dp: pl.Series, ev_scale: float, ev_cap: float) -> pl.Series:
-    return (dp.clip(min=-ev_cap, max=ev_cap) * ev_scale).cast(pl.Float64)
+    return (dp.clip(lower=-ev_cap, upper=ev_cap) * ev_scale).cast(pl.Float64)
 
 # ---------- liquidity ----------
 def level1_size(row, side: str) -> float:
@@ -240,7 +240,7 @@ def size_basket(df: pl.DataFrame, sizing: str, budget: float, kelly: bool,
     if df.is_empty(): return df
     if kelly:
         # naive Kelly using EV as an edge proxy; capped/floored
-        k_frac = (pl.col("ev_per_1").clip(min=-cap, max=cap)).clip(min=floor, max=cap)
+        k_frac = (pl.col("ev_per_1").clip(lower=-cap, upper=cap)).clip(min=floor, max=cap)
         return df.with_columns((k_frac * bankroll).alias("stake_target"))
     if sizing == "equal_stake":
         return df.with_columns((pl.lit(budget) / pl.len()).over("marketId").alias("stake_target"))
