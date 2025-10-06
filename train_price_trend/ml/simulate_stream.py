@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-simulate_stream.py — lightweight, streaming backtester for the price-trend model.
+simulate_stream.py — streaming backtester scaffold for price-trend model.
 
-Key points:
-- Single scan_parquet(glob) per day; no per-file loops.
-- Streaming collect to avoid RAM spikes.
+Fixes:
+- Join market definitions over a DATE RANGE (not same-day) to get marketStartMs.
+- Streaming single-scan parquet IO (no per-file loops).
 - Version-safe EV clamping (no Expr.clip).
-- Verbose progress logging; optional caps for files/rows.
+- Defensive knobs for IO/rows/threads.
 
-This version intentionally focuses on robustness/perf of IO. It doesn’t
-simulate order book microstructure; it estimates EV from a proxy dp signal.
-Integrate with your full trade fill logic later once loading is stable.
+This file intentionally focuses on robust IO + pre-off filtering. Plug your full
+fill/portfolio logic on top once loading is stable.
 """
 
 from __future__ import annotations
@@ -23,60 +22,104 @@ import glob
 import polars as pl
 
 # -------------------------
-# Helpers
+# Small utilities
 # -------------------------
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
+def parse_date(s: str) -> datetime.date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+def date_iter(start: str, end: str):
+    sd, ed = parse_date(start), parse_date(end)
+    d = sd
+    while d <= ed:
+        yield d.isoformat()
+        d += timedelta(days=1)
+
 def clamp_to_ev(dp: pl.Expr, ev_scale: float, ev_cap: float) -> pl.Expr:
-    # Avoid .clip keyword differences across Polars versions
+    # No .clip(...) to avoid Polars keyword differences
     x = pl.when(dp > ev_cap).then(pl.lit(ev_cap)).otherwise(dp)
     x = pl.when(x < -ev_cap).then(pl.lit(-ev_cap)).otherwise(x)
     return (x * ev_scale).cast(pl.Float64)
 
-def date_list(start: str, end: str) -> list[str]:
-    sd = datetime.strptime(start, "%Y-%m-%d").date()
-    ed = datetime.strptime(end, "%Y-%m-%d").date()
-    return [(sd + timedelta(days=i)).isoformat() for i in range((ed - sd).days + 1)]
+def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
+    try:
+        return lf.collect(engine="streaming")
+    except TypeError:
+        return lf.collect(streaming=True)
 
-def scan_one_day(glob_path: str, columns: list[str], max_files: int | None) -> pl.LazyFrame | None:
-    # Count files quickly for logging and optional cap
+# -------------------------
+# Scanners
+# -------------------------
+
+def scan_obs_glob(glob_path: str, want_cols: list[str], max_files: int | None) -> pl.LazyFrame | None:
     files = sorted(glob.glob(glob_path))
     if not files:
         return None
-    if max_files is not None and len(files) > max_files:
+    if max_files is not None and max_files > 0 and len(files) > max_files:
         files = files[:max_files]
-    # Single lazy scan on either the full glob or the truncated list
-    lf = pl.scan_parquet(files if max_files else glob_path)
-    # Select only columns that exist
+    lf = pl.scan_parquet(files)
     have = lf.collect_schema().names()
-    take = [c for c in columns if c in have]
+    take = [c for c in want_cols if c in have]
     if not take:
         return None
     return lf.select([pl.col(c) for c in take])
 
-def add_basic_features(lf: pl.LazyFrame, preoff_max_min: int, horizon_secs: int, row_sample_secs: int | None) -> pl.LazyFrame:
-    # marketStartMs may be missing; mins_to_off will be null in that case and filtered out
-    lf = lf.with_columns([
-        ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000.0).alias("mins_to_off"),
-        pl.col("ltp").cast(pl.Float32).alias("ltp_f"),
-        pl.col("tradedVolume").cast(pl.Float32).alias("vol_f"),
-    ]).filter(
-        pl.col("mins_to_off").is_not_null()
-        & (pl.col("mins_to_off") >= 0)
-        & (pl.col("mins_to_off") <= float(preoff_max_min))
-    ).sort(["marketId", "selectionId", "publishTimeMs"])
+def scan_defs_range(curated: str, sport: str, start_date: str, end_date: str) -> pl.LazyFrame | None:
+    """Scan market_definitions for [start_date .. end_date] and reduce to latest per marketId."""
+    base = Path(curated) / "market_definitions" / f"sport={sport}"
+    patterns = [str(base / f"date={d}" / "*.parquet") for d in date_iter(start_date, end_date)]
+    files = []
+    for pat in patterns:
+        files.extend(glob.glob(pat))
+    if not files:
+        return None
+    lf = pl.scan_parquet(files).select([
+        pl.col("marketId"),
+        pl.col("marketStartMs"),
+        pl.col("publishTimeMs").alias("__def_pub")
+    ])
+    # Reduce to latest definition per marketId (max publishTimeMs)
+    lf = (lf
+          .filter(pl.col("marketId").is_not_null())
+          .group_by("marketId")
+          .agg([
+              pl.col("marketStartMs").last().alias("marketStartMs"),  # if multiple rows same publish, last ok
+              pl.col("__def_pub").max().alias("__def_pub_max")
+          ])
+          .drop("__def_pub_max"))
+    return lf
 
-    # Optional uniform row sampling by time grid to reduce compute
+# -------------------------
+# Feature builder
+# -------------------------
+
+def add_basic_features(lf: pl.LazyFrame, preoff_max_min: int, horizon_secs: int, row_sample_secs: int | None) -> pl.LazyFrame:
+    # Sample down by time-grid if requested (base grid = 5s)
     if row_sample_secs and row_sample_secs > 0:
-        step = max(1, int(round(row_sample_secs / 5)))  # base grid=5s
+        step = max(1, int(round(row_sample_secs / 5)))
         lf = lf.with_columns(((pl.col("publishTimeMs") // 5000) % step).alias("__mod")).filter(pl.col("__mod") == 0).drop("__mod")
+
+    # Pre-off mins and sorting
+    lf = (lf
+          .with_columns([
+              ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000.0).alias("mins_to_off"),
+              pl.col("ltp").cast(pl.Float32).alias("ltp_f"),
+              pl.col("tradedVolume").cast(pl.Float32).alias("vol_f")
+          ])
+          .filter(
+              pl.col("marketStartMs").is_not_null()
+              & (pl.col("mins_to_off") >= 0)
+              & (pl.col("mins_to_off") <= float(preoff_max_min))
+          )
+          .sort(["marketId", "selectionId", "publishTimeMs"])
+          )
 
     grp = ["marketId", "selectionId"]
     steps = max(1, int(round(horizon_secs / 5)))
 
-    # Add deltas/momentum and proxy dp (future - now)
     lf = lf.with_columns([
         pl.col("ltp_f").diff().over(grp).alias("ltp_diff_5s"),
         pl.col("vol_f").diff().over(grp).alias("vol_diff_5s"),
@@ -95,26 +138,25 @@ def add_basic_features(lf: pl.LazyFrame, preoff_max_min: int, horizon_secs: int,
         (pl.col("ltp_future") - pl.col("ltp_f")).alias("__dp")
     ])
 
-    # Keep a compact set to collect
     keep = [
-        "marketId","selectionId","publishTimeMs","marketStartMs",
+        "marketId","selectionId","publishTimeMs","marketStartMs","mins_to_off",
         "ltp_f","vol_f",
         "ltp_diff_5s","vol_diff_5s",
         "ltp_lag30s","ltp_lag60s","ltp_lag120s",
         "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
         "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
-        "mins_to_off","ltp_future","__dp"
+        "ltp_future","__dp"
     ]
-    have2 = lf.collect_schema().names()
-    take2 = [c for c in keep if c in have2]
-    return lf.select([pl.col(c) for c in take2])
+    have = lf.collect_schema().names()
+    take = [c for c in keep if c in have]
+    return lf.select([pl.col(c) for c in take])
 
 # -------------------------
 # Main
 # -------------------------
 
 def main():
-    ap = argparse.ArgumentParser("simulate_stream (pre-off, streaming)")
+    ap = argparse.ArgumentParser("simulate_stream (pre-off, streaming, defs-range)")
     ap.add_argument("--curated", required=True)
     ap.add_argument("--asof", required=True)
     ap.add_argument("--start-date", required=True)
@@ -129,10 +171,15 @@ def main():
 
     ap.add_argument("--output-dir", required=True)
 
-    # Perf/control knobs
-    ap.add_argument("--max-files-per-day", type=int, default=0, help="cap number of parquet files read per day (0=off)")
-    ap.add_argument("--row-sample-secs", type=int, default=0, help="downsample rows by keeping 1 per N seconds (0=off)")
+    # IO/perf knobs
+    ap.add_argument("--max-files-per-day", type=int, default=0, help="cap #parquet files for snapshots per day (0=off)")
+    ap.add_argument("--row-sample-secs", type=int, default=0, help="downsample rows by time (0=off)")
     ap.add_argument("--polars-max-threads", type=int, default=0, help="override POLARS_MAX_THREADS (0=leave)")
+
+    # NEW: definition scan control
+    ap.add_argument("--defs-days-back", type=int, default=21, help="scan market_definitions this many days BEFORE start-date")
+    ap.add_argument("--defs-days-forward", type=int, default=7, help="scan market_definitions this many days AFTER asof")
+    ap.add_argument("--allow-missing-defs", action="store_true", help="if no defs found, skip pre-off filter (dangerous but useful for debugging)")
 
     args = ap.parse_args()
 
@@ -142,74 +189,83 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    asof_d = datetime.strptime(args.asof, "%Y-%m-%d").date()
-    days = date_list(args.start_date, args.asof)[-args.valid_days:]
+    # Build the list of validation days
+    asof_d = parse_date(args.asof)
+    all_days = list(date_iter(args.start_date, args.asof))
+    days = all_days[-args.valid_days:]
 
-    # What columns we will try to read
-    base_cols = [
-        "sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume"
-    ]
-    # defs columns are optional but help filtering to pre-off
-    def_cols = ["marketId","marketStartMs"]
+    # ---- pre-scan market definitions over a range ----
+    defs_start = (parse_date(args.start_date) - timedelta(days=args.defs_days_back)).isoformat()
+    defs_end   = (parse_date(args.asof) + timedelta(days=args.defs_days_forward)).isoformat()
+    log(f"[simulate] scanning definitions {defs_start} .. {defs_end}")
+    lf_defs = scan_defs_range(args.curated, args.sport, defs_start, defs_end)
 
+    # If defs absent but allowed → create stub with nulls (skip pre-off filter)
+    if lf_defs is None:
+        msg = "[simulate] WARNING: no market_definitions found in range."
+        if args.allow_missing_defs:
+            log(msg + " allow-missing-defs=on → proceeding WITHOUT pre-off filter.")
+        else:
+            log(msg + " Try increasing --defs-days-back/forward or pass --allow-missing-defs.")
+            return
+
+    # ---- process each day ----
+    base_cols = ["sport","marketId","selectionId","publishTimeMs","ltp","tradedVolume"]
     total_days = 0
-    ev_acc = []
+    mean_evs = []
 
     for day in days:
         ob_dir = Path(args.curated) / "orderbook_snapshots_5s" / f"sport={args.sport}" / f"date={day}"
-        md_dir = Path(args.curated) / "market_definitions"      / f"sport={args.sport}" / f"date={day}"
         ob_glob = str(ob_dir / "*.parquet")
-        md_glob = str(md_dir / "*.parquet")
+        n_files = len(glob.glob(ob_glob))
+        log(f"[simulate] {day} … files={n_files} (cap={args.max_files_per_day or '∞'})")
 
-        files = sorted(glob.glob(ob_glob))
-        log(f"[simulate] {day} … files={len(files)} (cap={args.max_files_per_day or '∞'})")
-
-        lf_obs = scan_one_day(ob_glob, base_cols, args.max_files_per_day if args.max_files_per_day>0 else None)
+        lf_obs = scan_obs_glob(ob_glob, base_cols, args.max_files_per_day if args.max_files_per_day>0 else None)
         if lf_obs is None:
             log(f"[simulate] {day} … no snapshots; skipping")
             continue
 
-        # defs are optional; if present we’ll join to get marketStartMs
-        lf_defs = scan_one_day(md_glob, def_cols, None)
+        # Join with definitions (if available)
         if lf_defs is not None:
             lf = lf_obs.join(lf_defs, on="marketId", how="left")
         else:
-            # if no defs, create a null start time to preserve schema
             lf = lf_obs.with_columns(pl.lit(None).alias("marketStartMs"))
 
-        # Feature add
+        # Features + filter
         lf = add_basic_features(lf, args.preoff_max, args.horizon_secs, args.row_sample_secs)
 
-        # Collect streaming (fallback for older Polars)
-        try:
-            df = lf.collect(engine="streaming")
-        except TypeError:
-            df = lf.collect(streaming=True)
+        # If defs missing and not allowed, skip days with null start time
+        if lf_defs is None and not args.allow_missing_defs:
+            log(f"[simulate] {day} … defs missing and allow-missing-defs=off → skipped")
+            continue
 
-        n_rows = df.height
-        if n_rows == 0:
+        # Collect (streaming)
+        df = collect_streaming(lf)
+        if df.height == 0:
             log(f"[simulate] {day} … 0 rows post-filter; skipping")
             continue
 
-        # EV from __dp (proxy)
+        # EV proxy
         df = df.with_columns(clamp_to_ev(pl.col("__dp"), args.ev_scale, args.ev_cap).alias("ev_per_1"))
         avg_ev = float(df["ev_per_1"].mean())
-        ev_acc.append(avg_ev)
+        mean_evs.append(avg_ev)
 
-        # Write a compact per-day parquet to allow further analysis
+        # Persist compact daily slice
         out_file = out_dir / f"sim_{day}.parquet"
         df.select([
-            "marketId","selectionId","publishTimeMs","mins_to_off","ltp_f","vol_f",
-            "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s","ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
+            "marketId","selectionId","publishTimeMs","marketStartMs","mins_to_off",
+            "ltp_f","vol_f",
+            "ltp_mom_30s","ltp_mom_60s","ltp_mom_120s",
+            "ltp_ret_30s","ltp_ret_60s","ltp_ret_120s",
             "ltp_future","__dp","ev_per_1"
         ]).write_parquet(out_file)
 
-        log(f"[simulate] {day} … rows={n_rows:,}  avg_ev/£1={avg_ev:.6f}  → {out_file.name}")
+        log(f"[simulate] {day} … rows={df.height:,}  avg_ev/£1={avg_ev:.6f} → {out_file.name}")
         total_days += 1
 
     log(f"[simulate] Completed {total_days} day(s).")
-    if ev_acc:
-        log(f"[simulate] Mean EV/£1 over days = {sum(ev_acc)/len(ev_acc):.6f}")
+    if mean_evs:
+        log(f"[simulate] Mean EV/£1 over days = {sum(mean_evs)/len(mean_evs):.6f}")
 
 
 if __name__ == "__main__":
