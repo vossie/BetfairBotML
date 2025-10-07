@@ -19,26 +19,35 @@ def date_iter(start: str, end: str):
         yield d.isoformat()
         d += timedelta(days=1)
 
-def clamp_to_ev(dp: pl.Expr, ev_scale: float, ev_cap: float) -> pl.Expr:
-    x = pl.when(dp > ev_cap).then(pl.lit(ev_cap)).otherwise(dp)
-    x = pl.when(x < -ev_cap).then(pl.lit(-ev_cap)).otherwise(x)
-    return (x * ev_scale).cast(pl.Float64)
-
 def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
     try:
         return lf.collect(engine="streaming")
     except TypeError:
+        # older Polars
         return lf.collect(streaming=True)
 
 def uniform_sample(seq: list[str], k: int) -> list[str]:
-    if k <= 0 or k >= len(seq): return seq
-    step = len(seq) / k
-    # spread picks across day; round to nearest indices
-    idxs = {min(len(seq)-1, int(round(i*step))) for i in range(k)}
-    # guard: ensure exactly k unique indices
+    if k <= 0 or k >= len(seq):
+        return seq
+    step = len(seq) / float(k)
+    # spread picks across day; ensure unique & within bounds
+    idxs = []
+    seen = set()
+    for i in range(k):
+        idx = int(round(i * step))
+        idx = max(0, min(len(seq) - 1, idx))
+        if idx not in seen:
+            idxs.append(idx)
+            seen.add(idx)
+    # if collisions reduced count, pad deterministically
+    j = 0
     while len(idxs) < k:
-        idxs.add(len(idxs))
-    return [seq[i] for i in sorted(idxs)]
+        cand = j % len(seq)
+        if cand not in seen:
+            idxs.append(cand); seen.add(cand)
+        j += 1
+    idxs.sort()
+    return [seq[i] for i in idxs]
 
 def scan_obs_glob(glob_path: str, want_cols: list[str], max_files: int | None, sample_mode: str) -> tuple[pl.LazyFrame | None, int]:
     files = sorted(glob.glob(glob_path))
@@ -50,7 +59,7 @@ def scan_obs_glob(glob_path: str, want_cols: list[str], max_files: int | None, s
             files = uniform_sample(files, max_files)
         elif sample_mode == "tail":
             files = files[-max_files:]
-        else:  # head
+        else:
             files = files[:max_files]
     lf = pl.scan_parquet(files)
     have = lf.collect_schema().names()
@@ -72,6 +81,7 @@ def scan_defs_range(curated: str, sport: str, start_date: str, end_date: str) ->
         pl.col("marketStartMs"),
         pl.col("publishTimeMs").alias("__def_pub")
     ]).filter(pl.col("marketId").is_not_null())
+    # reduce to latest info per marketId
     lf = (lf
           .group_by("marketId")
           .agg([
@@ -81,32 +91,29 @@ def scan_defs_range(curated: str, sport: str, start_date: str, end_date: str) ->
           .drop("__def_pub_max"))
     return lf, len(files)
 
-def add_basic_features(
-    lf: pl.LazyFrame,
+def add_features_with_future(
+    lf_join: pl.LazyFrame,
     preoff_max_min: int,
     horizon_secs: int,
     row_sample_secs: int | None,
     apply_preoff_filter: bool
 ) -> pl.LazyFrame:
+    # Optional row sampling (every N seconds over 5s grid)
+    lf = lf_join
     if row_sample_secs and row_sample_secs > 0:
         step = max(1, int(round(row_sample_secs / 5)))
         lf = lf.with_columns(((pl.col("publishTimeMs") // 5000) % step).alias("__mod")).filter(pl.col("__mod") == 0).drop("__mod")
 
+    # Base numeric casts and mins_to_off (computed BEFORE pre-off filter)
     lf = lf.with_columns([
         pl.col("ltp").cast(pl.Float32).alias("ltp_f"),
         pl.col("tradedVolume").cast(pl.Float32).alias("vol_f"),
         ((pl.col("marketStartMs") - pl.col("publishTimeMs")) / 60000.0).alias("mins_to_off"),
     ])
 
-    if apply_preoff_filter:
-        lf = lf.filter(
-            pl.col("marketStartMs").is_not_null()
-            & (pl.col("mins_to_off") >= 0)
-            & (pl.col("mins_to_off") <= float(preoff_max_min))
-        )
-
+    # Compute lags/future on UNFILTERED stream
     grp = ["marketId", "selectionId"]
-    steps = max(1, int(round(horizon_secs / 5)))
+    steps = max(1, int(round(horizon_secs / 5)))  # 5-second snapshots
     lf = lf.sort(["marketId", "selectionId", "publishTimeMs"]).with_columns([
         pl.col("ltp_f").diff().over(grp).alias("ltp_diff_5s"),
         pl.col("vol_f").diff().over(grp).alias("vol_diff_5s"),
@@ -124,6 +131,17 @@ def add_basic_features(
         (pl.col("ltp_f").shift(-steps).over(grp) - pl.col("ltp_f")).alias("__dp"),
     ])
 
+    # Now apply pre-off filter on CURRENT timestamp (keep only rows with a future value)
+    if apply_preoff_filter:
+        lf = lf.filter(
+            (pl.col("marketStartMs").is_not_null()) &
+            (pl.col("__dp").is_not_null()) &
+            (pl.col("mins_to_off") >= 0) &
+            (pl.col("mins_to_off") <= float(preoff_max_min))
+        )
+    else:
+        lf = lf.filter(pl.col("__dp").is_not_null())
+
     keep = [
         "marketId","selectionId","publishTimeMs","marketStartMs","mins_to_off",
         "ltp_f","vol_f",
@@ -134,6 +152,12 @@ def add_basic_features(
     have = lf.collect_schema().names()
     take = [c for c in keep if c in have]
     return lf.select([pl.col(c) for c in take])
+
+def clamp_to_ev(dp: pl.Expr, ev_scale: float, ev_cap: float) -> pl.Expr:
+    # Replace .clip(min/max) with when/otherwise for compatibility across Polars versions.
+    x = pl.when(dp > ev_cap).then(pl.lit(ev_cap)).otherwise(dp)
+    x = pl.when(x < -ev_cap).then(pl.lit(-ev_cap)).otherwise(x)
+    return (x * ev_scale).cast(pl.Float64)
 
 def main():
     ap = argparse.ArgumentParser("simulate_stream (pre-off, streaming, defs-range + uniform sampling)")
@@ -151,8 +175,7 @@ def main():
 
     # IO/perf
     ap.add_argument("--max-files-per-day", type=int, default=0)
-    ap.add_argument("--file-sample-mode", choices=["uniform","head","tail"], default="uniform",
-                    help="how to pick files when capping per day (default uniform)")
+    ap.add_argument("--file-sample-mode", choices=["uniform","head","tail"], default="uniform")
     ap.add_argument("--row-sample-secs", type=int, default=0)
     ap.add_argument("--polars-max-threads", type=int, default=0)
 
@@ -160,7 +183,7 @@ def main():
     ap.add_argument("--defs-days-back", type=int, default=30)
     ap.add_argument("--defs-days-forward", type=int, default=7)
 
-    # fallback
+    # pre-off fallback
     ap.add_argument("--fallback-coverage-thresh", type=float, default=0.01)
     ap.add_argument("--force-skip-preoff", action="store_true")
 
@@ -188,9 +211,11 @@ def main():
     for day in days:
         ob_dir = Path(args.curated) / "orderbook_snapshots_5s" / f"sport={args.sport}" / f"date={day}"
         ob_glob = str(ob_dir / "*.parquet")
-        lf_obs, total_files = scan_obs_glob(ob_glob, base_cols,
-                                            args.max_files_per_day if args.max_files_per_day>0 else None,
-                                            args.file_sample_mode)
+        lf_obs, total_files = scan_obs_glob(
+            ob_glob, base_cols,
+            args.max_files_per_day if args.max_files_per_day>0 else None,
+            args.file_sample_mode
+        )
         cap = args.max_files_per_day or "∞"
         log(f"[simulate] {day} … files={total_files} (cap={cap}, mode={args.file_sample_mode})")
         if lf_obs is None:
@@ -199,7 +224,7 @@ def main():
 
         lf_join = lf_obs.join(lf_defs, on="marketId", how="left") if lf_defs is not None else lf_obs.with_columns(pl.lit(None).alias("marketStartMs"))
 
-        # coverage
+        # coverage log
         cov_lf = lf_join.select([pl.len().alias("__n"), pl.col("marketStartMs").is_not_null().sum().alias("__nn")])
         cov = collect_streaming(cov_lf).to_dict(as_series=False)
         n_total = int(cov["__n"][0]) if cov["__n"] else 0
@@ -209,12 +234,12 @@ def main():
 
         apply_preoff = (not args.force_skip_preoff) and (pct >= args.fallback_coverage_thresh)
         if not apply_preoff:
-            why = "force" if args.force_skip_preoff else f"coverage {pct:.2%} < {args.fallback_coverage_thrash:.2%}"
+            why = "force" if args.force_skip_preoff else f"coverage {pct:.2%} < {args.fallback_coverage_thresh:.2%}"
             log(f"[simulate] {day} pre-off filter: SKIPPED ({why})")
 
-        lf_feats = add_basic_features(lf_join, args.preoff_max, args.horizon_secs, args.row_sample_secs, apply_preoff)
+        lf_feats = add_features_with_future(lf_join, args.preoff_max, args.horizon_secs, args.row_sample_secs, apply_preoff)
 
-        # log pre-off window coverage
+        # log pre-off window coverage (after features but before ev calc)
         pre_stats = collect_streaming(
             lf_feats.select([
                 pl.len().alias("__all"),
@@ -230,8 +255,15 @@ def main():
             log(f"[simulate] {day} … 0 rows post-feature; skipping")
             continue
 
+        # Compute EV, drop nulls just in case
         df = df.with_columns(clamp_to_ev(pl.col("__dp"), args.ev_scale, args.ev_cap).alias("ev_per_1"))
-        avg_ev = float(df["ev_per_1"].mean())
+        df = df.filter(pl.col("ev_per_1").is_not_null())
+
+        if df.height == 0:
+            log(f"[simulate] {day} … 0 rows after EV computation; skipping")
+            continue
+
+        avg_ev = float(df["ev_per_1"].fill_null(0.0).mean())
         mean_evs.append(avg_ev)
 
         out_file = out_dir / f"sim_{day}.parquet"
