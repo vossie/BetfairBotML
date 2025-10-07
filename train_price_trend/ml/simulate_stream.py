@@ -310,10 +310,15 @@ def select_trades(
             return out
     # Per-market topK by EV
     out = (out
-           .with_columns(pl.row_number().over(["marketId"]).alias("__rk_ev"))
-           .sort(["marketId","ev_per_1"], descending=[False, True])
+           .sort(["marketId", "ev_per_1"], descending=[False, True])
+           .with_columns(pl.col("ev_per_1")
+                         .rank(method="dense", descending=True)
+                         .over("marketId")
+                         .alias("__rk_ev"))
            .filter(pl.col("__rk_ev") <= int(per_market_topk))
-           .drop("__rk_ev"))
+           .drop("__rk_ev")
+           )
+
     return out
 
 
