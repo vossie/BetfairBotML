@@ -145,21 +145,19 @@ SIM_ARGS=(
   --horizon-secs "$HORIZON_SECS"
   --preoff-max "$PREOFF_MAX"
   --commission "$COMMISSION"
-  --edge-thresh "$EDGE_THRESH"
-  --stake-mode "$STAKE"
-  --kelly-cap "$KELLY_CAP"
-  --kelly-floor "$KELLY_FLOOR"
-  --bankroll-nom "$BANKROLL_NOM"
-  --ev-mode "$EV_MODE"
-  --ev-scale "$EV_SCALE"
-  --min-fill-frac "$MIN_FILL_FRAC"
-  --per-market-topk "$PER_MARKET_TOPK"
-  --per-market-budget "$PER_MARKET_BUDGET"
-  --basket-sizing "$BASKET_SIZING"
-  --exit-on-move-ticks "$EXIT_ON_MOVE_TICKS"
-  --device "$SIM_DEVICE"
+  --ev-scale "${EV_SCALE:-1.0}"
   --output-dir "$OUTDIR/stream"
+  # Optional performance/sampling knobs (uncomment/set envs if you want)
+  # --max-files-per-day "${MAX_FILES_PER_DAY:-0}"
+  # --file-sample-mode "${FILE_SAMPLE_MODE:-uniform}"
+  # --row-sample-secs "${ROW_SAMPLE_SECS:-0}"
+  # --polars-max-threads "${POLARS_MAX_THREADS:-0}"
+  # --defs-days-back "${DEFS_DAYS_BACK:-30}"
+  # --defs-days-forward "${DEFS_DAYS_FORWARD:-7}"
+  # --fallback-coverage-thresh "${FALLBACK_COVERAGE_THRESH:-0.01}"
+  # --force-skip-preoff   # include only if you explicitly want to skip pre-off
 )
+
 
 # Optional odds band
 [[ -n "$ODDS_MIN" ]] && SIM_ARGS+=( --odds-min "$ODDS_MIN" )
