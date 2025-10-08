@@ -6,10 +6,15 @@ set -euo pipefail
 #   export CURATED_ROOT=/mnt/nvme/betfair-curated
 #   ./train_price_trend/bin/run_daily_trend.sh 2025-10-07  # ASOF (YYYY-MM-DD)
 #
-# Optional env overrides (sensible defaults):
-#   START_DAYS_BACK=31 VALID_DAYS=7 SPORT=horse-racing PREOFF_MAX=30 COMMISSION=0.02
-#   MIN_TRADES=5000 MAX_TRADES=250000  ROI_TARGET_MIN=0.0
-#   GRIDS tuned below; override any *_GRID var to adjust search.
+# Behavior:
+#   - Cleans previous results for the SAME ASOF/TAG before running (configurable).
+#   - Trains model, runs a constrained trading sweep ranked by realised ROI (MTM),
+#     enforces guardrails, then re-runs the winner to confirm.
+#
+# Cleanup controls:
+#   CLEAN_MODE=auto   # (default) auto-delete previous sweep/confirm dirs for this ASOF/TAG
+#   CLEAN_MODE=prompt # ask before delete
+#   CLEAN_MODE=skip   # never delete; may mix old/new results (not recommended for same-day reruns)
 
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ML_DIR="$BASE_DIR/ml"
@@ -18,20 +23,84 @@ OUT_BASE="$BASE_DIR/output/stream"
 ASOF="${1:?Pass ASOF date, e.g. 2025-10-07}"
 : "${CURATED_ROOT:?Please export CURATED_ROOT (e.g. /mnt/nvme/betfair-curated)}"
 
+# ---------------- Defaults you can override via env ----------------
 START_DAYS_BACK="${START_DAYS_BACK:-31}"
+VALID_DAYS="${VALID_DAYS:-7}"
+SPORT="${SPORT:-horse-racing}"
+PREOFF_MAX="${PREOFF_MAX:-30}"
+COMMISSION="${COMMISSION:-0.02}"
+SIM_DEVICE="${SIM_DEVICE:-cpu}"
+TAG="${TAG:-auto}"
+
+# Sweep grids (realistic constraints; override as needed)
+EDGE_THRESH_GRID="${EDGE_THRESH_GRID:-0.00015,0.00025,0.00035,0.0005,0.0008,0.0012}"
+EV_SCALE_GRID="${EV_SCALE_GRID:-0.03,0.05,0.08,0.12,0.2,0.3}"
+EV_CAP_GRID="${EV_CAP_GRID:-0.03,0.05}"
+STAKE_MODES_GRID="${STAKE_MODES_GRID:-flat,kelly}"
+ODDS_BANDS_GRID="${ODDS_BANDS_GRID:-1.5:5.0,2.2:3.6}"
+EXIT_TICKS_GRID="${EXIT_TICKS_GRID:-0,1,2}"
+TOPK_GRID="${TOPK_GRID:-1}"
+BUDGET_GRID="${BUDGET_GRID:-5,10}"
+LIQ_ENFORCE_GRID="${LIQ_ENFORCE_GRID:-1}"
+MIN_FILL_FRAC_GRID="${MIN_FILL_FRAC_GRID:-5.0}"
+
+# Guardrails
+MIN_TRADES="${MIN_TRADES:-5000}"
+MAX_TRADES="${MAX_TRADES:-250000}"
+ROI_TARGET_MIN="${ROI_TARGET_MIN:-0.0}"
+
+# Cleanup behavior
+CLEAN_MODE="${CLEAN_MODE:-auto}"   # auto | prompt | skip
+
+# ---------------- Derived dates/paths ----------------
 START_DATE="$(python3 - <<PY
 from datetime import datetime, timedelta
 asof=datetime.strptime("$ASOF","%Y-%m-%d").date()
 print((asof - timedelta(days=int("$START_DAYS_BACK"))).strftime("%Y-%m-%d"))
 PY
 )"
-VALID_DAYS="${VALID_DAYS:-7}"
-SPORT="${SPORT:-horse-racing}"
-PREOFF_MAX="${PREOFF_MAX:-30}"
-COMMISSION="${COMMISSION:-0.02}"
-SIM_DEVICE="${SIM_DEVICE:-cpu}"
 
-# --- Train latest model ---
+MODEL_PATH="$BASE_DIR/output/models/xgb_trend_reg.json"
+SWEEP_ROOT="$OUT_BASE/sweeps/$ASOF/$TAG"
+CONFIRM_OUT="$OUT_BASE/confirm_${ASOF}_${TAG}"
+
+# ---------------- Same-day cleanup (sweep + confirm) ----------------
+clean_dir() {
+  local path="$1"
+  case "$CLEAN_MODE" in
+    auto)
+      if [[ -d "$path" ]]; then
+        echo "[auto] Cleaning: $path"
+        rm -rf "$path"
+      fi
+      ;;
+    prompt)
+      if [[ -d "$path" ]]; then
+        read -p "[auto] Found existing '$path'. Delete and rerun? [y/N] " REPLY
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+          rm -rf "$path"
+        else
+          echo "[auto] Aborting to avoid mixing old/new results."
+          exit 1
+        fi
+      fi
+      ;;
+    skip)
+      echo "[auto] CLEAN_MODE=skip → not deleting existing '$path'. (May mix results.)"
+      ;;
+    *)
+      echo "[auto] Unknown CLEAN_MODE='$CLEAN_MODE' (use auto|prompt|skip)."
+      exit 1
+      ;;
+  esac
+}
+
+clean_dir "$SWEEP_ROOT"
+mkdir -p "$SWEEP_ROOT"
+clean_dir "$CONFIRM_OUT"
+mkdir -p "$CONFIRM_OUT"
+
+# ---------------- TRAIN ----------------
 echo "=== TRAIN ${ASOF} ==="
 python3 "$ML_DIR/train_price_trend.py" \
   --curated "$CURATED_ROOT" \
@@ -44,25 +113,7 @@ python3 "$ML_DIR/train_price_trend.py" \
   --device cuda \
   --ev-mode mtm
 
-MODEL_PATH="$BASE_DIR/output/models/xgb_trend_reg.json"
-
-# --- Constrained, realistic sweep (edge/odds/liquidity/exit + EV scaling & cap) ---
-TAG="${TAG:-auto}"
-EDGE_THRESH_GRID="${EDGE_THRESH_GRID:-0.00015,0.00025,0.00035,0.0005,0.0008,0.0012}"
-EV_SCALE_GRID="${EV_SCALE_GRID:-0.03,0.05,0.08,0.12,0.2,0.3}"
-EV_CAP_GRID="${EV_CAP_GRID:-0.03,0.05}"
-STAKE_MODES_GRID="${STAKE_MODES_GRID:-flat,kelly}"
-ODDS_BANDS_GRID="${ODDS_BANDS_GRID:-1.5:5.0,2.2:3.6}"
-EXIT_TICKS_GRID="${EXIT_TICKS_GRID:-0,1,2}"
-TOPK_GRID="${TOPK_GRID:-1}"
-BUDGET_GRID="${BUDGET_GRID:-5,10}"
-LIQ_ENFORCE_GRID="${LIQ_ENFORCE_GRID:-1}"
-MIN_FILL_FRAC_GRID="${MIN_FILL_FRAC_GRID:-5.0}"
-
-MIN_TRADES="${MIN_TRADES:-5000}"
-MAX_TRADES="${MAX_TRADES:-250000}"
-ROI_TARGET_MIN="${ROI_TARGET_MIN:-0.0}"
-
+# ---------------- SWEEP (realised ROI objective) ----------------
 echo "=== SWEEP (realised ROI) ==="
 python3 "$ML_DIR/sim_sweep.py" \
   --curated "$CURATED_ROOT" \
@@ -93,7 +144,6 @@ python3 "$ML_DIR/sim_sweep.py" \
   --min-fill-frac-grid "$MIN_FILL_FRAC_GRID" \
   --tag "$TAG"
 
-SWEEP_ROOT="$OUT_BASE/sweeps/$ASOF/$TAG"
 TRIALS="$SWEEP_ROOT/trials.csv"
 BEST="$SWEEP_ROOT/best_config.json"
 
@@ -103,11 +153,11 @@ if [[ ! -f "$BEST" ]]; then
 fi
 
 echo "=== BEST (pre-confirm) ==="
-cat "$BEST" | sed -e 's/^/  /'
+sed -e 's/^/  /' "$BEST"
 
-# --- Guardrails: enforce min/max trades & positive realised ROI ---
+# ---------------- Guardrails ----------------
 BEST_OK="$(python3 - <<PY
-import json,sys
+import json
 cfg=json.load(open("$BEST"))
 n=cfg.get("n_trades",0)
 roi=cfg.get("overall_roi_real_mtm", cfg.get("overall_roi", -1e9))
@@ -120,11 +170,8 @@ if [[ "$BEST_OK" != "YES" ]]; then
   exit 3
 fi
 
-# --- Confirmatory re-run on best config (same 7d) ---
+# ---------------- Confirmatory re-run on the winner ----------------
 echo "=== CONFIRM RUN ==="
-CONFIRM_OUT="$OUT_BASE/confirm_${ASOF}_${TAG}"
-mkdir -p "$CONFIRM_OUT"
-
 python3 "$ML_DIR/simulate_stream.py" \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF" --start-date "$START_DATE" --valid-days "$VALID_DAYS" \
@@ -144,6 +191,9 @@ python3 "$ML_DIR/simulate_stream.py" \
   --output-dir "$CONFIRM_OUT"
 
 echo "=== CONFIRM SUMMARY ==="
-cat "$CONFIRM_OUT/summary_${ASOF}.json" | sed -e 's/^/  /'
+sed -e 's/^/  /' "$CONFIRM_OUT/summary_${ASOF}.json"
 
-echo "[auto] Done. Trials: $TRIALS"
+echo "[auto] Done."
+echo "  Trials:   $TRIALS"
+echo "  Best:     $BEST"
+echo "  Confirm:  $CONFIRM_OUT/summary_${ASOF}.json"
