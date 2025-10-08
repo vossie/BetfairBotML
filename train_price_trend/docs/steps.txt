@@ -1,0 +1,29 @@
+./train_price_trend/bin/train_price_trend.sh
+
+
+EDGE_THRESH_GRID="0.002,0.003,0.005" \
+STAKE_MODES_GRID="flat,kelly" \
+ODDS_BANDS_GRID="1.5:5.0,2.2:3.6" \
+EV_SCALE_GRID="0.01,0.005" \
+EV_CAP_GRID="0.05" \
+LIQ_ENFORCE_GRID="1" \
+MIN_FILL_FRAC_GRID="5.0" \
+TOPK_GRID="1" \
+BUDGET_GRID="5,10" \
+EXIT_TICKS_GRID="0,1,2" \
+./train_price_trend/bin/sweep_price_trend.sh 2025-10-07 constrained
+
+
+python3 /opt/BetfairBotML/train_price_trend/ml/simulate_stream.py \
+  --curated /mnt/nvme/betfair-curated \
+  --asof 2025-10-07 --start-date 2025-09-06 --valid-days 7 \
+  --sport horse-racing --preoff-max 30 --horizon-secs 120 --commission 0.02 \
+  --model-path /opt/BetfairBotML/train_price_trend/output/models/xgb_trend_reg.json \
+  --edge-thresh 0.002 \
+  --stake-mode flat --bankroll-nom 5000 \
+  --odds-min 1.5 --odds-max 5.0 \
+  --enforce-liquidity --min-fill-frac 5.0 \
+  --per-market-topk 1 --per-market-budget 10 \
+  --exit-on-move-ticks 1 \
+  --ev-scale 0.01 --ev-cap 0.05 \
+  --output-dir /opt/BetfairBotML/train_price_trend/output/stream/constrained_best_test
