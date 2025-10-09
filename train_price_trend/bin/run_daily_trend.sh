@@ -30,7 +30,7 @@ START_DAYS_BACK="${START_DAYS_BACK:-34}"
 VALID_DAYS="${VALID_DAYS:-7}"
 
 # Start window controls
-USE_EARLIEST="${USE_EARLIEST:-1}"                 # default ON for your dataset
+USE_EARLIEST="${USE_EARLIEST:-1}"
 EARLIEST_DATE="${EARLIEST_DATE:-2025-09-05}"
 START_DATE_FORCE="${START_DATE_FORCE:-}"
 
@@ -53,7 +53,7 @@ MIN_TRADES="${MIN_TRADES:-5000}"
 MAX_TRADES="${MAX_TRADES:-250000}"
 ROI_TARGET_MIN="${ROI_TARGET_MIN:-0.0}"
 
-# Adaptive sweep targets (used by adaptive sim_sweep.py)
+# Adaptive sweep targets
 TPD_MIN="${TPD_MIN:-1000}"
 TPD_MAX="${TPD_MAX:-2000}"
 EDGE_MIN="${EDGE_MIN:-0.0001}"
@@ -61,7 +61,7 @@ EDGE_MAX="${EDGE_MAX:-0.005}"
 EDGE_INIT_GRID="${EDGE_INIT_GRID:-0.0005,0.001,0.002}"
 MAX_EDGE_ITER="${MAX_EDGE_ITER:-4}"
 
-# Non-edge grids still swept
+# Non-edge grids
 STAKE_MODES_GRID="${STAKE_MODES_GRID:-flat,kelly}"
 ODDS_BANDS_GRID="${ODDS_BANDS_GRID:-1.5:5.0,2.2:3.6}"
 EV_SCALE_GRID="${EV_SCALE_GRID:-0.05,0.1,0.2}"
@@ -84,6 +84,25 @@ ROW_SAMPLE_SECS="${ROW_SAMPLE_SECS:-}"            # e.g. 15
 # Parallel sims & per-run timeout for the sweep
 PARALLEL="${PARALLEL:-6}"                          # try 6; 8–10 if NVMe & RAM allow
 TIMEOUT_SECS="${TIMEOUT_SECS:-2400}"               # 40min per inner run
+
+# CPU topology
+TOTAL_CORES="${TOTAL_CORES:-36}"
+
+# ===================== TUNER (new) =====================
+# Enable/disable tuner & grid (kept small to be fast daily)
+TUNE_ENABLE="${TUNE_ENABLE:-1}"
+TUNE_LOG_DIR="$BASE_DIR/output/tune/$ASOF"
+TUNE_MAX_TRIALS="${TUNE_MAX_TRIALS:-24}"          # safety cap
+# modest, good ranges for your data; override via env if needed
+XGB_DEPTHS="${XGB_DEPTHS:-5 6}"
+XGB_N_EST="${XGB_N_EST:-400 600}"
+XGB_ETAS="${XGB_ETAS:-0.05 0.10}"
+XGB_MIN_CHILD_WEIGHT="${XGB_MIN_CHILD_WEIGHT:-1.0 2.0}"
+XGB_SUBSAMPLE="${XGB_SUBSAMPLE:-0.8 0.9}"
+XGB_COLSAMPLE="${XGB_COLSAMPLE:-0.8 0.9}"
+XGB_L2="${XGB_L2:-1.0 2.0}"
+XGB_L1="${XGB_L1:-0.0 0.5}"
+XGB_EARLY_STOP="${XGB_EARLY_STOP:-50}"
 
 # ===================== Compute START_DATE =====================
 if [[ -n "$START_DATE_FORCE" ]]; then
@@ -133,15 +152,115 @@ clean_dir() {
 echo "[auto] Ensuring output dirs…"
 clean_dir "$SWEEP_ROOT";   mkdir -p "$SWEEP_ROOT"
 clean_dir "$CONFIRM_OUT";  mkdir -p "$CONFIRM_OUT"
+mkdir -p "$TUNE_LOG_DIR"
 
 # ===================== Threading policy =====================
-TOTAL_CORES="${TOTAL_CORES:-36}"                   # set if your machine differs
 # TRAIN uses all cores
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$TOTAL_CORES}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$TOTAL_CORES}"
 export XGBOOST_NUM_THREADS="${XGBOOST_NUM_THREADS:-$TOTAL_CORES}"
 
-# ===================== TRAIN =====================
+# Helper: python float compare
+py_float_gt () { python3 - "$1" "$2" <<'PY'
+import sys
+a=float(sys.argv[1]); b=float(sys.argv[2])
+print("yes" if a>b else "no")
+PY
+}
+
+# Helper: parse "[trend] valid EV per £1: mean=<val>"
+parse_valid_ev () {
+  awk -F'=' '/\[trend\] valid EV per £1: mean=/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' | tail -1
+}
+
+# ===================== TUNER STAGE =====================
+BEST_SCORE="-inf"
+BEST_TAG=""
+BEST_ARGS=()
+
+if [[ "$TUNE_ENABLE" == "1" ]]; then
+  echo "=== TUNE (daily XGBoost hyperparams) ${ASOF} ==="
+  trial_count=0
+  for d in $XGB_DEPTHS; do
+    for n in $XGB_N_EST; do
+      for eta in $XGB_ETAS; do
+        for mc in $XGB_MIN_CHILD_WEIGHT; do
+          for sub in $XGB_SUBSAMPLE; do
+            for col in $XGB_COLSAMPLE; do
+              for l2 in $XGB_L2; do
+                for l1 in $XGB_L1; do
+                  trial_count=$((trial_count+1))
+                  if (( trial_count > TUNE_MAX_TRIALS )); then
+                    echo "[tune] Reached TUNE_MAX_TRIALS=$TUNE_MAX_TRIALS — stopping grid."
+                    break 8
+                  fi
+                  tag="d${d}_n${n}_eta${eta}_mc${mc}_sub${sub}_col${col}_l2${l2}_l1${l1}"
+                  logf="$TUNE_LOG_DIR/${tag}.log"
+                  echo "[tune] $trial_count) $tag"
+                  # Train once with this config (unbuffered -u)
+                  set +e
+                  python3 -u "$ML_DIR/train_price_trend.py" \
+                    --curated "$CURATED_ROOT" \
+                    --asof "$ASOF" \
+                    --start-date "$START_DATE" \
+                    --valid-days "$VALID_DAYS" \
+                    --sport "$SPORT" \
+                    --horizon-secs 120 \
+                    --preoff-max "$PREOFF_MAX" \
+                    --commission "$COMMISSION" \
+                    --device "$TRAIN_DEVICE" \
+                    --xgb-max-depth "$d" \
+                    --xgb-n-estimators "$n" \
+                    --xgb-learning-rate "$eta" \
+                    --xgb-min-child-weight "$mc" \
+                    --xgb-subsample "$sub" \
+                    --xgb-colsample-bytree "$col" \
+                    --xgb-reg-lambda "$l2" \
+                    --xgb-reg-alpha "$l1" \
+                    --xgb-early-stopping-rounds "$XGB_EARLY_STOP" \
+                    | tee "$logf"
+                  rc=$?
+                  set -e
+                  if [[ $rc -ne 0 ]]; then
+                    echo "[tune] WARN: trainer exited rc=$rc; skipping."
+                    continue
+                  fi
+                  score="$(parse_valid_ev < "$logf")"
+                  [[ -z "$score" ]] && score="-inf"
+                  echo "    → valid_EV_per_£1=${score}"
+
+                  better="$(py_float_gt "$score" "$BEST_SCORE")"
+                  if [[ "$better" == "yes" ]]; then
+                    BEST_SCORE="$score"
+                    BEST_TAG="$tag"
+                    BEST_ARGS=( \
+                      --xgb-max-depth "$d" \
+                      --xgb-n-estimators "$n" \
+                      --xgb-learning-rate "$eta" \
+                      --xgb-min-child-weight "$mc" \
+                      --xgb-subsample "$sub" \
+                      --xgb-colsample-bytree "$col" \
+                      --xgb-reg-lambda "$l2" \
+                      --xgb-reg-alpha "$l1" \
+                      --xgb-early-stopping-rounds "$XGB_EARLY_STOP" )
+                    # snapshot the tuned model (optional)
+                    cp -f "$MODEL_PATH" "$TUNE_LOG_DIR/xgb_${tag}.json" 2>/dev/null || true
+                    echo "    ✔ new best: $BEST_SCORE ($BEST_TAG)"
+                  fi
+                done
+              done
+            done
+          done
+        done
+      done
+    done
+  done
+  echo "[tune] DONE. Best by valid EV/£1 = $BEST_SCORE  ($BEST_TAG)"
+else
+  echo "=== TUNE disabled (TUNE_ENABLE=0) ==="
+fi
+
+# ===================== TRAIN (final, with best params if any) =====================
 echo "=== TRAIN ${ASOF} ==="
 python3 -u "$ML_DIR/train_price_trend.py" \
   --curated "$CURATED_ROOT" \
@@ -152,7 +271,8 @@ python3 -u "$ML_DIR/train_price_trend.py" \
   --horizon-secs 120 \
   --preoff-max "$PREOFF_MAX" \
   --commission "$COMMISSION" \
-  --device "$TRAIN_DEVICE"
+  --device "$TRAIN_DEVICE" \
+  "${BEST_ARGS[@]:-}"
 
 # ===================== Build optional sampling args =====================
 SIM_EXTRA_ARGS=()
@@ -248,7 +368,7 @@ if [[ "$STATUS" != "OK" ]]; then
 fi
 
 # ===================== CONFIRM =====================
-# Give confirm run more threads (single process)
+# Give confirm run full threads (single process)
 export POLARS_MAX_THREADS="$TOTAL_CORES"
 export OMP_NUM_THREADS="$TOTAL_CORES"
 export XGBOOST_NUM_THREADS="$TOTAL_CORES"
