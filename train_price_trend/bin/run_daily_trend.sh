@@ -210,8 +210,8 @@ if [[ "$TUNE_ENABLE" == "1" ]]; then
                     --commission "$COMMISSION" \
                     --device "$TRAIN_DEVICE" \
                     --xgb-max-depth "$d" \
-                    --xgb-n-estimators "$n" \
-                    --xgb-learning-rate "$eta" \
+                    --xgb-num-boost-round "$n" \
+                    --xgb-eta "$eta" \
                     --xgb-min-child-weight "$mc" \
                     --xgb-subsample "$sub" \
                     --xgb-colsample-bytree "$col" \
@@ -235,8 +235,8 @@ if [[ "$TUNE_ENABLE" == "1" ]]; then
                     BEST_TAG="$tag"
                     BEST_ARGS=( \
                       --xgb-max-depth "$d" \
-                      --xgb-n-estimators "$n" \
-                      --xgb-learning-rate "$eta" \
+                      --xgb-num-boost-round "$n" \
+                      --xgb-eta "$eta" \
                       --xgb-min-child-weight "$mc" \
                       --xgb-subsample "$sub" \
                       --xgb-colsample-bytree "$col" \
