@@ -35,7 +35,8 @@ PREOFF_MAX="${PREOFF_MAX:-30}"
 COMMISSION="${COMMISSION:-0.02}"
 SIM_DEVICE="${SIM_DEVICE:-cpu}"
 TAG="${TAG:-auto}"
-CLEAN_MODE="${CLEAN_MODE:-auto}"
+CLEAN_MODE="${CLEAN_MODE:-skip}"   # default to skip so we never block runs
+TRASH_DIR="$OUT_BASE/.trash"
 POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$(nproc || echo 8)}"
 
 # Optional sampling (safe to leave empty)
@@ -105,18 +106,37 @@ echo "[auto] SWEEP_ROOT=$SWEEP_ROOT"
 echo "[auto] CONFIRM_OUT=$CONFIRM_OUT"
 
 # ── Cleanup helpers ───────────────────────────────────────────────────────────
+# Fast cleanup: move old dir to trash (same filesystem → instant), GC old trash dirs
 clean_dir() {
   local path="$1"
   case "$CLEAN_MODE" in
-    auto)   [[ -d "$path" ]] && { echo "[auto] Cleaning: $path"; rm -rf "$path"; } ;;
-    prompt) if [[ -d "$path" ]]; then
-              read -p "[auto] Found '$path'. Delete and rerun? [y/N] " R
-              [[ "$R" =~ ^[Yy]$ ]] && rm -rf "$path" || { echo "[auto] Aborting."; exit 1; }
-            fi ;;
-    skip)   echo "[auto] CLEAN_MODE=skip → not deleting '$path'." ;;
-    *)      echo "[auto] Unknown CLEAN_MODE='$CLEAN_MODE' (use auto|prompt|skip)."; exit 1;;
+    skip)
+      echo "[auto] CLEAN_MODE=skip → keeping existing '$path'."
+      ;;
+    auto|prompt)
+      if [[ -d "$path" ]]; then
+        if [[ "$CLEAN_MODE" == "prompt" ]]; then
+          read -p "[auto] Found '$path'. Move to trash and rerun? [y/N] " R
+          [[ "$R" =~ ^[Yy]$ ]] || { echo "[auto] Aborting."; exit 1; }
+        fi
+        mkdir -p "$TRASH_DIR"
+        local stamp; stamp="$(date +%s)"
+        local dst="$TRASH_DIR/$(basename "$path").$stamp"
+        echo "[auto] Moving '$path' → '$dst'"
+        mv "$path" "$dst" || { echo "[auto] mv failed; falling back to rm -rf (may take time)…"; rm -rf "$path"; }
+      fi
+      ;;
+    *)
+      echo "[auto] Unknown CLEAN_MODE='$CLEAN_MODE' (use auto|prompt|skip)."; exit 1;;
   esac
 }
+
+# Optional: garbage collect trash older than 2 days (safe & quick)
+if [[ -d "$TRASH_DIR" ]]; then
+  echo "[auto] GC trash >2d in $TRASH_DIR …"
+  find "$TRASH_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} + || true
+fi
+
 echo "[auto] Ensuring output dirs…"
 clean_dir "$SWEEP_ROOT";   mkdir -p "$SWEEP_ROOT"
 clean_dir "$CONFIRM_OUT";  mkdir -p "$CONFIRM_OUT"
