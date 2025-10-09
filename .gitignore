@@ -6,3 +6,4 @@
 ml/__pycache__/*
 /ml/.ipynb_checkpoints/
 /ml/.ipynb_checkpoints/*
+*.log
