@@ -40,16 +40,20 @@ def parse_args():
     p.add_argument("--max-train-rows", type=int, default=0, help="cap train rows (0=off)")
     p.add_argument("--max-valid-rows", type=int, default=250_000, help="cap valid rows")
 
-    # NEW: XGBoost hyper-params (backwards-compatible defaults = your previous ones)
+    # NEW/Preferred flags (already present)
     p.add_argument("--xgb-max-depth", type=int, default=6)
-    p.add_argument("--xgb-eta", type=float, default=0.08)                # learning_rate
+    p.add_argument("--xgb-eta", type=float, default=0.08)  # learning_rate
     p.add_argument("--xgb-subsample", type=float, default=0.8)
     p.add_argument("--xgb-colsample-bytree", type=float, default=0.8)
     p.add_argument("--xgb-min-child-weight", type=float, default=1.0)
-    p.add_argument("--xgb-reg-lambda", type=float, default=1.0)          # L2
-    p.add_argument("--xgb-reg-alpha", type=float, default=0.0)           # L1
-    p.add_argument("--xgb-num-boost-round", type=int, default=300)       # your cuda path used 300
-    p.add_argument("--xgb-early-stopping-rounds", type=int, default=0)   # 0=off
+    p.add_argument("--xgb-reg-lambda", type=float, default=1.0)
+    p.add_argument("--xgb-reg-alpha", type=float, default=0.0)
+    p.add_argument("--xgb-num-boost-round", type=int, default=300)
+    p.add_argument("--xgb-early-stopping-rounds", type=int, default=0)
+
+    # --- LEGACY ALIASES (accept both; map below) ---
+    p.add_argument("--xgb-learning-rate", type=float, default=None)  # alias for --xgb-eta
+    p.add_argument("--xgb-n-estimators", type=int, default=None)  # alias for --xgb-num-boost-round
 
     return p.parse_args()
 
@@ -326,6 +330,13 @@ def eval_xgb(booster, feats: list[str], df_va: pl.DataFrame):
 # ---------------- main ----------------
 def main():
     args = parse_args()
+
+    # Map legacy flags to new names if provided
+    if getattr(args, "xgb_learning_rate", None) is not None:
+        args.xgb_eta = args.xgb_learning_rate
+    if getattr(args, "xgb_n_estimators", None) is not None:
+        args.xgb_num_boost_round = args.xgb_n_estimators
+
 
     print("=== Price Trend Training ===")
     print(f"Curated root:    {args.curated}")
