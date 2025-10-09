@@ -20,6 +20,10 @@ print((datetime.utcnow().date() - timedelta(days=1)).strftime("%Y-%m-%d"))
 PY
 )"
 fi
+if [[ -z "${ASOF}" ]]; then
+  echo "[auto] ERROR: ASOF could not be determined." >&2
+  exit 1
+fi
 
 # ===================== Config (env-overridable) =====================
 START_DAYS_BACK="${START_DAYS_BACK:-34}"
@@ -35,8 +39,8 @@ PREOFF_MAX="${PREOFF_MAX:-30}"
 COMMISSION="${COMMISSION:-0.02}"
 
 # Devices / perf
-SIM_DEVICE="${SIM_DEVICE:-cpu}"                   # cpu|cuda
-POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$(nproc || echo 8)}"
+TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"              # cuda|cpu
+SIM_DEVICE="${SIM_DEVICE:-cuda}"                  # cuda|cpu
 
 # Output mgmt
 TAG="${TAG:-auto}"
@@ -55,7 +59,7 @@ TPD_MAX="${TPD_MAX:-2000}"
 EDGE_MIN="${EDGE_MIN:-0.0001}"
 EDGE_MAX="${EDGE_MAX:-0.005}"
 EDGE_INIT_GRID="${EDGE_INIT_GRID:-0.0005,0.001,0.002}"
-MAX_EDGE_ITER="${MAX_EDGE_ITER:-6}"
+MAX_EDGE_ITER="${MAX_EDGE_ITER:-4}"
 
 # Non-edge grids still swept
 STAKE_MODES_GRID="${STAKE_MODES_GRID:-flat,kelly}"
@@ -76,6 +80,10 @@ EV_HIST_BINS="${EV_HIST_BINS:-0,0.0005,0.001,0.002,0.003,0.005,0.01}"
 MAX_FILES_PER_DAY="${MAX_FILES_PER_DAY:-}"        # e.g. 6000
 FILE_SAMPLE_MODE="${FILE_SAMPLE_MODE:-}"          # uniform|head|tail
 ROW_SAMPLE_SECS="${ROW_SAMPLE_SECS:-}"            # e.g. 15
+
+# Parallel sims & per-run timeout for the sweep
+PARALLEL="${PARALLEL:-6}"                          # try 6; 8–10 if NVMe & RAM allow
+TIMEOUT_SECS="${TIMEOUT_SECS:-2400}"               # 40min per inner run
 
 # ===================== Compute START_DATE =====================
 if [[ -n "$START_DATE_FORCE" ]]; then
@@ -126,13 +134,16 @@ echo "[auto] Ensuring output dirs…"
 clean_dir "$SWEEP_ROOT";   mkdir -p "$SWEEP_ROOT"
 clean_dir "$CONFIRM_OUT";  mkdir -p "$CONFIRM_OUT"
 
-# ===================== Threads for Polars =====================
-export POLARS_MAX_THREADS
-echo "[auto] POLARS_MAX_THREADS=$POLARS_MAX_THREADS"
+# ===================== Threading policy =====================
+TOTAL_CORES="${TOTAL_CORES:-36}"                   # set if your machine differs
+# TRAIN uses all cores
+export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$TOTAL_CORES}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$TOTAL_CORES}"
+export XGBOOST_NUM_THREADS="${XGBOOST_NUM_THREADS:-$TOTAL_CORES}"
 
 # ===================== TRAIN =====================
 echo "=== TRAIN ${ASOF} ==="
-python3 "$ML_DIR/train_price_trend.py" \
+python3 -u "$ML_DIR/train_price_trend.py" \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF" \
   --start-date "$START_DATE" \
@@ -141,7 +152,7 @@ python3 "$ML_DIR/train_price_trend.py" \
   --horizon-secs 120 \
   --preoff-max "$PREOFF_MAX" \
   --commission "$COMMISSION" \
-  --device cuda
+  --device "$TRAIN_DEVICE"
 
 # ===================== Build optional sampling args =====================
 SIM_EXTRA_ARGS=()
@@ -149,9 +160,17 @@ SIM_EXTRA_ARGS=()
 [[ -n "$FILE_SAMPLE_MODE"  ]] && SIM_EXTRA_ARGS+=( --file-sample-mode "$FILE_SAMPLE_MODE" )
 [[ -n "$ROW_SAMPLE_SECS"   ]] && SIM_EXTRA_ARGS+=( --row-sample-secs "$ROW_SAMPLE_SECS" )
 
-# ===================== SWEEP (Adaptive edge) =====================
+# For SWEEP: cap threads per worker (to use all cores across PARALLEL workers)
+SIM_THREADS=$(( TOTAL_CORES / PARALLEL ))
+if [ "$SIM_THREADS" -lt 2 ]; then SIM_THREADS=2; fi
+export POLARS_MAX_THREADS="$SIM_THREADS"
+export OMP_NUM_THREADS="$SIM_THREADS"
+export XGBOOST_NUM_THREADS="$SIM_THREADS"
+export NUMEXPR_MAX_THREADS="$SIM_THREADS"
+
+# ===================== SWEEP (Adaptive edge; parallel + timeouts) =====================
 echo "=== SWEEP (adaptive edge; realised ROI objective) ==="
-python3 "$ML_DIR/sim_sweep.py" \
+python3 -u "$ML_DIR/sim_sweep.py" \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF" \
   --start-date "$START_DATE" \
@@ -180,6 +199,8 @@ python3 "$ML_DIR/sim_sweep.py" \
   --max-edge-iterations "$MAX_EDGE_ITER" \
   --target-trades-per-day-min "$TPD_MIN" \
   --target-trades-per-day-max "$TPD_MAX" \
+  --parallel "$PARALLEL" \
+  --timeout-secs "$TIMEOUT_SECS" \
   $( [[ "$SAMPLE_EV_DENSITY" == "1" ]] && echo --sample-ev-density ) \
   --ev-hist-bins "$EV_HIST_BINS" \
   --tag "$TAG" \
@@ -193,7 +214,7 @@ if [[ ! -f "$BEST" ]]; then
 fi
 
 echo "=== BEST (pre-confirm) ==="
-sed -e 's/^/  /' "$BEST"
+sed -e 's/^/  /' "$BEST" || true
 
 # Helper: read JSON value without jq
 json_get () {
@@ -203,7 +224,6 @@ import json, sys
 k=sys.argv[1]; p=sys.argv[2]
 with open(p) as f: d=json.load(f)
 v=d.get(k, "")
-# normalise booleans to shell-friendly
 if isinstance(v, bool): print("true" if v else "false")
 else: print(v)
 PY
@@ -216,22 +236,23 @@ if [[ -z "$BEST_ROI" || "$BEST_ROI" == "None" ]]; then
   BEST_ROI="$(json_get overall_roi_exp "$BEST")"
 fi
 
-if ! python3 - <<PY
+STATUS="$(python3 - <<PY
 n=float("$BEST_N_TRADES" or 0)
 roi=float("$BEST_ROI" or -1e9)
 print("OK" if (n>=float("$MIN_TRADES") and n<=float("$MAX_TRADES") and roi>=float("$ROI_TARGET_MIN")) else "BAD")
 PY
-then
-  echo "[auto] Guardrail check failed to run." >&2
-  exit 3
-fi | read STATUS
-
+)"
 if [[ "$STATUS" != "OK" ]]; then
   echo "[auto] Best config failed guardrails (min/max trades or ROI). Review $TRIALS" >&2
   exit 3
 fi
 
 # ===================== CONFIRM =====================
+# Give confirm run more threads (single process)
+export POLARS_MAX_THREADS="$TOTAL_CORES"
+export OMP_NUM_THREADS="$TOTAL_CORES"
+export XGBOOST_NUM_THREADS="$TOTAL_CORES"
+
 echo "=== CONFIRM RUN ==="
 EDGE_THR="$(json_get edge_thresh "$BEST")"
 STAKE_MODE="$(json_get stake_mode "$BEST")"
@@ -250,7 +271,7 @@ if [[ "$ENF_LIQ" == "true" ]]; then
   CONF_ARGS+=( --enforce-liquidity --min-fill-frac "$MIN_FILL_FRAC" )
 fi
 
-python3 "$ML_DIR/simulate_stream.py" \
+python3 -u "$ML_DIR/simulate_stream.py" \
   --curated "$CURATED_ROOT" \
   --asof "$ASOF" --start-date "$START_DATE" --valid-days "$VALID_DAYS" \
   --sport "$SPORT" --preoff-max "$PREOFF_MAX" --horizon-secs 120 --commission "$COMMISSION" \
