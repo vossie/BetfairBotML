@@ -205,6 +205,7 @@ if [[ "${TUNE_ENABLE}" == "1" ]]; then
                     --preoff-max "$PREOFF_MAX" \
                     --commission "$COMMISSION" \
                     --device "$TRAIN_DEVICE" \
+  --model-out "$MODEL_PATH" \
                     --xgb-max-depth "$d" \
                     --xgb-num-boost-round "$n" \
                     --xgb-eta "$eta" \
@@ -249,6 +250,13 @@ else
 fi
 
 # ===================== Final TRAIN =====================
+TRAIN_EXTRA=()
+if [[ -n "" && "" != "-inf" && ${#BEST_ARGS[@]} -gt 0 ]]; then
+  TRAIN_EXTRA=( "${BEST_ARGS[@]}" )
+else
+  echo "[tune] No valid best trial; using defaults (no extra XGB args)."
+  TRAIN_EXTRA=()
+fi
 echo "=== TRAIN ${ASOF} ==="
 python3 -u "$ML_DIR/train_price_trend.py" \
   --curated "$CURATED_ROOT" \
@@ -260,7 +268,8 @@ python3 -u "$ML_DIR/train_price_trend.py" \
   --preoff-max "$PREOFF_MAX" \
   --commission "$COMMISSION" \
   --device "$TRAIN_DEVICE" \
-  "${BEST_ARGS[@]:-}"
+  --model-out "$MODEL_PATH" \
+  ${TRAIN_EXTRA[@]}
 
 # ===================== Build extra sim args =====================
 SIM_EXTRA_ARGS=()
