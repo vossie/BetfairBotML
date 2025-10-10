@@ -170,8 +170,10 @@ PY
 
 # Helper: parse "[trend] valid EV per £1: mean=<val>"
 parse_valid_ev () {
-  awk -F'=' '/\[trend\] valid EV per £1: mean=/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2}' | tail -1
-}
+  python3 - <<'PY'
+import sys, re
+text=sys.stdin.read()
+m=re.search(rvalid
 
 # ===================== TUNER STAGE =====================
 BEST_SCORE="-inf"
