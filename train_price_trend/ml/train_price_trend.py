@@ -88,21 +88,74 @@ def curated_dirs(root: str, sport: str, date: str) -> Tuple[Path,Path]:
     md = base / sport / date / "market-definitions"
     return ob, md
 
-def read_day(root: str, sport: str, date: str) -> Tuple[pl.DataFrame, pl.DataFrame]:
-    ob_dir, md_dir = curated_dirs(root, sport, date)
-    ob_files = sorted(glob.glob(str(ob_dir / "*.parquet")))
-    md_files = sorted(glob.glob(str(md_dir / "*.parquet")))
-    if not ob_files or not md_files:
-        return pl.DataFrame({}), pl.DataFrame({})
+import glob
+from pathlib import Path
 
-    # scan lazily to be memory-safe
-    ob_cols = load_schema("orderbook")
-    ob = pl.scan_parquet(ob_files).select([c for c in ob_cols if c in pl.scan_parquet(ob_files).columns])
-    md_cols = load_schema("marketdef")
-    md = pl.scan_parquet(md_files).select([c for c in md_cols if c in pl.scan_parquet(md_files).columns])
+def collect_streaming(lf: pl.LazyFrame) -> pl.DataFrame:
+    try:
+        return lf.collect(engine="streaming")
+    except Exception:
+        return lf.collect()
 
-    # materialize now; engine='streaming' keeps memory frugal
-    return ob.collect(streaming=True), md.collect(streaming=True)
+def read_day(curated: str, sport: str, date: str) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Load one day of snapshots and (deduped) market definitions.
+    - Snapshots: EXACT day under orderbook_snapshots_5s/sport=.../date=...
+    - Market defs: ±2 days under market_definitions/sport=.../date=...
+    """
+    want_order = load_schema("orderbook")
+    want_defs  = load_schema("marketdef")
+
+    # --- paths ---
+    ob_dir = Path(curated) / "orderbook_snapshots_5s" / f"sport={sport}" / f"date={date}"
+
+    from datetime import datetime, timedelta
+    d0 = datetime.strptime(date, "%Y-%m-%d").date()
+    def_dates = [(d0 + timedelta(days=k)).strftime("%Y-%m-%d") for k in (-2, -1, 0, 1, 2)]
+    def_dirs = [Path(curated) / "market_definitions" / f"sport={sport}" / f"date={d}" for d in def_dates]
+
+    # --- snapshots (this day only) ---
+    sfiles = sorted(glob.glob(str(ob_dir / "*.parquet")))
+    if not sfiles:
+        print(f"[io] {date} snapshots: 0 files @ {ob_dir}")
+        snaps = pl.DataFrame({})
+    else:
+        lf = pl.scan_parquet(sfiles)
+        have = lf.collect_schema().names()
+        cols = intersect_existing(want_order, have) or have  # be permissive
+        snaps = collect_streaming(lf.select([pl.col(c) for c in cols]))
+        print(f"[io] {date} snapshots: {len(sfiles)} files → {snaps.height:,} rows")
+
+    # --- market defs (±2 days), unique by marketId ---
+    defs_parts = []
+    ndef_files = 0
+    for ddir in def_dirs:
+        dfiles = sorted(glob.glob(str(ddir / "*.parquet")))
+        if not dfiles:
+            continue
+        ndef_files += len(dfiles)
+        lf = pl.scan_parquet(dfiles)
+        have = lf.collect_schema().names()
+        cols = intersect_existing(want_defs, have) or have
+        defs_parts.append(lf.select([pl.col(c) for c in cols]))
+
+    if defs_parts:
+        defs = pl.concat(defs_parts, how="vertical_relaxed").unique(subset=["marketId"])
+        defs = collect_streaming(defs)
+        print(f"[io] {date} defs ±2d: {ndef_files} files → {defs.height:,} rows (unique markets)")
+    else:
+        print(f"[io] {date} defs ±2d: 0 files")
+        defs = pl.DataFrame({"marketId": pl.Series([], dtype=pl.Utf8)})
+
+    # Ensure required columns exist (even if null) so downstream joins/filters work
+    if "marketStartMs" not in defs.columns:
+        defs = defs.with_columns(pl.lit(None, dtype=pl.Int64).alias("marketStartMs"))
+    if "countryCode" not in defs.columns:
+        defs = defs.with_columns(pl.lit("UNK").alias("countryCode"))
+    if "sport" not in defs.columns:
+        defs = defs.with_columns(pl.lit(sport).alias("sport"))
+
+    return snaps, defs
 
 # ---------------- features ----------------
 def _safe_ret(now: pl.Expr, past: pl.Expr) -> pl.Expr:
