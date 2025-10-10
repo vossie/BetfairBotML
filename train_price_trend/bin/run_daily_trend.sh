@@ -205,7 +205,6 @@ if [[ "${TUNE_ENABLE}" == "1" ]]; then
                     --preoff-max "$PREOFF_MAX" \
                     --commission "$COMMISSION" \
                     --device "$TRAIN_DEVICE" \
-  --model-out "$MODEL_PATH" \
                     --xgb-max-depth "$d" \
                     --xgb-num-boost-round "$n" \
                     --xgb-eta "$eta" \
@@ -268,7 +267,6 @@ python3 -u "$ML_DIR/train_price_trend.py" \
   --preoff-max "$PREOFF_MAX" \
   --commission "$COMMISSION" \
   --device "$TRAIN_DEVICE" \
-  --model-out "$MODEL_PATH" \
   ${TRAIN_EXTRA[@]}
 
 # ===================== Build extra sim args =====================
