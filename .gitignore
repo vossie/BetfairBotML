@@ -3,6 +3,7 @@
 *set-env-vars-prod.sh*
 */output/*.json
 */output/*.csv
+*/output/**
 ml/__pycache__/*
 /ml/.ipynb_checkpoints/
 /ml/.ipynb_checkpoints/*
