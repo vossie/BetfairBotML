@@ -23,7 +23,7 @@ fi
 # ===================== Config (env) =====================
 START_DAYS_BACK="${START_DAYS_BACK:-34}"
 VALID_DAYS="${VALID_DAYS:-7}"
-USE_EARLIEST="${USE_EARLIEST:-1}"
+USE_EARLIEST="${USE_EARLIEST:-0}"                 # rolling window by default
 EARLIEST_DATE="${EARLIEST_DATE:-2025-09-05}"
 START_DATE_FORCE="${START_DATE_FORCE:-}"
 
@@ -34,27 +34,27 @@ COMMISSION="${COMMISSION:-0.02}"
 TRAIN_DEVICE="${TRAIN_DEVICE:-cuda}"
 SIM_DEVICE="${SIM_DEVICE:-cuda}"
 
-TAG="${TAG:-auto}"
+TAG="${TAG:-auto_strict}"
 CLEAN_MODE="${CLEAN_MODE:-skip}"        # skip|auto|prompt
 
 # Edge search targets
 TPD_MIN="${TPD_MIN:-1000}"
 TPD_MAX="${TPD_MAX:-2000}"
-EDGE_MIN="${EDGE_MIN:-0.0001}"
-EDGE_MAX="${EDGE_MAX:-0.005}"
-EDGE_INIT_GRID="${EDGE_INIT_GRID:-0.0005,0.001,0.002}"
-MAX_EDGE_ITER="${MAX_EDGE_ITER:-4}"
+EDGE_MIN="${EDGE_MIN:-0.0005}"
+EDGE_MAX="${EDGE_MAX:-0.03}"
+EDGE_INIT_GRID="${EDGE_INIT_GRID:-0.003,0.005,0.01,0.015}"
+MAX_EDGE_ITER="${MAX_EDGE_ITER:-7}"
 
 # Non-edge grids
 STAKE_MODES_GRID="${STAKE_MODES_GRID:-flat,kelly}"
-ODDS_BANDS_GRID="${ODDS_BANDS_GRID:-1.5:5.0,2.2:3.6}"
-EV_SCALE_GRID="${EV_SCALE_GRID:-0.05,0.1,0.2}"
+ODDS_BANDS_GRID="${ODDS_BANDS_GRID:-2.2:3.6,1.5:5.0}"
+EV_SCALE_GRID="${EV_SCALE_GRID:-0.005,0.01,0.02,0.05}"
 EV_CAP_GRID="${EV_CAP_GRID:-0.05}"
 EXIT_TICKS_GRID="${EXIT_TICKS_GRID:-0,1}"
 TOPK_GRID="${TOPK_GRID:-1}"
 BUDGET_GRID="${BUDGET_GRID:-5,10}"
 LIQ_ENFORCE_GRID="${LIQ_ENFORCE_GRID:-1}"
-MIN_FILL_FRAC_GRID="${MIN_FILL_FRAC_GRID:-5.0}"
+MIN_FILL_FRAC_GRID="${MIN_FILL_FRAC_GRID:-5.0,10.0,25.0,50.0}"
 
 # EV density
 SAMPLE_EV_DENSITY="${SAMPLE_EV_DENSITY:-1}"
@@ -83,6 +83,9 @@ XGB_EARLY_STOP="${XGB_EARLY_STOP:-50}"
 MAX_FILES_PER_DAY="${MAX_FILES_PER_DAY:-}"
 FILE_SAMPLE_MODE="${FILE_SAMPLE_MODE:-}"
 ROW_SAMPLE_SECS="${ROW_SAMPLE_SECS:-}"
+
+# Sweeper guard (ensure enough trades overall across the window)
+MIN_TRADES="${MIN_TRADES:-2000}"
 
 # ===================== Derived dirs =====================
 SWEEP_ROOT="$OUT_BASE/sweeps/$ASOF/$TAG"
@@ -313,6 +316,7 @@ python3 -u "$ML_DIR/sim_sweep.py" \
   --max-edge-iterations "$MAX_EDGE_ITER" \
   --target-trades-per-day-min "$TPD_MIN" \
   --target-trades-per-day-max "$TPD_MAX" \
+  --min-trades "$MIN_TRADES" \
   --parallel "$PARALLEL" \
   --timeout-secs "$TIMEOUT_SECS" \
   $( [[ "$SAMPLE_EV_DENSITY" == "1" ]] && echo --sample-ev-density ) \
